@@ -49,6 +49,17 @@ open FSharp.Compiler.GraphChecking
 type internal TcResult = TcEnv * TopAttribs * CheckedImplFile option * ModuleOrNamespaceType
 type internal TcErrors = FSharpDiagnostic[]
 
+/// The result of checking one file over the dependency graph, kept for reuse while
+/// neither the file nor anything it depends on changes.
+type internal GraphCheckEntry = {
+    parseResults: FSharpParseFileResults
+    qualifiedName: string
+    fileIndex: int
+    dependencies: string[]
+    finisher: Finisher<NodeToTypeCheck, TcState, PartialResult>
+    tcErrors: TcErrors
+}
+
 type internal CompilerState = {
     tcConfig: TcConfig
     tcGlobals: TcGlobals
@@ -57,6 +68,7 @@ type internal CompilerState = {
     projectOptions: FSharpProjectOptions
     parseCache: ConcurrentDictionary<string * int, FSharpParseFileResults>
     checkCache: ConcurrentDictionary<string, (TcResult * TcErrors) * (TcState * ModuleNamesDict)>
+    graphCheckCache: ConcurrentDictionary<string, GraphCheckEntry>
 }
 
 type internal CacheMsg<'T> =
@@ -149,6 +161,8 @@ module internal ParseAndCheck =
         let parseCache = ConcurrentDictionary<string * int, FSharpParseFileResults>(HashIdentity.Structural)
         // type check cache, keyed on file name
         let checkCache = ConcurrentDictionary<string, (TcResult * TcErrors) * (TcState * ModuleNamesDict)>(HashIdentity.Structural)
+        // graph type check cache, keyed on file name
+        let graphCheckCache = ConcurrentDictionary<string, GraphCheckEntry>(HashIdentity.Structural)
 
         return {
             tcConfig = tcConfig
@@ -158,6 +172,7 @@ module internal ParseAndCheck =
             projectOptions = projectOptions
             parseCache = parseCache
             checkCache = checkCache
+            graphCheckCache = graphCheckCache
         }
     }
 
@@ -247,9 +262,10 @@ module internal ParseAndCheck =
             FSharpImplementationFileContents(cenv, implFile) |> subscriber
         | _ -> ()
 
-    /// Type checks all files in parallel where the file dependency graph allows, and fills the check cache
-    /// with the same per-file entries a sequential check would leave, so later rechecks can start from any file.
-    /// The subscriber gets the files in project order, each as soon as it and all files before it are checked,
+    /// Type checks the files in parallel where the file dependency graph allows. A file checked by an earlier call is
+    /// reused while neither it nor anything it depends on has changed, so after an edit only the edited file and its
+    /// dependents are checked again. Fills the check cache with the same per-file entries a sequential check would
+    /// leave. The subscriber gets the files in project order, each as soon as it and all files before it are checked,
     /// because Fable expects every earlier file to be known, not only the file's dependencies.
     let TypeCheckInputsInParallel (parseResults: FSharpParseFileResults[], tcState: TcState, compilerState, subscriber) =
         let tcConfig = compilerState.tcConfig
@@ -260,19 +276,50 @@ module internal ParseAndCheck =
                 let input, moduleNamesDict = parseRes.ParseTree |> DeduplicateParsedInputModuleName moduleNamesDict
                 (input, moduleNamesDict), moduleNamesDict)
         let inputs, moduleNamesDicts = Array.unzip inputsAndModuleNames
+        let fileNames = parseResults |> Array.map (fun parseRes -> parseRes.FileName)
+
+        let sourceFiles = inputs |> Array.mapi (fun idx input -> { Idx = idx; FileName = input.FileName; ParsedInput = input })
+        let filePairs = FilePairMap(sourceFiles)
+        let graph, _trie = DependencyResolution.mkGraph filePairs sourceFiles
+        let dependencies = Array.init inputs.Length (fun idx -> graph[idx] |> Array.filter ((<>) idx) |> Array.map (fun dep -> fileNames[dep]))
+
+        // A file's earlier result is reused when the file is unchanged and none of the files it depends on, now or in
+        // the earlier check, is checked again. Dependencies always come earlier in the project, so one pass in file
+        // order settles every file.
+        let rechecked = Collections.Generic.HashSet<string>()
+        let reused =
+            Array.init inputs.Length (fun idx ->
+                let reusable =
+                    match compilerState.graphCheckCache.TryGetValue fileNames[idx] with
+                    | true, entry when
+                        obj.ReferenceEquals(entry.parseResults, parseResults[idx])
+                        && entry.qualifiedName = inputs[idx].QualifiedName.Text
+                        && entry.fileIndex = idx
+                        && not (dependencies[idx] |> Array.exists rechecked.Contains)
+                        && not (entry.dependencies |> Array.exists rechecked.Contains) -> Some entry
+                    | _ -> None
+                if reusable.IsNone then rechecked.Add fileNames[idx] |> ignore
+                reusable)
 
         let capturingLoggers = parseResults |> Array.map (fun _ -> CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions))
         let loggers = capturingLoggers |> Array.map (fun logger -> GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, logger))
+        let finishers = Array.zeroCreate<Finisher<NodeToTypeCheck, TcState, PartialResult>> inputs.Length
 
         let checkFile idx tcState =
+            match reused[idx] with
+            | Some entry -> entry.finisher
+            | None ->
             let parseRes = parseResults[idx]
             let logger = loggers[idx]
             use _scope = new CompilationGlobalsScope (logger, BuildPhase.TypeCheck)
             let checkForErrors () = parseRes.ParseHadErrors || logger.ErrorCount > 0
             let prefixPathOpt = None
-            CheckOneInputWithCallback (NodeToTypeCheck.PhysicalFile idx)
-                (checkForErrors, tcConfig, compilerState.tcImports, compilerState.tcGlobals, prefixPathOpt, TcResultsSink.NoSink, tcState, inputs[idx], false)
-            |> Cancellable.runWithoutCancellation
+            let finisher =
+                CheckOneInputWithCallback (NodeToTypeCheck.PhysicalFile idx)
+                    (checkForErrors, tcConfig, compilerState.tcImports, compilerState.tcGlobals, prefixPathOpt, TcResultsSink.NoSink, tcState, inputs[idx], false)
+                |> Cancellable.runWithoutCancellation
+            finishers[idx] <- finisher
+            finisher
 
         let checkedFiles = Array.zeroCreate<(TcResult * TcState) option> parseResults.Length
         let nextToReport = ref 0
@@ -287,16 +334,23 @@ module internal ParseAndCheck =
         let fileResults =
             use _ = UseBuildPhase BuildPhase.TypeCheck
             CheckMultipleInputsUsingGraphModeWithStates (compilerState.tcImports, compilerState.tcGlobals, None, tcState, inputs,
-                checkFile, onChecked, (fun idx -> loggers[idx]), CancellationToken.None)
+                graph, filePairs, checkFile, onChecked, (fun idx -> loggers[idx]), CancellationToken.None)
 
         let flatErrors = tcConfig.flatErrors
         let results =
             fileResults |> Array.mapi (fun idx (tcResult, tcState) ->
-                let fileName = parseResults[idx].FileName
-                let diagnostics = capturingLoggers[idx].GetDiagnostics()
-                let tcErrors = DiagnosticHelpers.CreateDiagnostics (diagnosticsOptions, false, fileName, diagnostics, suggestNamesForErrors, flatErrors, None)
-                let entry = (tcResult, tcErrors), (tcState, moduleNamesDicts[idx])
-                compilerState.checkCache.[fileName] <- entry
+                let fileName = fileNames[idx]
+                let tcErrors, finisher =
+                    match reused[idx] with
+                    | Some entry -> entry.tcErrors, entry.finisher
+                    | None ->
+                        let diagnostics = capturingLoggers[idx].GetDiagnostics()
+                        DiagnosticHelpers.CreateDiagnostics (diagnosticsOptions, false, fileName, diagnostics, suggestNamesForErrors, flatErrors, None),
+                        finishers[idx]
+                compilerState.graphCheckCache[fileName] <-
+                    { parseResults = parseResults[idx]; qualifiedName = inputs[idx].QualifiedName.Text; fileIndex = idx
+                      dependencies = dependencies[idx]; finisher = finisher; tcErrors = tcErrors }
+                compilerState.checkCache[fileName] <- ((tcResult, tcErrors), (tcState, moduleNamesDicts[idx]))
                 tcResult, tcErrors)
 
         let lastState = fileResults |> Array.last |> snd
@@ -313,11 +367,9 @@ module internal ParseAndCheck =
             ReportCheckedFile (tcState, result, compilerState, subscriber)
             (result, errors), (tcState, moduleNamesDict)
 
-        // A cold check of several files goes through the dependency graph in parallel. Rechecks stay sequential,
-        // as they start from the cached state of the last unchanged file.
+        // Several files go through the dependency graph in parallel, reusing unaffected results from earlier checks.
         let checkInParallel =
-            compilerState.checkCache.IsEmpty
-            && parseResults.Length > 1
+            parseResults.Length > 1
             && compilerState.tcConfig.typeCheckingConfig.Mode = TypeCheckingMode.Graph
             && not compilerState.tcConfig.compilingFSharpCore
 
@@ -352,6 +404,7 @@ type InteractiveChecker internal (compilerStateCache) =
         let! compilerState = compilerStateCache.Get()
         compilerState.parseCache.Clear()
         compilerState.checkCache.Clear()
+        compilerState.graphCheckCache.Clear()
     }
 
     member _.GetImportedAssemblies() = async {

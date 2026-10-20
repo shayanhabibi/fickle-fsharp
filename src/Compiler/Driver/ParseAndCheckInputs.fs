@@ -1937,10 +1937,11 @@ let CheckMultipleInputsUsingGraphMode
         partialResults, tcState)
 
 /// Type-checks the files in parallel where possible, like 'CheckMultipleInputsUsingGraphMode', for a
-/// caller that checks each file itself and keeps per-file results. 'checkFile' checks one physical file
-/// against the state of its dependencies. 'onChecked' is called with each file's result as soon as that
-/// file is checked, in an order where every file comes after its dependencies. Returns each file's result
-/// and the state after it, in file order.
+/// caller that checks each file itself and keeps per-file results. 'graph' and 'filePairs' are the file
+/// dependency graph of 'inputs', from 'DependencyResolution.mkGraph'. 'checkFile' checks one physical file
+/// against the state of its dependencies, or returns a result kept from an earlier check. 'onChecked' is
+/// called with each file's result as soon as that file is checked, in an order where every file comes after
+/// its dependencies. Returns each file's result and the state after it, in file order.
 let CheckMultipleInputsUsingGraphModeWithStates
     (
         tcImports: TcImports,
@@ -1948,23 +1949,14 @@ let CheckMultipleInputsUsingGraphModeWithStates
         prefixPathOpt,
         tcState: TcState,
         inputs: ParsedInput array,
+        graph: Graph<FileIndex>,
+        filePairs: FilePairMap,
         checkFile: FileIndex -> TcState -> Finisher<NodeToTypeCheck, TcState, PartialResult>,
         onChecked: FileIndex -> PartialResult -> TcState -> unit,
         loggerForFile: FileIndex -> DiagnosticsLogger,
         ct: CancellationToken
     ) : (PartialResult * TcState) array =
 
-    let sourceFiles: FileInProject array =
-        inputs
-        |> Array.mapi (fun idx (input: ParsedInput) ->
-            {
-                Idx = idx
-                FileName = input.FileName
-                ParsedInput = input
-            })
-
-    let filePairs = FilePairMap(sourceFiles)
-    let graph, _trie = DependencyResolution.mkGraph filePairs sourceFiles
     let nodeGraph = TransformDependencyGraph(graph, filePairs)
 
     let work (node: NodeToTypeCheck) ((tcState, priorErrors): State) : Finisher<NodeToTypeCheck, State, PartialResult> =
