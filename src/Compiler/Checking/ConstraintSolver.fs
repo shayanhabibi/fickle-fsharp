@@ -4162,7 +4162,11 @@ let CodegenWitnessExprForTraitConstraint tcVal g amap m (traitInfo:TraitConstrai
     }
 
 /// Generate the lambda argument passed for a use of a generic construct that accepts trait witnesses
-let CodegenWitnessesForTyparInst tcVal g amap m typars tyargs =
+let CodegenWitnessesForTyparInst tcVal g amap m (typars: Typars) tyargs =
+    let hasTraitConstraint (tp: Typar) =
+        tp.Constraints |> List.exists (function TyparConstraint.MayResolveMember _ -> true | _ -> false)
+    // Without trait constraints there are no witnesses, so skip building the codegen state (a fresh InfoReader).
+    if not (typars |> List.exists hasTraitConstraint) then ResultD [] else
     trackErrors {
         let css = CreateCodegenState tcVal g amap
         let csenv = MakeConstraintSolverEnv ContextInfo.NoContext css m (DisplayEnv.Empty g)
