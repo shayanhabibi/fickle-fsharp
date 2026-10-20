@@ -240,6 +240,20 @@ val CheckClosedInputSet:
     inputs: ParsedInput list ->
         TcState * TopAttribs * CheckedImplFile list * TcEnv
 
+/// Check a closed set of inputs in parallel where possible, leaving the check of each file to 'checkFile',
+/// and return each file's result and the state after it, in file order.
+val CheckMultipleInputsUsingGraphModeWithStates:
+    tcImports: TcImports *
+    tcGlobals: TcGlobals *
+    prefixPathOpt: LongIdent option *
+    tcState: TcState *
+    inputs: ParsedInput array *
+    checkFile: (FileIndex -> TcState -> Finisher<NodeToTypeCheck, TcState, PartialResult>) *
+    onChecked: (FileIndex -> PartialResult -> TcState -> unit) *
+    loggerForFile: (FileIndex -> DiagnosticsLogger) *
+    ct: System.Threading.CancellationToken ->
+        (PartialResult * TcState) array
+
 /// Check a single input and finish the checking
 val CheckOneInputAndFinish:
     checkForErrors: (unit -> bool) *

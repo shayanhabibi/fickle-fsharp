@@ -1699,6 +1699,65 @@ module private TypeCheckingGraphProcessing =
 
         finalFileResults, state
 
+    /// <summary>
+    /// A version of 'processTypeCheckingGraph' that reports each physical file as soon as it is checked,
+    /// and returns the state after each physical file in file order, as a sequential check would leave it.
+    /// Diagnostics raised while combining dependency states are discarded; the final fold reports them
+    /// once per file, under the logger 'loggerForFile' gives for that file.
+    /// </summary>
+    let processTypeCheckingGraphWithStates
+        (graph: Graph<NodeToTypeCheck>)
+        (work: NodeToTypeCheck -> State -> Finisher<NodeToTypeCheck, State, FinalFileResult>)
+        (onChecked: FileIndex -> FinalFileResult -> State -> unit)
+        (loggerForFile: FileIndex -> DiagnosticsLogger)
+        (emptyState: State)
+        (ct: CancellationToken)
+        : (FileIndex * FinalFileResult * State) array =
+
+        let workWrapper
+            (getProcessedNode: NodeToTypeCheck -> ProcessedNode<NodeToTypeCheck, State * Finisher<NodeToTypeCheck, State, FinalFileResult>>)
+            (node: NodeInfo<NodeToTypeCheck>)
+            : State * Finisher<NodeToTypeCheck, State, FinalFileResult> =
+            let folder (state: State) (Finisher(finisher = finisher)) : State = finisher state |> snd
+            let deps = node.Deps |> Array.except [| node.Item |] |> Array.map getProcessedNode
+
+            let transitiveDeps =
+                node.TransitiveDeps
+                |> Array.except [| node.Item |]
+                |> Array.map getProcessedNode
+
+            let inputState =
+                use _ = UseDiagnosticsLogger DiscardErrorsLogger
+                combineResults emptyState deps transitiveDeps folder
+
+            let singleRes = work node.Item inputState
+            let (Finisher(finisher = finisher)) = singleRes
+
+            let fileResult, state =
+                use _ = UseDiagnosticsLogger DiscardErrorsLogger
+                finisher inputState
+
+            match node.Item with
+            | NodeToTypeCheck.PhysicalFile idx -> onChecked idx fileResult state
+            | NodeToTypeCheck.ArtificialImplFile _ -> ()
+
+            state, singleRes
+
+        processGraph graph workWrapper ct
+        |> Array.choose (fun (item, res) ->
+            match item with
+            | NodeToTypeCheck.ArtificialImplFile _ -> None
+            | NodeToTypeCheck.PhysicalFile file -> Some(file, res))
+        |> Array.mapFold
+            (fun state (idx, (_, Finisher(finisher = finisher))) ->
+                let fileResult, state =
+                    use _ = UseDiagnosticsLogger(loggerForFile idx)
+                    finisher state
+
+                (idx, fileResult, state), state)
+            emptyState
+        |> fst
+
 let TransformDependencyGraph (graph: Graph<FileIndex>, filePairs: FilePairMap) =
     let mkArtificialImplFile n = NodeToTypeCheck.ArtificialImplFile n
     let mkPhysicalFile n = NodeToTypeCheck.PhysicalFile n
@@ -1876,6 +1935,62 @@ let CheckMultipleInputsUsingGraphMode
             |> List.map snd
 
         partialResults, tcState)
+
+/// Type-checks the files in parallel where possible, like 'CheckMultipleInputsUsingGraphMode', for a
+/// caller that checks each file itself and keeps per-file results. 'checkFile' checks one physical file
+/// against the state of its dependencies. 'onChecked' is called with each file's result as soon as that
+/// file is checked, in an order where every file comes after its dependencies. Returns each file's result
+/// and the state after it, in file order.
+let CheckMultipleInputsUsingGraphModeWithStates
+    (
+        tcImports: TcImports,
+        tcGlobals,
+        prefixPathOpt,
+        tcState: TcState,
+        inputs: ParsedInput array,
+        checkFile: FileIndex -> TcState -> Finisher<NodeToTypeCheck, TcState, PartialResult>,
+        onChecked: FileIndex -> PartialResult -> TcState -> unit,
+        loggerForFile: FileIndex -> DiagnosticsLogger,
+        ct: CancellationToken
+    ) : (PartialResult * TcState) array =
+
+    let sourceFiles: FileInProject array =
+        inputs
+        |> Array.mapi (fun idx (input: ParsedInput) ->
+            {
+                Idx = idx
+                FileName = input.FileName
+                ParsedInput = input
+            })
+
+    let filePairs = FilePairMap(sourceFiles)
+    let graph, _trie = DependencyResolution.mkGraph filePairs sourceFiles
+    let nodeGraph = TransformDependencyGraph(graph, filePairs)
+
+    let work (node: NodeToTypeCheck) ((tcState, priorErrors): State) : Finisher<NodeToTypeCheck, State, PartialResult> =
+        let finisher =
+            match node with
+            | NodeToTypeCheck.ArtificialImplFile idx ->
+                AddSignatureResultToTcImplEnv(tcImports, tcGlobals, prefixPathOpt, TcResultsSink.NoSink, tcState, inputs[idx])
+            | NodeToTypeCheck.PhysicalFile idx ->
+                let (Finisher(finisher = finisher)) = checkFile idx tcState
+                finisher
+
+        Finisher(
+            node,
+            (fun (tcState, priorErrors2) ->
+                let partialResult, tcState = finisher tcState
+                partialResult, (tcState, priorErrors || priorErrors2))
+        )
+
+    TypeCheckingGraphProcessing.processTypeCheckingGraphWithStates
+        nodeGraph
+        work
+        (fun idx partialResult (tcState, _) -> onChecked idx partialResult tcState)
+        loggerForFile
+        (tcState, false)
+        ct
+    |> Array.map (fun (_, partialResult, (tcState, _)) -> partialResult, tcState)
 
 let CheckClosedInputSet (ctok, checkForErrors, tcConfig: TcConfig, tcImports, tcGlobals, prefixPathOpt, tcState, eagerFormat, inputs) =
     // tcEnvAtEndOfLastFile is the environment required by fsi.exe when incrementally adding definitions

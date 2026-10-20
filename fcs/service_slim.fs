@@ -239,6 +239,69 @@ module internal ParseAndCheck =
                                 loadClosure, implFile, sink.GetOpenDeclarations())
         FSharpCheckFileResults (fileName, errors, Some scope, parseResults.DependencyFiles, None, keepAssemblyContents)
 
+    let ReportCheckedFile (tcState: TcState, tcResult: TcResult, compilerState, subscriber) =
+        let _, _, implFile, _ = tcResult
+        match subscriber, implFile with
+        | Some subscriber, Some implFile ->
+            let cenv = SymbolEnv(compilerState.tcGlobals, tcState.Ccu, Some tcState.CcuSig, compilerState.tcImports)
+            FSharpImplementationFileContents(cenv, implFile) |> subscriber
+        | _ -> ()
+
+    /// Type checks all files in parallel where the file dependency graph allows, and fills the check cache
+    /// with the same per-file entries a sequential check would leave, so later rechecks can start from any file.
+    /// The subscriber gets the files in project order, each as soon as it and all files before it are checked,
+    /// because Fable expects every earlier file to be known, not only the file's dependencies.
+    let TypeCheckInputsInParallel (parseResults: FSharpParseFileResults[], tcState: TcState, compilerState, subscriber) =
+        let tcConfig = compilerState.tcConfig
+        let diagnosticsOptions = tcConfig.diagnosticsOptions
+
+        let inputsAndModuleNames, _ =
+            (Map.empty, parseResults) ||> Array.mapFold (fun moduleNamesDict parseRes ->
+                let input, moduleNamesDict = parseRes.ParseTree |> DeduplicateParsedInputModuleName moduleNamesDict
+                (input, moduleNamesDict), moduleNamesDict)
+        let inputs, moduleNamesDicts = Array.unzip inputsAndModuleNames
+
+        let capturingLoggers = parseResults |> Array.map (fun _ -> CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions))
+        let loggers = capturingLoggers |> Array.map (fun logger -> GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, logger))
+
+        let checkFile idx tcState =
+            let parseRes = parseResults[idx]
+            let logger = loggers[idx]
+            use _scope = new CompilationGlobalsScope (logger, BuildPhase.TypeCheck)
+            let checkForErrors () = parseRes.ParseHadErrors || logger.ErrorCount > 0
+            let prefixPathOpt = None
+            CheckOneInputWithCallback (NodeToTypeCheck.PhysicalFile idx)
+                (checkForErrors, tcConfig, compilerState.tcImports, compilerState.tcGlobals, prefixPathOpt, TcResultsSink.NoSink, tcState, inputs[idx], false)
+            |> Cancellable.runWithoutCancellation
+
+        let checkedFiles = Array.zeroCreate<(TcResult * TcState) option> parseResults.Length
+        let nextToReport = ref 0
+        let onChecked idx tcResult tcState =
+            lock checkedFiles (fun () ->
+                checkedFiles[idx] <- Some (tcResult, tcState)
+                while nextToReport.Value < checkedFiles.Length && checkedFiles[nextToReport.Value].IsSome do
+                    let tcResult, tcState = checkedFiles[nextToReport.Value].Value
+                    ReportCheckedFile (tcState, tcResult, compilerState, subscriber)
+                    nextToReport.Value <- nextToReport.Value + 1)
+
+        let fileResults =
+            use _ = UseBuildPhase BuildPhase.TypeCheck
+            CheckMultipleInputsUsingGraphModeWithStates (compilerState.tcImports, compilerState.tcGlobals, None, tcState, inputs,
+                checkFile, onChecked, (fun idx -> loggers[idx]), CancellationToken.None)
+
+        let flatErrors = tcConfig.flatErrors
+        let results =
+            fileResults |> Array.mapi (fun idx (tcResult, tcState) ->
+                let fileName = parseResults[idx].FileName
+                let diagnostics = capturingLoggers[idx].GetDiagnostics()
+                let tcErrors = DiagnosticHelpers.CreateDiagnostics (diagnosticsOptions, false, fileName, diagnostics, suggestNamesForErrors, flatErrors, None)
+                let entry = (tcResult, tcErrors), (tcState, moduleNamesDicts[idx])
+                compilerState.checkCache.[fileName] <- entry
+                tcResult, tcErrors)
+
+        let lastState = fileResults |> Array.last |> snd
+        results, (lastState, Array.last moduleNamesDicts)
+
     let TypeCheckClosedInputSet (parseResults: FSharpParseFileResults[], tcState, compilerState, subscriber) =
         let cachedTypeCheck (tcState, moduleNamesDict) (parseRes: FSharpParseFileResults) =
             let checkCacheKey = parseRes.FileName
@@ -247,18 +310,22 @@ module internal ParseAndCheck =
                 TypeCheckOneInputEntry (parseRes, TcResultsSink.NoSink, tcState, moduleNamesDict, compilerState)
 
             let (result, errors), (tcState, moduleNamesDict) = compilerState.checkCache.GetOrAdd(checkCacheKey, typeCheckOneInput)
-
-            let _, _, implFile, _ = result
-            match subscriber, implFile with
-            | Some subscriber, Some implFile ->
-                let cenv = SymbolEnv(compilerState.tcGlobals, tcState.Ccu, Some tcState.CcuSig, compilerState.tcImports)
-                FSharpImplementationFileContents(cenv, implFile) |> subscriber
-            | _ -> ()
-
+            ReportCheckedFile (tcState, result, compilerState, subscriber)
             (result, errors), (tcState, moduleNamesDict)
 
+        // A cold check of several files goes through the dependency graph in parallel. Rechecks stay sequential,
+        // as they start from the cached state of the last unchanged file.
+        let checkInParallel =
+            compilerState.checkCache.IsEmpty
+            && parseResults.Length > 1
+            && compilerState.tcConfig.typeCheckingConfig.Mode = TypeCheckingMode.Graph
+            && not compilerState.tcConfig.compilingFSharpCore
+
         let results, (tcState, moduleNamesDict) =
-            ((tcState, Map.empty), parseResults) ||> Array.mapFold cachedTypeCheck
+            if checkInParallel then
+                TypeCheckInputsInParallel (parseResults, tcState, compilerState, subscriber)
+            else
+                ((tcState, Map.empty), parseResults) ||> Array.mapFold cachedTypeCheck
 
         let tcResults, tcErrors = Array.unzip results
         let (tcEnvAtEndOfLastFile, topAttrs, implFiles, _ccuSigsForFiles), tcState =
