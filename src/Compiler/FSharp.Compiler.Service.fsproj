@@ -3,7 +3,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>netstandard2.0</TargetFrameworks>
+    <!-- fickle: net10 only, so FCS can use modern runtime APIs; the netstandard2.0 build is dropped -->
+    <TargetFrameworks>$(FSharpNetCoreProductTargetFramework)</TargetFrameworks>
     <OutputType>Library</OutputType>
     <NoWarn>$(NoWarn);44</NoWarn> <!-- Obsolete -->
     <NoWarn>$(NoWarn);57</NoWarn> <!-- Experimental -->
@@ -23,7 +24,6 @@
 
      OSX and Linux has problems with Xliff targets for net9, skipping via SKIP_NETCURRENT_FSC_BUILD until resolved ( The target "UpdateXlf" does not exist in the project.)
 	-->
-    <TargetFrameworks Condition=" '$(OfficialBuildId)' == '' AND '$(FSharpNetCoreProductTargetFramework)' != '' AND '$(Configuration)' != 'Proto' AND '$(SKIP_NETCURRENT_FSC_BUILD)' != 'true' ">$(FSharpNetCoreProductTargetFramework);$(TargetFrameworks)</TargetFrameworks>
     <DefineConstants Condition="'$(FSHARPCORE_USE_PACKAGE)' == 'true'">$(DefineConstants);FSHARPCORE_USE_PACKAGE</DefineConstants>
     <OtherFlags>$(OtherFlags) --extraoptimizationloops:1</OtherFlags>
     <!-- 3218: ArgumentsInSigAndImplMismatch -->
