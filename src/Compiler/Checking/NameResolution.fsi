@@ -658,6 +658,17 @@ val internal ExtensionPropInfosOfTypeInScope:
     ty: TType ->
         PropInfo list
 
+/// Get the intrinsic methods of a type (both declared and inherited), without extension methods
+val internal IntrinsicMethInfosOfType:
+    infoReader: InfoReader ->
+    optFilter: string option ->
+    ad: AccessorDomain ->
+    allowMultiIntfInst: FSharp.Compiler.TypeHierarchy.AllowMultiIntfInstantiations ->
+    findFlag: FindMemberFlag ->
+    m: range ->
+    ty: TType ->
+        MethInfo list
+
 /// Get the available methods of a type (both declared and inherited)
 val internal AllMethInfosOfTypeInScope:
     collectionSettings: ResultCollectionSettings ->
