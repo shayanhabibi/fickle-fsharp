@@ -399,6 +399,12 @@ type InteractiveChecker internal (compilerStateCache) =
     static member Create(projectOptions: FSharpProjectOptions) =
         Cache(initializeCompilerState projectOptions) |> InteractiveChecker
 
+    /// Treats the anonymous record types of the assemblies `isUnified` accepts as one, as if compiled together, for
+    /// every checker in the process: for sources checked as assemblies of their own that a compile of the project
+    /// would check in its assembly.
+    static member SetAnonRecdTypesUnifiedAssembly(isUnified: string -> bool) =
+        FSharp.Compiler.TypedTreeBasics.anonRecdTypesUnifiedAssembly <- isUnified
+
     /// Clears parse and typecheck caches.
     member _.ClearCache () = async {
         let! compilerState = compilerStateCache.Get()

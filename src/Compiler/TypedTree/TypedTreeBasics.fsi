@@ -71,6 +71,12 @@ val valEq: v1: Val -> v2: Val -> bool
 /// Equality on CCU references, implemented as reference equality except when unresolved
 val ccuEq: ccu1: CcuThunk -> ccu2: CcuThunk -> bool
 
+/// Assemblies whose anonymous record types are one, as if compiled together (none unless set)
+val mutable anonRecdTypesUnifiedAssembly: (string -> bool)
+
+/// Equality on the assemblies of two anonymous record types
+val anonRecdCcuEq: ccu1: CcuThunk -> ccu2: CcuThunk -> bool
+
 /// For dereferencing in the middle of a pattern
 val (|ValDeref|): vref: ValRef -> Val
 

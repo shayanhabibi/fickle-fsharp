@@ -98,8 +98,17 @@ let ccuEq (ccu1: CcuThunk) (ccu2: CcuThunk) =
     (ccu1 === ccu2) || 
     (if ccu1.IsUnresolvedReference || ccu2.IsUnresolvedReference then 
         ccu1.AssemblyName = ccu2.AssemblyName
-     else 
+     else
         ccu1.Contents === ccu2.Contents)
+
+/// Assemblies whose anonymous record types are one, as if compiled together (none unless set). Fable compiles an
+/// anonymous record to a structural value, so the assembly it belongs to does not matter to its output.
+let mutable anonRecdTypesUnifiedAssembly: string -> bool = fun _ -> false
+
+/// Equality on the assemblies of two anonymous record types
+let anonRecdCcuEq (ccu1: CcuThunk) (ccu2: CcuThunk) =
+    ccuEq ccu1 ccu2
+    || (anonRecdTypesUnifiedAssembly ccu1.AssemblyName && anonRecdTypesUnifiedAssembly ccu2.AssemblyName)
 
 /// For dereferencing in the middle of a pattern
 let (|ValDeref|) (vref: ValRef) = vref.Deref

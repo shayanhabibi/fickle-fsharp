@@ -106,7 +106,7 @@ let rec TypesFeasiblyEquivalent stripMeasures ndeep g amap m ty1 ty2 =
 
     | TType_anon (anonInfo1, l1),TType_anon (anonInfo2, l2) ->
         (evalTupInfoIsStruct anonInfo1.TupInfo = evalTupInfoIsStruct anonInfo2.TupInfo) &&
-        (match anonInfo1.Assembly, anonInfo2.Assembly with ccu1, ccu2 -> ccuEq ccu1 ccu2) &&
+        (match anonInfo1.Assembly, anonInfo2.Assembly with ccu1, ccu2 -> anonRecdCcuEq ccu1 ccu2) &&
         (anonInfo1.SortedNames = anonInfo2.SortedNames) &&
         List.lengthsEqAndForall2 (TypesFeasiblyEquivalent stripMeasures ndeep g amap m) l1 l2
 

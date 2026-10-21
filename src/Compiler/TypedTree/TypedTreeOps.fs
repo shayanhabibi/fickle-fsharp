@@ -1125,8 +1125,8 @@ and typeAEquivAux erasureFlag g aenv ty1 ty2 =
     | _ -> false
 
 and anonInfoEquiv (anonInfo1: AnonRecdTypeInfo) (anonInfo2: AnonRecdTypeInfo) =
-    ccuEq anonInfo1.Assembly anonInfo2.Assembly && 
-    structnessAEquiv anonInfo1.TupInfo anonInfo2.TupInfo && 
+    anonRecdCcuEq anonInfo1.Assembly anonInfo2.Assembly &&
+    structnessAEquiv anonInfo1.TupInfo anonInfo2.TupInfo &&
     anonInfo1.SortedNames = anonInfo2.SortedNames 
 
 and structnessAEquiv un1 un2 =

@@ -1141,7 +1141,7 @@ and SolveAnonInfoEqualsAnonInfo (csenv: ConstraintSolverEnv) m2 (anonInfo1: Anon
         ErrorD (ConstraintSolverError(FSComp.SR.tcTupleStructMismatch(), csenv.m,m2))
     else
         trackErrors {
-            if not (ccuEq anonInfo1.Assembly anonInfo2.Assembly) then
+            if not (anonRecdCcuEq anonInfo1.Assembly anonInfo2.Assembly) then
                 do! ErrorD (ConstraintSolverError(FSComp.SR.tcAnonRecdCcuMismatch(anonInfo1.Assembly.AssemblyName, anonInfo2.Assembly.AssemblyName), csenv.m,m2))
                 
             if anonInfo1.SortedNames <> anonInfo2.SortedNames then 
