@@ -4551,11 +4551,7 @@ and CheckIWSAM (cenv: cenv) (env: TcEnv) checkConstraints iwsam m tcref =
     let ty = generalizedTyconRef g tcref
 
     if iwsam = WarnOnIWSAM.Yes && isInterfaceTy g ty && checkConstraints = CheckCxs then
-        // Extension members can never be static abstract dispatch slots, so only the intrinsic methods are collected:
-        // collecting extension methods for every interface type in a signature dominated checking large bindings.
-        let meths = IntrinsicMethInfosOfType cenv.infoReader None env.eAccessRights AllowMultiIntfInstantiations.Yes IgnoreOverrides m ty
-
-        if meths |> List.exists (fun meth -> not meth.IsInstance && meth.IsDispatchSlot) then
+        if cenv.infoReader.HasIntrinsicStaticAbstractMethod env.eAccessRights m ty then
             let tcref = tcrefOfAppTy g ty
             warning(Error(FSComp.SR.tcUsingInterfaceWithStaticAbstractMethodAsType(tcref.DisplayNameWithStaticParametersAndUnderscoreTypars), m))
 
