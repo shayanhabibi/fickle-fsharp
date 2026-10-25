@@ -1374,6 +1374,10 @@ module internal Makers =
     let mkCallNewFormat (g: TcGlobals) m aty bty cty dty ety formatStringExpr =
         mkApps g (typedExprForIntrinsic g m g.new_format_info, [ [ aty; bty; cty; dty; ety ] ], [ formatStringExpr ], m)
 
+    // fickle: Fable's interpolated-string lowering still calls sprintf
+    let mkCall_sprintf (g: TcGlobals) m funcTy fmtExpr fillExprs =
+        mkApps g (typedExprForIntrinsic g m g.sprintf_info, [ [ funcTy ] ], fmtExpr :: fillExprs, m)
+
     let mkCallStringOperator (g: TcGlobals) m argTy e =
         mkApps g (typedExprForIntrinsic g m g.string_operator_info, [ [ argTy ] ], [ e ], m)
 

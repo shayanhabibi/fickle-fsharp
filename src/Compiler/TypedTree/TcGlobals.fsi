@@ -793,6 +793,8 @@ type internal TcGlobals =
 
     member new_decimal_info: IntrinsicValRef
 
+    member sprintf_info: IntrinsicValRef
+
     member new_format_info: IntrinsicValRef
 
     member new_format_vref: TypedTree.ValRef

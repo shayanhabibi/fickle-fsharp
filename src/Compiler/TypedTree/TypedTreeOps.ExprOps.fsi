@@ -208,6 +208,9 @@ module internal Makers =
     val mkCallNewFormat:
         TcGlobals -> range -> TType -> TType -> TType -> TType -> TType -> formatStringExpr: Expr -> Expr
 
+    /// Make a call to the 'sprintf' function for string interpolation (kept for Fable)
+    val mkCall_sprintf: g: TcGlobals -> m: range -> funcTy: TType -> fmtExpr: Expr -> fillExprs: Expr list -> Expr
+
     /// Build a call to the 'string' operator (Operators.ToString) at the given argument type.
     val mkCallStringOperator: TcGlobals -> range -> argTy: TType -> Expr -> Expr
 

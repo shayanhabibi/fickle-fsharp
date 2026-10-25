@@ -1760,6 +1760,8 @@ type TcGlobals(
   member _.seq_map_info               = v_seq_map_info
   member _.seq_singleton_info         = v_seq_singleton_info
   member _.seq_empty_info             = v_seq_empty_info
+  // fickle: Fable's interpolated-string lowering still calls sprintf
+  member _.sprintf_info               = v_sprintf_info
   member _.new_format_info            = v_new_format_info
   member _.unbox_info                 = v_unbox_info
   member _.get_generic_comparer_info  = v_get_generic_comparer_info

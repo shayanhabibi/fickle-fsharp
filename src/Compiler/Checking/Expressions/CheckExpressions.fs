@@ -146,6 +146,44 @@ exception InvalidInternalsVisibleToAssemblyName of badName: string * fileName: s
 
 exception InvalidAttributeTargetForLanguageElement of elementTargets: string array * allowedTargets: string array * range: range
 
+#if FABLE_CLI
+//----------------------------------------------------------------------------------------------
+// fickle: Fable builds string templates from the PrintfFormat of an interpolated string, so it keeps
+// the lowering from before upstream's String.Concat change: concat only when every hole is a string.
+//----------------------------------------------------------------------------------------------
+[<return: Struct>]
+let (|HasFormatSpecifier|_|) (s: string) =
+    if
+        System.Text.RegularExpressions.Regex.IsMatch(
+            s,
+            // Regex pattern for something like: %[flags][width][.precision][type]
+            """
+            (^|[^%])                # Start with beginning of string or any char other than '%'
+            (%%)*%                  # followed by an odd number of '%' chars
+            [+-0 ]{0,3}             # optionally followed by flags
+            (d+)?                  # optionally followed by width
+            (.d+)?                # optionally followed by .precision
+            [bscdiuxXoBeEfFgGMOAat] # and then a char that determines specifier's type
+            """,
+            System.Text.RegularExpressions.RegexOptions.Compiled ||| System.Text.RegularExpressions.RegexOptions.IgnorePatternWhitespace)
+    then
+        ValueSome HasFormatSpecifier
+    else
+        ValueNone
+
+// Removes trailing "%s" unless it was escaped by another '%' (checks for odd sequence of '%' before final "%s")
+let (|WithTrailingStringSpecifierRemoved|) (s: string) =
+    if s.EndsWith "%s" then
+        let i = s.AsSpan(0, s.Length - 2).LastIndexOfAnyExcept '%'
+        let diff = s.Length - 2 - i
+        if diff &&& 1 <> 0 then
+            s[..s.Length - 3]
+        else
+            s
+    else
+        s
+#endif
+
 /// Compute the available access rights from a particular location in code
 let ComputeAccessRights eAccessPath eInternalsVisibleCompPaths eFamilyType =
     AccessibleFrom (eAccessPath :: eInternalsVisibleCompPaths, eFamilyType)
@@ -7767,6 +7805,7 @@ and MakeCapturedPrintfFormat (cenv: cenv) m newFormatMethod printfFormatString a
             mkArray (g.system_Type_ty, tyExprs, m)
     MakeMethInfoCall cenv.amap m newFormatMethod [] [mkString g m printfFormatString; argsExpr; percentATysExpr] None
 
+#if !FABLE_CLI // fickle: Fable keeps the PrintfFormat lowering (see TcInterpolatedString)
 /// Lower a string-typed interpolated string to System.String.Concat of its rendered parts,
 /// type-checking each part in place.
 and TcInterpolatedStringViaConcat (cenv: cenv, overallTy: OverallTy, env: TcEnv, m: range, tpenv: UnscopedTyparEnv, parts: SynInterpolatedStringPart list, argTys: TType list) =
@@ -7861,6 +7900,8 @@ and TcInterpolatedStringViaConcat (cenv: cenv, overallTy: OverallTy, env: TcEnv,
         | _ -> mkStringConcat (g, m, List.map fst argExprs)
 
     TcPropagatingExprLeafThenConvert cenv overallTy g.string_ty env m (fun () -> resultExpr, tpenv)
+
+#endif
 
 /// Check an interpolated string expression
 and [<TailCall>] warnForFunctionValuesInFillExprs (g: TcGlobals) argTys synFillExprs =
@@ -8008,10 +8049,69 @@ and TcInterpolatedStringExpr cenv (overallTy: OverallTy) env m tpenv (parts: Syn
             else
                 let str = mkString g m printfFormatString
                 mkCallNewFormat g m printerTy printerArgTy printerResidueTy printerResultTy printerTupleTy str, tpenv
+#if FABLE_CLI
+        elif isString then
+            let fillExprs, tpenv = TcExprsNoFlexes cenv env m tpenv argTys synFillExprs
+
+            if g.langVersion.SupportsFeature LanguageFeature.WarnWhenFunctionValueUsedAsInterpolatedStringArg then
+                warnForFunctionValuesInFillExprs g argTys synFillExprs
+
+            // Take all interpolated string parts and typed fill expressions
+            // and convert them to typed expressions that can be used as args to System.String.Concat
+            // return an empty list if there are some format specifiers that make lowering to not applicable
+            let rec concatenable acc fillExprs parts =
+                match fillExprs, parts with
+                | [], [] ->
+                    List.rev acc
+                | [], SynInterpolatedStringPart.FillExpr _ :: _
+                | _, [] ->
+                    // This should never happen, there will always be as many typed fill expressions
+                    // as there are FillExprs in the interpolated string parts
+                    error(InternalError("Mismatch in interpolation expression count", m))
+                | _, SynInterpolatedStringPart.String (WithTrailingStringSpecifierRemoved "", _) :: parts ->
+                    // If the string is empty (after trimming %s of the end), we skip it
+                    concatenable acc fillExprs parts
+
+                | _, SynInterpolatedStringPart.String (WithTrailingStringSpecifierRemoved HasFormatSpecifier, _) :: _
+                | _, SynInterpolatedStringPart.FillExpr (_, SynInterpolationFormatting.DotNet (Some _, _)) :: _
+                | _, SynInterpolatedStringPart.FillExpr (_, SynInterpolationFormatting.DotNet (_, Some _)) :: _ ->
+                    // There was a format specifier like {..,20} or {x:hh}, which means we cannot simply concat
+                    []
+
+                | _, SynInterpolatedStringPart.FillExpr (_, SynInterpolationFormatting.Printf (spec, _)) :: _ when spec <> "%s" ->
+                    // The parser moves a printf specifier like %20s or %d onto its hole; only a plain %s can concat
+                    []
+
+                | _, SynInterpolatedStringPart.String (s & WithTrailingStringSpecifierRemoved trimmed, m) :: parts ->
+                    let finalStr = trimmed.Replace("%%", "%")
+                    concatenable (mkString g (shiftEnd 0 (finalStr.Length - s.Length) m) finalStr :: acc) fillExprs parts
+
+                | fillExpr :: fillExprs, SynInterpolatedStringPart.FillExpr _ :: parts ->
+                    concatenable (fillExpr :: acc) fillExprs parts
+
+            let canLower =
+                g.langVersion.SupportsFeature LanguageFeature.LowerInterpolatedStringToConcat
+                && argTys |> List.forall (isStringTy g)
+
+            let concatenableExprs = if canLower then concatenable [] fillExprs parts else []
+
+            match concatenableExprs with
+            | [p1; p2; p3; p4] -> TcPropagatingExprLeafThenConvert cenv overallTy g.string_ty env m (fun () -> mkStaticCall_String_Concat4 g m p1 p2 p3 p4, tpenv)
+            | [p1; p2; p3] -> TcPropagatingExprLeafThenConvert cenv overallTy g.string_ty env m (fun () -> mkStaticCall_String_Concat3 g m p1 p2 p3, tpenv)
+            | [p1; p2] -> TcPropagatingExprLeafThenConvert cenv overallTy g.string_ty env m (fun () -> mkStaticCall_String_Concat2 g m p1 p2, tpenv)
+            | [p1] -> p1, tpenv
+            | _ ->
+                let fmtExpr = MakeCapturedPrintfFormat cenv m newFormatMethod printfFormatString argTys fillExprs percentATys
+                TcPropagatingExprLeafThenConvert cenv overallTy g.string_ty env (* true *) m (fun () ->
+                    // Make the call to sprintf
+                    mkCall_sprintf g m printerTy fmtExpr [], tpenv
+                )
+#else
         elif isString then
             // String-typed interpolation: concatenate rendered parts,
             // type-checking each hole in place (no separate batch, no flat fill-expression list).
             TcInterpolatedStringViaConcat (cenv, overallTy, env, m, tpenv, parts, argTys)
+#endif
         else
             // $"...{x}..." used as a PrintfFormat value: build a PrintfFormat that captures the args.
             let fillExprs, tpenv = TcExprsNoFlexes cenv env m tpenv argTys synFillExprs
