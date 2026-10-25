@@ -2216,6 +2216,11 @@ and AdjustAccess isHidden (cpath: unit -> CompilationPath) access =
 // at least as accessible as the value itself (FS1113). Inline callees are followed transitively because
 // the optimizer inlines them away; only module/member bindings can escape their scope.
 and CheckInlineValueIsSufficientlyAccessible cenv env (v: Val) bindRhs =
+#if FABLE_CLI
+    // fickle: Fable allows inline functions to use internal values (as precompiled packages do) and reports
+    // inlined private values itself, as it did when this check lived in the optimizer
+    ignore (cenv, env, v, bindRhs)
+#else
     if cenv.reportErrors && v.ShouldInline && not v.IsCompilerGenerated &&
        (v.IsMemberOrModuleBinding || v.IsMember) && not v.IsIncrClassGeneratedMember then
         let inlineAcc =
@@ -2234,6 +2239,7 @@ and CheckInlineValueIsSufficientlyAccessible cenv env (v: Val) bindRhs =
                      true))
         if escapes bindRhs then
             errorR(Error(FSComp.SR.optValueMarkedInlineButIncomplete(richTextOfValName cenv.g v), v.Range))
+#endif
 
 and CheckBinding cenv env alwaysCheckNoReraise ctxt (TBind(v, bindRhs, _) as bind) : Limit =
     let vref = mkLocalValRef v
