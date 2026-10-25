@@ -7,6 +7,7 @@
 module internal FSharp.Compiler.TypedTreeBasics
 
 open Internal.Utilities.Library.Extras
+open FSharp.Compiler.AbstractIL.IL
 open FSharp.Compiler.Syntax
 open FSharp.Compiler.Text
 open FSharp.Compiler.TypedTree
@@ -147,6 +148,8 @@ val tryShortcutSolvedUnitPar: canShortcut: bool -> r: Typar -> Measure
 
 val stripUnitEqnsAux: canShortcut: bool -> unt: Measure -> Measure
 
+/// Follows type variable solutions: when a type variable has been solved by unifying it with another type,
+/// replaces that type variable with its solution.
 val stripTyparEqnsAux: nullness0: Nullness -> canShortcut: bool -> ty: TType -> TType
 
 val replaceNullnessOfTy: nullness: Nullness -> ty: TType -> TType
@@ -158,6 +161,10 @@ val stripUnitEqns: unt: Measure -> Measure
 /// Detect a use of a nominal type, including type abbreviations.
 [<return: Struct>]
 val (|AbbrevOrAppTy|_|): ty: TType -> (TyconRef * TypeInst) voption
+
+/// Matches a type definition reference backed by Abstract IL metadata, returning that metadata.
+[<return: Struct>]
+val (|ILTyconRawMetadata|_|): tcref: TyconRef -> ILTypeDef voption
 
 val mkLocalValRef: v: Val -> ValRef
 

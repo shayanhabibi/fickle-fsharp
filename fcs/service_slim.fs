@@ -46,7 +46,7 @@ open FSharp.Compiler.GraphChecking
 // InteractiveChecker
 //-------------------------------------------------------------------------
 
-type internal TcResult = TcEnv * TopAttribs * CheckedImplFile option * ModuleOrNamespaceType
+type internal TcResult = PartialResult
 type internal TcErrors = FSharpDiagnostic[]
 
 /// The result of checking one file over the dependency graph, kept for reuse while
@@ -214,7 +214,7 @@ module internal SignatureFingerprint =
                 add "default"
                 add (string priority)
                 ty t
-            | TyparConstraint.MayResolveMember (TTrait (supportTys, memberName, memberFlags, argTys, returnTy, _, _), _) ->
+            | TyparConstraint.MayResolveMember (TTrait (supportTys, memberName, memberFlags, argTys, returnTy, _, _, _), _) ->
                 add "member"
                 tys supportTys
                 add memberName
@@ -287,7 +287,7 @@ module internal SignatureFingerprint =
 
         and argInfo (info: ArgReprInfo) =
             add (match info.Name with Some id -> id.idText | None -> "-")
-            attribs info.Attribs
+            attribs (info.Attribs.AsList())
 
         and slotSig (TSlotSig (name, declaringTy, classTps, methodTps, paramGroups, returnTy)) =
             add name
@@ -346,7 +346,7 @@ module internal SignatureFingerprint =
             access e.Accessibility
             access e.TypeReprAccessibility
             attribs e.Attribs
-            typars (e.Typars range0)
+            typars e.Typars
 
             if e.IsModuleOrNamespace then
                 add (sprintf "%A" e.ModuleOrNamespaceType.ModuleOrNamespaceKind)
@@ -570,10 +570,10 @@ module internal ParseAndCheck =
         let loadClosure = None
         let keepAssemblyContents = true
 
-        let tcEnvAtEnd, _topAttrs, implFile, ccuSigForFile = tcResult
+        let tcEnvAtEnd, _topAttrs, implFile, ccuSigForFile, ownSigForFile = tcResult
         let errors = Array.append parseResults.Diagnostics tcErrors
 
-        let scope = TypeCheckInfo (compilerState.tcConfig, compilerState.tcGlobals, ccuSigForFile, tcState.Ccu, compilerState.tcImports, tcEnvAtEnd.AccessRights,
+        let scope = TypeCheckInfo (compilerState.tcConfig, compilerState.tcGlobals, ccuSigForFile, ownSigForFile, tcState.Ccu, compilerState.tcImports, tcEnvAtEnd.AccessRights,
                                 projectFileName, fileName, Some compilerState.projectOptions, sink.GetResolutions(), sink.GetSymbolUses(), tcEnvAtEnd.NameEnv,
                                 loadClosure, implFile, sink.GetOpenDeclarations())
         FSharpCheckFileResults (fileName, errors, Some scope, parseResults.DependencyFiles, None, keepAssemblyContents)
@@ -585,7 +585,7 @@ module internal ParseAndCheck =
     let signatureCutoff = Environment.GetEnvironmentVariable "FICKL_FCS_SIGNATURE_CUTOFF" <> "0"
 
     let ReportCheckedFile (tcState: TcState, tcResult: TcResult, compilerState, subscriber) =
-        let _, _, implFile, _ = tcResult
+        let _, _, implFile, _, _ = tcResult
         match subscriber, implFile with
         | Some subscriber, Some implFile ->
             let cenv = SymbolEnv(compilerState.tcGlobals, tcState.Ccu, Some tcState.CcuSig, compilerState.tcImports)
@@ -670,7 +670,7 @@ module internal ParseAndCheck =
                         use _ = new CompilationGlobalsScope (DiscardErrorsLogger, BuildPhase.TypeCheck)
                         finish tcState
                     match partialResult with
-                    | _, topAttrs, Some implFile, _ ->
+                    | _, topAttrs, Some implFile, _, _ ->
                         let signature = SignatureFingerprint.compute implFile.Signature topAttrs
                         if signature.IsSome && signature = entry.signature.Force() then Some (entry, implFile) else None
                     | _ -> None
@@ -685,13 +685,13 @@ module internal ParseAndCheck =
                 finisher
 
         // The implementation to report for a file: a kept or reused file's finisher gives an earlier one.
-        let withLatestImplFile idx ((tcEnv, topAttrs, implFile, ccuSig): TcResult) : TcResult =
+        let withLatestImplFile idx ((tcEnv, topAttrs, implFile, ccuSig, ownSig): TcResult) : TcResult =
             let implFile =
                 match outcomes[idx] with
                 | Reused entry -> entry.implFile
                 | Kept (_, implFile) -> Some implFile
                 | Replaced _ -> implFile
-            tcEnv, topAttrs, implFile, ccuSig
+            tcEnv, topAttrs, implFile, ccuSig, ownSig
 
         let checkedFiles = Array.zeroCreate<(TcResult * TcState) option> parseResults.Length
         let nextToReport = ref 0
@@ -723,7 +723,7 @@ module internal ParseAndCheck =
                         // The kept finisher was checked against the earlier dependencies, which include the current ones.
                         { entry with parseResults = parseResults[idx]; implFile = Some implFile; tcErrors = newErrors () }
                     | Replaced (finisher, dependencyGenerations) ->
-                        let _, topAttrs, implFile, _ = tcResult
+                        let _, topAttrs, implFile, _, _ = tcResult
                         { parseResults = parseResults[idx]; qualifiedName = inputs[idx].QualifiedName.Text; fileIndex = idx
                           generation = generations[idx]; dependencyGenerations = dependencyGenerations
                           finisher = finisher; implFile = implFile
@@ -900,7 +900,7 @@ type InteractiveChecker internal (compilerStateCache) =
         let parseFileResults = parseFile fileName
         let checkFileResults = CheckFile (projectFileName, parseFileResults, tcState, moduleNamesDict, compilerState)
         let (tcResult, _tcErrors), (tcState, _moduleNamesDict) = compilerState.checkCache.[fileName]
-        let _tcEnvAtEndFile, topAttrsFile, implFile, _ccuSigForFile = tcResult
+        let _tcEnvAtEndFile, topAttrsFile, implFile, _ccuSigForFile, _ownSigForFile = tcResult
 
         // collect errors
         let parseErrorsBefore = parseResults |> Array.collect (fun p -> p.Diagnostics)
