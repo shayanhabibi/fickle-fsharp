@@ -538,6 +538,12 @@ module internal ParseAndCheck =
             let dependencyFiles = [||] // interactions have no dependencies
             FSharpParseFileResults (parseErrors, parseTreeOpt, anyErrors, dependencyFiles) )
 
+    /// Counts the compiler-generated names of a file from zero again, before checking it, so a file checked again in
+    /// this process, as in watch mode, gets the names a fresh compilation gives instead of continuing from its last check.
+    let ResetGeneratedNames (input: ParsedInput, compilerState) =
+        compilerState.tcGlobals.CompilerGlobalState
+        |> Option.iter (fun state -> state.ResetCompilerGeneratedNamesOfFile input.QualifiedName.Range.FileIndex)
+
     let TypeCheckOneInputEntry (parseResults: FSharpParseFileResults, tcSink: TcResultsSink, tcState: TcState, moduleNamesDict: ModuleNamesDict, compilerState) =
         let input = parseResults.ParseTree
         let diagnosticsOptions = compilerState.tcConfig.diagnosticsOptions
@@ -549,6 +555,7 @@ module internal ParseAndCheck =
         let prefixPathOpt = None
 
         let input, moduleNamesDict = input |> DeduplicateParsedInputModuleName moduleNamesDict
+        ResetGeneratedNames (input, compilerState)
         let tcResult, tcState =
             CheckOneInput (checkForErrors, compilerState.tcConfig, compilerState.tcImports, compilerState.tcGlobals, prefixPathOpt, tcSink, tcState, input)
             |> Cancellable.runWithoutCancellation
@@ -656,6 +663,7 @@ module internal ParseAndCheck =
             use _scope = new CompilationGlobalsScope (logger, BuildPhase.TypeCheck)
             let checkForErrors () = parseRes.ParseHadErrors || logger.ErrorCount > 0
             let prefixPathOpt = None
+            ResetGeneratedNames (inputs[idx], compilerState)
             let finisher =
                 CheckOneInputWithCallback (NodeToTypeCheck.PhysicalFile idx)
                     (checkForErrors, tcConfig, compilerState.tcImports, compilerState.tcGlobals, prefixPathOpt, TcResultsSink.NoSink, tcState, inputs[idx], false)
