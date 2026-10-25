@@ -398,6 +398,17 @@ val CodegenWitnessesForTyparInst:
     TType list ->
         OperationResult<Choice<TraitConstraintInfo, Expr> list>
 
+// fickl: CodegenWitnessesForTyparInst reusing the caller's InfoReader for the same TcGlobals and ImportMap
+val CodegenWitnessesForTyparInstUsing:
+    InfoReader ->
+    TcValF ->
+    TcGlobals ->
+    ImportMap ->
+    range ->
+    Typars ->
+    TType list ->
+        OperationResult<Choice<TraitConstraintInfo, Expr> list>
+
 /// Generate the lambda argument passed for a use of a generic construct that accepts trait witnesses
 val CodegenWitnessArgForTraitConstraint:
     TcValF ->

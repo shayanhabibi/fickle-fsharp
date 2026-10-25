@@ -36,6 +36,9 @@ type internal SymbolEnv =
 
     member tcValF: ConstraintSolver.TcValF
 
+    // fickl: lets expression conversion reuse it for codegen witnesses
+    member infoReader: InfoReader
+
 /// Indicates the accessibility of a symbol, as seen by the F# language
 type FSharpAccessibility =
     internal new: Accessibility * ?isProtected: bool -> FSharpAccessibility

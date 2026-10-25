@@ -4461,14 +4461,15 @@ let CodegenWitnessExprForTraitConstraint tcVal g amap m (traitInfo:TraitConstrai
         return GenWitnessExpr amap g m traitInfo argExprs
     }
 
-/// Generate the lambda argument passed for a use of a generic construct that accepts trait witnesses
-let CodegenWitnessesForTyparInstWith tcVal g amap m (typars: Typars) tyargs f =
+// fickl: mkInfoReader lets a caller that already has an InfoReader for g and amap reuse it: a new one builds a dozen
+// caches, each preallocating a concurrent dictionary, for every application of a member with trait constraints
+let private codegenWitnessesForTyparInstUsing (mkInfoReader: unit -> InfoReader) tcVal g amap m (typars: Typars) tyargs f =
     let hasTraitConstraint (tp: Typar) =
         tp.Constraints |> List.exists (function TyparConstraint.MayResolveMember _ -> true | _ -> false)
     // Without trait constraints there are no witnesses, so skip building the codegen state (a fresh InfoReader).
     if not (typars |> List.exists hasTraitConstraint) then ResultD [] else
     trackErrors {
-        let css = CreateCodegenState tcVal g amap
+        let css = ConstraintSolverState.New(g, amap, mkInfoReader (), tcVal)
         let csenv = MakeConstraintSolverEnv ContextInfo.NoContext css m (DisplayEnv.Empty g)
         let ftps, _renaming, tinst = FreshenTypeInst g traitCtxtNone m typars
         let traitInfos = GetTraitConstraintInfosOfTypars g ftps
@@ -4485,8 +4486,16 @@ let CodegenWitnessesForTyparInstWith tcVal g amap m (typars: Typars) tyargs f =
         return [ for traitInfo in traitInfos -> f traitInfo (GenWitnessExprLambda amap g m traitInfo) ]
     }
 
+/// Generate the lambda argument passed for a use of a generic construct that accepts trait witnesses
+let CodegenWitnessesForTyparInstWith tcVal g amap m typars tyargs f =
+    codegenWitnessesForTyparInstUsing (fun () -> InfoReader(g, amap)) tcVal g amap m typars tyargs f
+
 let CodegenWitnessesForTyparInst tcVal g amap m typars tyargs =
     CodegenWitnessesForTyparInstWith tcVal g amap m typars tyargs (fun _ -> id)
+
+// fickl: CodegenWitnessesForTyparInst with the caller's InfoReader for g and amap
+let CodegenWitnessesForTyparInstUsing infoReader tcVal g amap m typars tyargs =
+    codegenWitnessesForTyparInstUsing (fun () -> infoReader) tcVal g amap m typars tyargs (fun _ -> id)
 
 /// Generate the lambda argument passed for a use of a generic construct that accepts trait witnesses
 let CodegenWitnessArgForTraitConstraint tcVal g amap m traitInfo =

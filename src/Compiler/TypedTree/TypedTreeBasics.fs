@@ -181,10 +181,9 @@ let ccuOfValRef vref =
     | VRefLocal _ -> None
     | VRefNonLocal nlr -> Some nlr.Ccu
 
-let ccuOfTyconRef eref =
-    match eref with
-    | ERefLocal _ -> None
-    | ERefNonLocal nlr -> Some nlr.Ccu
+// fickl: IsLocalRef instead of |ERefLocal|ERefNonLocal|, which allocates a Choice on every call
+let ccuOfTyconRef (eref: EntityRef) =
+    if eref.IsLocalRef then None else Some eref.nlr.Ccu
 
 //--------------------------------------------------------------------------
 // Type parameters and inference unknowns

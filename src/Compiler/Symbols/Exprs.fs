@@ -529,7 +529,7 @@ module FSharpExprConvert =
                 | TType_measure _ -> false
 
             let witnessExprs =
-                match ConstraintSolver.CodegenWitnessesForTyparInst cenv.tcValF g cenv.amap m tps tyargs with
+                match ConstraintSolver.CodegenWitnessesForTyparInstUsing cenv.infoReader cenv.tcValF g cenv.amap m tps tyargs with // fickl: shared InfoReader
                 // There is a case where optimized code makes expressions that do a shift-left on the 'char'
                 // type.  There is no witness for this case.  This is due to the code
                 //    let inline HashChar (x:char) = (# "or" (# "shl" x 16 : int #) x : int #)

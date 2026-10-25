@@ -87,6 +87,10 @@ module Impl =
     let makeReadOnlyCollection (arr: seq<'T>) =
         System.Collections.ObjectModel.ReadOnlyCollection<_>(Seq.toArray arr) :> IList<_>
 
+    // fickl: for an array nothing else holds, makeReadOnlyCollection without the copy
+    let wrapReadOnly (arr: 'T[]) =
+        System.Collections.ObjectModel.ReadOnlyCollection<_>(arr) :> IList<_>
+
     let makeXmlDoc (doc: XmlDoc) =
         FSharpXmlDoc.FromXmlText doc
 
@@ -455,17 +459,16 @@ module Impl =
         | ValueNone -> mkLocalEntityRef entity
         | ValueSome eref -> eref
 
+    // fickl: IsLocalRef instead of |ERefLocal|ERefNonLocal|, which allocates a Choice on every call
     let entityIsUnresolved(entity:EntityRef) =
-        match entity with
-        | ERefNonLocal(NonLocalEntityRef(ccu, _)) ->
-            ccu.IsUnresolvedReference && entity.TryDeref.IsNone
-        | _ -> false
+        not entity.IsLocalRef && entity.nlr.Ccu.IsUnresolvedReference && entity.TryDeref.IsNone
 
     // fickle: FSharpEntity's isResolvedAndFSharp, for callers that only have the EntityRef
     let entityIsResolvedAndFSharp (cenv: SymbolEnv) (entity:EntityRef) =
-        match entity with
-        | ERefNonLocal(NonLocalEntityRef(ccu, _)) -> not ccu.IsUnresolvedReference && ccu.IsFSharp
-        | _ -> cenv.thisCcu.IsFSharp
+        if entity.IsLocalRef then cenv.thisCcu.IsFSharp
+        else
+            let ccu = entity.nlr.Ccu
+            not ccu.IsUnresolvedReference && ccu.IsFSharp
 
     let checkEntityIsResolved(entity:EntityRef) = 
         if entityIsUnresolved entity then 
@@ -756,10 +759,7 @@ type FSharpEntity(cenv: SymbolEnv, entity: EntityRef, tyargs: TType list) =
     // If an entity is in an assembly not available to us in the resolution set,
     // we generally return "false" from predicates like IsClass, since we know
     // nothing about that type.
-    let isResolvedAndFSharp() =
-        match entity with
-        | ERefNonLocal(NonLocalEntityRef(ccu, _)) -> not ccu.IsUnresolvedReference && ccu.IsFSharp
-        | _ -> cenv.thisCcu.IsFSharp
+    let isResolvedAndFSharp() = entityIsResolvedAndFSharp cenv entity // fickl: shared, non-allocating
 
     let isUnresolved() = entityIsUnresolved entity
     let isResolved() = not (isUnresolved())
@@ -3093,11 +3093,12 @@ type FSharpType(cenv, ty:TType) =
          | TType_anon (_, tyargs)
          | TType_app (_, tyargs, _)
          | TType_tuple (_, tyargs) -> System.Collections.ObjectModel.ReadOnlyCollection<_>([| for ty in tyargs -> FSharpType(cenv, ty) |]) :> IList<_>
-         | TType_fun(domainTy, rangeTy, _) -> [| FSharpType(cenv, domainTy); FSharpType(cenv, rangeTy) |] |> makeReadOnlyCollection
-         | TType_measure (Measure.Const _) ->  [| |] |> makeReadOnlyCollection
-         | TType_measure (Measure.Prod(measure1= t1; measure2 = t2)) ->  [| FSharpType(cenv, TType_measure t1); FSharpType(cenv, TType_measure t2) |] |> makeReadOnlyCollection
-         | TType_measure (Measure.One _) ->  [| |] |> makeReadOnlyCollection
-         | TType_measure (Measure.Inv t1) ->  [| FSharpType(cenv, TType_measure t1) |] |> makeReadOnlyCollection
+         // fickl: wrap the fresh arrays directly; makeReadOnlyCollection copies them
+         | TType_fun(domainTy, rangeTy, _) -> [| FSharpType(cenv, domainTy); FSharpType(cenv, rangeTy) |] |> wrapReadOnly
+         | TType_measure (Measure.Const _) ->  [| |] |> wrapReadOnly
+         | TType_measure (Measure.Prod(measure1= t1; measure2 = t2)) ->  [| FSharpType(cenv, TType_measure t1); FSharpType(cenv, TType_measure t2) |] |> wrapReadOnly
+         | TType_measure (Measure.One _) ->  [| |] |> wrapReadOnly
+         | TType_measure (Measure.Inv t1) ->  [| FSharpType(cenv, TType_measure t1) |] |> wrapReadOnly
          | _ -> invalidOp "not a named type"
         genericArguments <- args
         args
