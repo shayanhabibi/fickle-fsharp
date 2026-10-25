@@ -188,7 +188,22 @@ type PropertyCollector(g, amap, m, ty, optFilter, ad) =
         | _ ->
             ()
 
+#if FABLE_CLI
+    // The dictionary enumerates in hash order, and string hashes are randomized per process, so return the
+    // properties in declaration order: callers that print or pick members must not change from one run to the next.
+    member _.Close() =
+        [ for KeyValue(_, pinfo) in props -> pinfo ]
+        |> List.sortWith (fun pinfo1 pinfo2 ->
+            let rangeOf (pinfo: PropInfo) =
+                match pinfo.ArbitraryValRef with
+                | Some vref -> vref.Range
+                | None -> range0
+            match rangeOrder.Compare(rangeOf pinfo1, rangeOf pinfo2) with
+            | 0 -> String.CompareOrdinal(pinfo1.PropertyName, pinfo2.PropertyName)
+            | c -> c)
+#else
     member _.Close() = [ for KeyValue(_, pinfo) in props -> pinfo ]
+#endif
 
 let rec GetImmediateIntrinsicPropInfosOfTypeAux (optFilter, ad) g amap m withExplicitImpl origTy metadataTy =
 
