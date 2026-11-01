@@ -129,6 +129,7 @@ type DeclarationResult
         envAtEnd: TcEnv,
         checkedDecl: CheckedDeclaration,
         delta: ModuleOrNamespaceType,
+        deltaCombines: bool,
         sink: TcResultsSinkImpl,
         leftovers: TcFileState -> unit
     ) =
@@ -143,10 +144,13 @@ type DeclarationResult
     member internal _.Checked = checkedDecl
     /// What the declaration publishes into the module or namespace it is in.
     member internal _.Delta: ModuleOrNamespaceType = delta
+    /// Whether the delta is combined into the file's contents, as a namespace fragment's is, rather than added.
+    member internal _.DeltaCombines = deltaCombines
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
 
-    /// Whether the two results contribute the same Val and Entity objects, by reference. For tests.
+    /// Whether the two results contribute the same Val and Entity objects, by reference and in the same order.
+    /// For tests.
     member _.IsSameDelta(other: DeclarationResult) =
         let same (mine: seq<'T>) (theirs: seq<'T>) =
             Seq.length mine = Seq.length theirs && Seq.forall2 (fun a b -> obj.ReferenceEquals(a, b)) mine theirs
@@ -291,14 +295,25 @@ module internal DeclarationCheck =
         let entities = after.AllEntities |> Seq.filter (oldEntities.Contains >> not) |> List.ofSeq
         Construct.NewModuleOrNamespaceType after.ModuleOrNamespaceKind entities vals
 
+    /// Whether a declaration publishes into the file's contents by combining: a fragment in a namespace does, at its
+    /// end, and only reads accumulators of its own before that. A fragment with no namespace (namespace global, or the
+    /// module of a file) publishes into the file's accumulator directly, as declarations in a module do.
+    let combinesIntoFile (decl: SynModuleDecl) =
+        match decl with
+        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = longId; kind = kind)) ->
+            // The enclosing namespace path, as EnterNamespaceFragment computes it
+            let path = if kind.IsModule then List.truncate (max 0 (longId.Length - 1)) longId else longId
+            not path.IsEmpty
+        | _ -> false
+
     /// Merges the declarations' deltas in order onto what the scope held before them, as publishing them did: a
-    /// fragment combines its namespaces with the file's, and anything else adds its values and entities.
-    let mergeDeltas fileLevel (scopeContents: ModuleOrNamespaceType) (deltas: ModuleOrNamespaceType list) =
-        if fileLevel then
-            CombineCcuContentFragments(scopeContents :: deltas)
-        else
-            (scopeContents, deltas)
-            ||> List.fold (fun acc delta ->
+    /// namespace fragment combines its namespaces with the file's, and anything else adds its values and entities.
+    let mergeDeltas (scopeContents: ModuleOrNamespaceType) (deltas: (ModuleOrNamespaceType * bool) list) =
+        (scopeContents, deltas)
+        ||> List.fold (fun acc (delta, combines) ->
+            if combines then
+                CombineCcuContentFragments [ acc; delta ]
+            else
                 let acc = (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
                 (acc, delta.AllValsAndMembers) ||> Seq.fold (fun acc v -> acc.AddVal v))
 
@@ -559,13 +574,16 @@ type DeclarationChecker =
         let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
         let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
-        // A fragment publishes by combining its namespaces with the file's, which builds new namespace entities, so
-        // only from an empty start is what it adds the whole of what it leaves.
+        // Combining builds new namespace entities, so only from an empty start is what such a fragment adds the
+        // whole of what it leaves; it reads nothing else from the file's accumulator. Anything else starts from the
+        // earlier declarations' contents, which its duplicate checks read.
+        let deltaCombines = DeclarationCheck.combinesIntoFile decl.Syntax
+
         let contentsAtStart =
-            if DeclarationCheck.splitsFragment start.File then
-                contentsBefore
-            else
+            if deltaCombines then
                 Construct.NewEmptyModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind
+            else
+                contentsBefore
 
         let accumulator = ref contentsAtStart
         let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
@@ -598,6 +616,7 @@ type DeclarationChecker =
             envAtEnd,
             checkedDecl,
             delta,
+            deltaCombines,
             sink,
             DeclarationCheck.leftoversOf cenv
         )
@@ -620,10 +639,7 @@ type DeclarationChecker =
             result.Leftovers cenv
 
         let scopeContents =
-            DeclarationCheck.mergeDeltas
-                (not (DeclarationCheck.splitsFragment file))
-                start.ScopeContents
-                [ for result in results -> result.Delta ]
+            DeclarationCheck.mergeDeltas start.ScopeContents [ for result in results -> result.Delta, result.DeltaCombines ]
 
         let envAtEnd =
             match Array.tryLast results with

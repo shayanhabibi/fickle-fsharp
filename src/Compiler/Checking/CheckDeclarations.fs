@@ -6525,9 +6525,9 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
 
 /// Builds the file's contents from its checked declarations as TcModuleOrNamespaceElements does, with what the
 /// cases for the fragment and its module do after their declarations. env is a new initial environment for the
-/// file, and scopeContents what the declarations of the scope publish, merged. The accumulators and the module and
-/// namespace entities this publishes into are new each time, so it changes neither the setup nor the declarations'
-/// results, and can run again over other results.
+/// file, and scopeContents what the declarations of the scope publish, merged. The accumulators and namespace
+/// entities this publishes into are new each time, and a module's entity gets scopeContents as its whole type, so it
+/// changes neither the declarations' results nor anything a declaration check reads, and can run again.
 let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFileDeclarationScope) (scopeContents: ModuleOrNamespaceType) (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) (envAtEnd: TcEnv) =
     // As TcModuleOrNamespaceElements for a list of non-recursive declarations
     let elementsContents openDecls0 (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) envAtEnd =
@@ -6565,11 +6565,9 @@ let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFi
                     elementsContents [] compiledDefs envAtEnd
                 | ModuleFailed -> elementsContents [] [ ([], [], []) ] envNS
                 | ModuleStarted (moduleEntity, scopem, mModule) ->
-                    // A copy with the same stamp, which FinishNestedModule gives its type: the setup's entity stays as
-                    // it is, and the declarations' values keep it as their parent.
-                    let moduleEntity = { moduleEntity with entity_modul_type = MaybeLazy.Strict scopeContents }
-
-                    // As TcModuleOrNamespaceElementNonMutRec for the module, after its declarations
+                    // As TcModuleOrNamespaceElementNonMutRec for the module, after its declarations. FinishNestedModule
+                    // replaces the type of the setup's entity, the parent of the declarations' values, with
+                    // scopeContents: a whole new value each time, which no declaration check reads.
                     let moduleDef, _, moduleEnvAtEnd =
                         try
                             FinishNestedModule cenv scopem envNS mModule true moduleEntity (ref scopeContents) (elementsContents [] compiledDefs envAtEnd)
