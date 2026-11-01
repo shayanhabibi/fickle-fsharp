@@ -173,6 +173,8 @@ type ValFlags =
 
     member WithHasBeenReferenced: ValFlags
 
+    member WithHasBeenReferencedSetTo: referenced: bool -> ValFlags
+
     member WithIgnoresByrefScope: ValFlags
 
     member WithInlineIfLambda: ValFlags
@@ -2087,6 +2089,9 @@ type Val =
     member SetDeclaringEntity: parent: ParentRef -> unit
 
     member SetHasBeenReferenced: unit -> unit
+
+    /// Sets or clears whether the value has been referenced, recording how to restore it in the active mutation log
+    member SetHasBeenReferencedTo: referenced: bool -> unit
 
     member SetIgnoresByrefScope: unit -> unit
 

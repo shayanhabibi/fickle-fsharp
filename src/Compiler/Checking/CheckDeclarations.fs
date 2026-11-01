@@ -6652,12 +6652,22 @@ let rec ExtendEnvWithDeclaration (cenv: cenv) scopem (env: TcEnv) (synDecl: SynM
         | SynModuleDecl.Types _ -> addTyconsAndMembers env
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(synType = None)) -> env
         | SynModuleDecl.NestedModule(range = m) -> (env, modules) ||> List.fold (AddLocalSubModule g amap m)
-        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = longId; kind = kind; decls = decls; range = m)) ->
+        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = longId; isRecursive = isRec; kind = kind; decls = decls; range = m)) ->
             // As EnterNamespaceFragment and FinishNamespaceFragment
             let enclosingNamespacePath = if kind.IsModule then List.truncate (max 0 (longId.Length - 1)) longId else longId
 
             if not (isNil enclosingNamespacePath) then
                 AddLocalRootModuleOrNamespace g amap m env defs
+            elif isRec then
+                // EnterNamespaceFragment adds what the file holds so far again; then TcModuleOrNamespaceElementsMutRec
+                // leaves the environment of a recursive group, which FinishNamespaceFragment keeps. A 'module rec X'
+                // fragment is a group of one module.
+                let env = AddLocalRootModuleOrNamespace g amap m env env.eModuleOrNamespaceTypeAccumulator.Value
+
+                if kind.IsModule then
+                    (env, modules) ||> List.fold (AddLocalSubModule g amap m)
+                else
+                    ExtendEnvWithMutRecDeclarations cenv m env decls defs
             elif kind.IsModule then
                 // 'module X' continues to its end: the environment after it is the one at the end of X's declarations
                 match modules with
@@ -6673,6 +6683,36 @@ let rec ExtendEnvWithDeclaration (cenv: cenv) scopem (env: TcEnv) (synDecl: SynM
         | SynModuleDecl.Expr _ -> env
     with RecoverableException _ ->
         env
+
+/// What TcModuleOrNamespaceElementsMutRec adds to the environment for a recursive group's top level, in the order of
+/// TcMutRecDefns_ComputeEnvs whatever the order of the declarations: modules, opens, types and exceptions, the modules
+/// again, module abbreviations, then values and members.
+and ExtendEnvWithMutRecDeclarations (cenv: cenv) m (env: TcEnv) (decls: SynModuleDecl list) (defs: ModuleOrNamespaceType) =
+    let g = cenv.g
+    let amap = cenv.amap
+    let m = match decls with [] -> m | _ -> decls |> List.map (fun d -> d.Range) |> List.reduce unionRanges
+    let entities = List.ofSeq defs.AllEntities
+    let modules = entities |> List.filter (fun e -> e.IsModuleOrNamespace)
+    let tycons = entities |> List.filter (fun e -> not e.IsModuleOrNamespace)
+    let env = (env, modules) ||> List.fold (AddLocalSubModule g amap m)
+
+    let env =
+        (env, decls) ||> List.fold (fun env decl ->
+            match decl with
+            | SynModuleDecl.Open(target, _) -> TcOpenDecl cenv m env target |> fst
+            | _ -> env)
+
+    let env = AddLocalTycons g amap m tycons env
+    let env = (env, tycons |> List.filter (fun e -> e.IsFSharpException)) ||> List.fold (AddLocalExnDefnAndReport TcResultsSink.NoSink m)
+    let env = (env, modules) ||> List.fold (AddLocalSubModule g amap m)
+
+    let env =
+        (env, decls) ||> List.fold (fun env decl ->
+            match decl with
+            | SynModuleDecl.ModuleAbbrev(id, p, mAbbrev) -> MutRecBindingChecking.TcModuleAbbrevDecl cenv m env (id, p, mAbbrev)
+            | _ -> env)
+
+    AddLocalVals g TcResultsSink.NoSink m (List.ofSeq defs.AllValsAndMembers) env
 
 /// ExtendEnvWithDeclaration over declarations checked as one, each defining what defs holds within its range.
 and ExtendEnvWithDeclarations (cenv: cenv) endm (env: TcEnv) (decls: SynModuleDecl list) (defs: ModuleOrNamespaceType) =

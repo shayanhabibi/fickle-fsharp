@@ -271,7 +271,6 @@ type DeclarationResult
         diagnostics: FSharpDiagnostic[],
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
-        dependsOnLaterDeclarations: bool,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
         checkedDecl: CheckedDeclaration,
@@ -280,7 +279,8 @@ type DeclarationResult
         sink: TcResultsSinkImpl,
         leftovers: TcFileState -> unit,
         nesting: Nesting,
-        typedUses: DeclarationRef[]
+        typedUses: DeclarationRef[],
+        references: (DeclarationRef * string)[]
     ) =
     let mutable finishTypedUses: DeclarationRef[] = [||]
 
@@ -301,11 +301,10 @@ type DeclarationResult
 
     /// Whether later checks change this result in place, so that (ruling R12) it depends on every later declaration
     /// of its file: when one changes, is added or is removed, discard this result and re-check the declaration from
-    /// its environment before it, and everything after it. True when it LeavesFreeTypars, and when the unused-value
-    /// warning is on (FS1182, by --warnon or --warnaserror) in a file with a signature and the declaration defines a
-    /// module value: such a value the signature leaves out is reported unused unless something references it, and
-    /// checking a later declaration marks it referenced (SetHasBeenReferenced), which nothing undoes.
-    member _.DependsOnLaterDeclarations = dependsOnLaterDeclarations
+    /// its environment before it, and everything after it. That is when it LeavesFreeTypars. Checks also mark the
+    /// values they use referenced, which the unused-value warning (FS1182) reads; FinishFile recomputes those marks
+    /// from the current results (ruling R15), so they need no dependency.
+    member _.DependsOnLaterDeclarations = leavesFreeTypars
 
     member _.EnvAfter = envAfter
 
@@ -322,6 +321,8 @@ type DeclarationResult
         | atFinish -> Array.append typedUses atFinish |> Array.distinct |> Array.sort
 
     member internal _.SetFinishTypedUses(uses: DeclarationRef[]) = finishTypedUses <- uses
+    /// The module values of the project the check marked referenced: the declaration defining each, and its name
+    member internal _.References = references
     member internal _.Start = start
     member internal _.Declaration = declaration
     member internal _.Ref = { File = start.Parse.FileName; Key = Some declaration.Key }
@@ -794,6 +795,45 @@ module internal DeclarationCheck =
                 yield v.Stamp
         }
 
+    /// The module values in a module type, including those inside its modules.
+    let rec moduleValuesOf (mty: ModuleOrNamespaceType) =
+        seq {
+            for v in mty.AllValsAndMembers do
+                if v.IsModuleBinding then
+                    yield v
+
+            for entity in mty.AllEntities do
+                if entity.IsModuleOrNamespace then
+                    yield! moduleValuesOf entity.ModuleOrNamespaceType
+        }
+
+    /// Marks referenced exactly the module values of the results that the results' checks referenced (ruling R15).
+    /// A check marks the values it uses, and a later check can mark an earlier result's value, or a value of an earlier
+    /// version of a declaration that the current result no longer holds: so every flag is cleared, then each recorded
+    /// reference is found by its declaration's key and the value's name in the current results. Both are recorded in
+    /// the active mutation log, which the next finish or check undoes.
+    let replayReferences (fileName: string) (results: DeclarationResult[]) =
+        let byKey = Dictionary<DeclarationKey, DeclarationResult>(HashIdentity.Structural)
+
+        for result in results do
+            byKey[result.Key] <- result
+
+        for result in results do
+            for v in moduleValuesOf result.Delta do
+                v.SetHasBeenReferencedTo false
+
+        for result in results do
+            for declaration, name in result.References do
+                match declaration.Key with
+                | Some key when String.Equals(declaration.File, fileName, StringComparison.OrdinalIgnoreCase) ->
+                    match byKey.TryGetValue key with
+                    | true, target ->
+                        for v in moduleValuesOf target.Delta do
+                            if v.LogicalName = name then
+                                v.SetHasBeenReferencedTo true
+                    | _ -> ()
+                | _ -> ()
+
     /// Records the declaration as the definition of what its delta publishes.
     let addDefinitions (definitions: Map<Stamp, DeclarationRef>) (declaration: DeclarationRef) (delta: ModuleOrNamespaceType) =
         (definitions, stampsOf delta) ||> Seq.fold (fun acc stamp -> Map.add stamp declaration acc)
@@ -805,16 +845,18 @@ module internal DeclarationCheck =
     let signatureDefinitions fileName (sigType: ModuleOrNamespaceType) =
         addDefinitions Map.empty { File = fileName; Key = None } sigType
 
-    /// The definitions of a file's inferred signature, a copy of the file's contents with new stamps: each copied
-    /// entity and value is matched to the original by position and name, or by name where the counts differ.
+    /// The definitions of a file's inferred signature, a copy of the file's contents with new stamps
+    /// (copyModuleOrNamespaceType keeps every entity and value, in order): each copied entity and value is matched to
+    /// the original at the same position. A copy of another shape would lose definitions, so it raises.
     let rec copiedDefinitions (own: Map<Stamp, DeclarationRef>) (contents: ModuleOrNamespaceType) (copy: ModuleOrNamespaceType) acc =
         let pairs (originals: seq<'T>) (copies: seq<'T>) (name: 'T -> string) =
             let originals, copies = Array.ofSeq originals, Array.ofSeq copies
+            let names (items: 'T[]) = items |> Array.map name |> String.concat ", "
 
-            if originals.Length = copies.Length then
-                Array.zip originals copies |> Array.filter (fun (o, c) -> name o = name c)
-            else
-                copies |> Array.choose (fun c -> originals |> Array.tryFind (fun o -> name o = name c) |> Option.map (fun o -> o, c))
+            if originals.Length <> copies.Length || Array.exists2 (fun o c -> name o <> name c) originals copies then
+                invalidOp $"The inferred signature is not a copy of the file's contents: [%s{names originals}] against [%s{names copies}]."
+
+            Array.zip originals copies
 
         let add acc (original: Stamp) (copied: Stamp) =
             match own.TryFind original with
@@ -1235,6 +1277,8 @@ type DeclarationChecker =
         use _ = FSharp.Compiler.Cancellable.UsingToken ct
         let sink = TcResultsSinkImpl(state.tcGlobals)
         let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
+        let referenced = ResizeArray<Val>()
+        cenv.recordValueReference <- fun v -> if v.IsModuleBinding then referenced.Add v
         let envBefore = DeclarationCheck.exitModules state start envBefore decl.Depth
         let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
@@ -1330,23 +1374,18 @@ type DeclarationChecker =
         let leavesFreeTypars =
             not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env))
 
-        // With FS1182 on, a module value of a file with a signature that the signature leaves out is reported unless
-        // something references it, and checking a later declaration marks it referenced, which nothing undoes
-        let referencedByLater =
-            let options = state.tcConfig.diagnosticsOptions
-
-            let rec hasValues (mty: ModuleOrNamespaceType) =
-                mty.AllValsAndMembers |> Seq.exists (fun v -> not v.IsMember)
-                || mty.AllEntities |> Seq.exists (fun e -> e.IsModuleOrNamespace && hasValues e.ModuleOrNamespaceType)
-
-            (List.contains 1182 options.WarnOn || List.contains 1182 options.WarnAsError)
-            && start.RootSigOpt.IsSome
-            && hasValues delta
-
         let self = { File = start.Parse.FileName; Key = Some decl.Key }
         let definitions = DeclarationCheck.addDefinitions envBefore.Definitions self delta
         let envAfter = DeclEnv(envAfter.Env, envAfter.Parent, envAfter.TypeNames, envAfter.Frames, definitions)
         let contents, _, _ = checkedDecl
+
+        // By the declaration that defines each and the value's name, never the value: FinishFile finds the value in
+        // whatever result of that declaration is current
+        let references =
+            referenced
+            |> Seq.choose (fun v -> definitions.TryFind v.Stamp |> Option.map (fun declaration -> declaration, v.LogicalName))
+            |> Seq.distinct
+            |> Array.ofSeq
 
         DeclarationResult(
             start,
@@ -1355,7 +1394,6 @@ type DeclarationChecker =
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
             leavesFreeTypars,
-            leavesFreeTypars || referencedByLater,
             envAfter,
             envAtEnd,
             checkedDecl,
@@ -1364,7 +1402,8 @@ type DeclarationChecker =
             sink,
             DeclarationCheck.leftoversOf cenv,
             nesting,
-            DeclarationCheck.typedUsesOf definitions self delta contents (Some sink)
+            DeclarationCheck.typedUsesOf definitions self delta contents (Some sink),
+            references
         )
 
     /// The environment after the declaration of `result`, assembled from `envBefore` without checking it again: what
@@ -1423,14 +1462,18 @@ type DeclarationChecker =
                     | frame :: _ -> frame.Entity.IsSome
                     | [] -> true)
 
-            let accumulator = ref (DeclarationCheck.mergeDelta contentsBefore result.Delta result.DeltaCombines)
-            let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
+            // Replayed against what the module or namespace held before it, as its check saw it (a recursive
+            // fragment reads that), then given what it publishes
+            let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = ref contentsBefore }
 
             let env =
                 if checks then
                     ExtendEnvWithDeclaration cenv decl.ScopeRange env decl.Syntax result.Delta
                 else
                     env
+
+            let accumulator = ref (DeclarationCheck.mergeDelta contentsBefore result.Delta result.DeltaCombines)
+            let env = { env with eModuleOrNamespaceTypeAccumulator = accumulator }
 
             let frames =
                 match envBefore.Frames with
@@ -1510,6 +1553,7 @@ type DeclarationChecker =
             ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
 
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
+        DeclarationCheck.replayReferences start.Parse.FileName results
 
         let _topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile =
             CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents

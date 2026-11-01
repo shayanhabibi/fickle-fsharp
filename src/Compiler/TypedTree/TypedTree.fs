@@ -244,6 +244,9 @@ type ValFlags(flags: int64) =
 
     member x.WithHasBeenReferenced                     =  ValFlags(flags ||| 0b00001000000000000000L)
 
+    member x.WithHasBeenReferencedSetTo(referenced: bool) =
+        if referenced then x.WithHasBeenReferenced else ValFlags(flags &&& ~~~0b00001000000000000000L)
+
     member x.IsCompiledAsStaticPropertyWithoutField =             (flags &&& 0b00010000000000000000L) <> 0L
 
     member x.WithIsCompiledAsStaticPropertyWithoutField = ValFlags(flags ||| 0b00010000000000000000L)
@@ -3519,6 +3522,16 @@ type Val =
     member x.SetMakesNoCriticalTailcalls() = x.val_flags <- x.val_flags.WithMakesNoCriticalTailcalls
 
     member x.SetHasBeenReferenced() = x.val_flags <- x.val_flags.WithHasBeenReferenced
+
+    /// Sets or clears whether the value has been referenced, recording how to restore it in the active mutation log
+    member x.SetHasBeenReferencedTo(referenced: bool) =
+        match MutationLog.Current with
+        | null -> ()
+        | log ->
+            let was = x.val_flags.HasBeenReferenced
+            log.Add(fun () -> x.val_flags <- x.val_flags.WithHasBeenReferencedSetTo was)
+
+        x.val_flags <- x.val_flags.WithHasBeenReferencedSetTo referenced
 
     member x.SetIsCompiledAsStaticPropertyWithoutField() = x.val_flags <- x.val_flags.WithIsCompiledAsStaticPropertyWithoutField
 
