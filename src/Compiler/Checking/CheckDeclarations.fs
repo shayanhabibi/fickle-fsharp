@@ -6411,7 +6411,7 @@ let CheckOneImplFile
 [<NoEquality; NoComparison>]
 type ImplFileModuleState =
     | NoModule
-    | ModuleStarted of moduleEntity: ModuleOrNamespace * moduleTyAcc: ModuleOrNamespaceType ref * scopem: range * m: range
+    | ModuleStarted of moduleEntity: ModuleOrNamespace * scopem: range * m: range
     /// Setting up the module failed, which skips its declarations but still finishes the fragment
     | ModuleFailed
 
@@ -6421,8 +6421,8 @@ type ImplFileFragmentScope =
     { Syntax: SynModuleOrNamespace
       EnclosingNamespacePath: Ident list
       EnvNS: TcEnv
-      ModTyRoot: ModuleOrNamespaceType
-      NsInfo: (ModuleOrNamespace option * ModuleOrNamespaceType ref) option
+      /// The contents of the namespace's accumulator before the declarations
+      ModTyNS: ModuleOrNamespaceType
       Module: ImplFileModuleState }
 
 [<NoEquality; NoComparison>]
@@ -6472,7 +6472,7 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
         cenv.synArgNameGenerator.Reset()
         try
             let endm = m.EndRange
-            let enclosingNamespacePath, defs, envNS, modTyRoot, nsInfo, _ = EnterNamespaceFragment cenv env fragment
+            let enclosingNamespacePath, defs, envNS, _, _, _ = EnterNamespaceFragment cenv env fragment
 
             // As TcModuleOrNamespaceElements for the fragment's declarations
             if cenv.compilingCanonicalFslibModuleType then
@@ -6483,8 +6483,7 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
                 { Syntax = fragment
                   EnclosingNamespacePath = enclosingNamespacePath
                   EnvNS = envNS
-                  ModTyRoot = modTyRoot
-                  NsInfo = nsInfo
+                  ModTyNS = envNS.eModuleOrNamespaceTypeAccumulator.Value
                   Module = moduleState }
 
             match defs with
@@ -6495,7 +6494,7 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
                 cenv.synArgNameGenerator.Reset()
                 try
                     let (SynComponentInfo(xmlDoc = moduleXml)) = compInfo
-                    let moduleEntity, envForModule, moduleTyAcc = TcNestedModuleHeader cenv ParentNone typeNames envNS compInfo
+                    let moduleEntity, envForModule, _ = TcNestedModuleHeader cenv ParentNone typeNames envNS compInfo
 
                     // As TcModuleOrNamespaceElements for the module's declarations
                     if cenv.compilingCanonicalFslibModuleType then
@@ -6505,7 +6504,7 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
                       Env = envForModule
                       TypeNames = EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv envForModule moduleDefs
                       ChecksDeclarations = true
-                      Kind = InFragment (fragmentScope (ModuleStarted (moduleEntity, moduleTyAcc, scopem, mModule))) }
+                      Kind = InFragment (fragmentScope (ModuleStarted (moduleEntity, scopem, mModule))) }
                 with RecoverableException exn ->
                     errorRecovery exn modDecl.Range
                     { Parent = ParentNone
@@ -6525,8 +6524,11 @@ let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragme
     | _ -> fileLevel
 
 /// Builds the file's contents from its checked declarations as TcModuleOrNamespaceElements does, with what the
-/// cases for the fragment and its module do after their declarations. env is the file's initial environment.
-let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFileDeclarationScope) (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) (envAtEnd: TcEnv) =
+/// cases for the fragment and its module do after their declarations. env is a new initial environment for the
+/// file, and scopeContents what the declarations of the scope publish, merged. The accumulators and the module and
+/// namespace entities this publishes into are new each time, so it changes neither the setup nor the declarations'
+/// results, and can run again over other results.
+let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFileDeclarationScope) (scopeContents: ModuleOrNamespaceType) (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) (envAtEnd: TcEnv) =
     // As TcModuleOrNamespaceElements for a list of non-recursive declarations
     let elementsContents openDecls0 (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) envAtEnd =
         let moduleDefs = List.collect p13 compiledDefs
@@ -6534,31 +6536,49 @@ let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFi
         TMDefs moduleDefs, List.collect p33 compiledDefs, envAtEnd
 
     match scope.Kind with
-    | FileLevel -> elementsContents openDecls0 compiledDefs envAtEnd
+    | FileLevel ->
+        env.eModuleOrNamespaceTypeAccumulator.Value <- scopeContents
+        elementsContents openDecls0 compiledDefs envAtEnd
     | FragmentFailed -> elementsContents openDecls0 [ ([], [], []) ] env
     | InFragment fragmentScope ->
 
     let (SynModuleOrNamespace(kind = kind; range = m)) = fragmentScope.Syntax
-    let envNS = fragmentScope.EnvNS
+    let enclosingNamespacePath = fragmentScope.EnclosingNamespacePath
+
+    // As EnterNamespaceFragment, with a new accumulator: LocateEnv gives a namespace its own, and the file's otherwise
+    let envNS =
+        let accNS =
+            if isNil enclosingNamespacePath then env.eModuleOrNamespaceTypeAccumulator
+            else ref fragmentScope.ModTyNS
+        { fragmentScope.EnvNS with eModuleOrNamespaceTypeAccumulator = accNS }
+
+    let modTyRoot, modulNSs = BuildRootModuleType enclosingNamespacePath envNS.eCompPath envNS.eModuleOrNamespaceTypeAccumulator.Value
+    let nsInfo = Some (List.tryHead modulNSs, envNS.eModuleOrNamespaceTypeAccumulator)
 
     // As TcModuleOrNamespaceElementNonMutRec for the fragment, after its declarations
     let fragmentDefs, _, envAtEnd =
         try
             let moduleContents =
                 match fragmentScope.Module with
-                | NoModule -> elementsContents [] compiledDefs envAtEnd
+                | NoModule ->
+                    envNS.eModuleOrNamespaceTypeAccumulator.Value <- scopeContents
+                    elementsContents [] compiledDefs envAtEnd
                 | ModuleFailed -> elementsContents [] [ ([], [], []) ] envNS
-                | ModuleStarted (moduleEntity, moduleTyAcc, scopem, mModule) ->
+                | ModuleStarted (moduleEntity, scopem, mModule) ->
+                    // A copy with the same stamp, which FinishNestedModule gives its type: the setup's entity stays as
+                    // it is, and the declarations' values keep it as their parent.
+                    let moduleEntity = { moduleEntity with entity_modul_type = MaybeLazy.Strict scopeContents }
+
                     // As TcModuleOrNamespaceElementNonMutRec for the module, after its declarations
                     let moduleDef, _, moduleEnvAtEnd =
                         try
-                            FinishNestedModule cenv scopem envNS mModule true moduleEntity moduleTyAcc (elementsContents [] compiledDefs envAtEnd)
+                            FinishNestedModule cenv scopem envNS mModule true moduleEntity (ref scopeContents) (elementsContents [] compiledDefs envAtEnd)
                         with RecoverableException exn ->
                             errorRecovery exn mModule
                             ([], [], []), envNS, envNS
                     elementsContents [] [ moduleDef ] moduleEnvAtEnd
 
-            FinishNamespaceFragment cenv env kind m fragmentScope.EnclosingNamespacePath envNS fragmentScope.ModTyRoot fragmentScope.NsInfo moduleContents
+            FinishNamespaceFragment cenv env kind m enclosingNamespacePath envNS modTyRoot nsInfo moduleContents
         with RecoverableException exn ->
             errorRecovery exn m
             ([], [], []), env, env

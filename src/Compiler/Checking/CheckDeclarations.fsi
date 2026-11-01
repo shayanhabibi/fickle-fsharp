@@ -118,6 +118,7 @@ val ExitImplFileDeclarations:
     env: TcEnv ->
     openDecls0: OpenDeclaration list ->
     scope: ImplFileDeclarationScope ->
+    scopeContents: ModuleOrNamespaceType ->
     compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list ->
     envAtEnd: TcEnv ->
         ModuleOrNamespaceContents * (AttributeTargets * Attrib) list * TcEnv

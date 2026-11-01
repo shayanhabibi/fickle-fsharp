@@ -22,9 +22,11 @@ open FSharp.Compiler.NameResolution
 open FSharp.Compiler.ParseAndCheckInputs
 open FSharp.Compiler.SourceCodeServices
 open FSharp.Compiler.Syntax
+open FSharp.Compiler.TcGlobals
 open FSharp.Compiler.Text
 open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
+open FSharp.Compiler.TypedTreeOps
 
 type DeclarationKind =
     | Value
@@ -53,8 +55,9 @@ type ParsedDeclaration internal (key: DeclarationKey, decl: SynModuleDecl, scope
     /// A hash of the declaration's source text. Unequal hashes mean the text changed; equal ones do not prove
     /// it is the same, so compare Text for that.
     member _.SyntaxHash = hash text
-    /// The declaration's source text, from the start of its range to its end.
-    member internal _.Text = text
+    /// The declaration's source text, from the start of its range to its end. Compare Text, not SyntaxHash, to
+    /// decide a declaration is unchanged.
+    member _.Text = text
     member internal _.Syntax = decl
     /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
     member internal _.ScopeRange = scopem
@@ -89,11 +92,10 @@ type FileStart
         moduleNamesDict: ModuleNamesDict,
         tcState: TcState,
         rootSigOpt: ModuleOrNamespaceType option,
-        cenv: TcFileState,
-        envFile: TcEnv,
-        moduleTyAcc: ModuleOrNamespaceType ref,
         scope: ImplFileDeclarationScope,
+        scopeContents: ModuleOrNamespaceType,
         sink: TcResultsSinkImpl,
+        leftovers: TcFileState -> unit,
         diagnostics: FSharpDiagnostic[],
         errorCount: int
     ) =
@@ -103,11 +105,11 @@ type FileStart
     member internal _.ModuleNamesDict = moduleNamesDict
     member internal _.TcState = tcState
     member internal _.RootSigOpt = rootSigOpt
-    member internal _.Cenv = cenv
-    member internal _.EnvFile = envFile
-    member internal _.ModuleTyAcc = moduleTyAcc
     member internal _.Scope = scope
+    /// What the scope's accumulator held before the declarations: FinishFile merges their deltas onto it.
+    member internal _.ScopeContents = scopeContents
     member internal _.Sink = sink
+    member internal _.Leftovers = leftovers
     /// What setting up the file reported.
     member internal _.Diagnostics = diagnostics
     member internal _.ErrorCount = errorCount
@@ -125,7 +127,10 @@ type DeclarationResult
         leavesFreeTypars: bool,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
-        checkedDecl: CheckedDeclaration
+        checkedDecl: CheckedDeclaration,
+        delta: ModuleOrNamespaceType,
+        sink: TcResultsSinkImpl,
+        leftovers: TcFileState -> unit
     ) =
     member _.Key = key
     member _.Fingerprint = fingerprint
@@ -136,6 +141,18 @@ type DeclarationResult
     /// The environment at the end of the enclosing scope if this is its last declaration.
     member internal _.EnvAtEnd = envAtEnd
     member internal _.Checked = checkedDecl
+    /// What the declaration publishes into the module or namespace it is in.
+    member internal _.Delta: ModuleOrNamespaceType = delta
+    member internal _.Sink = sink
+    member internal _.Leftovers = leftovers
+
+    /// Whether the two results contribute the same Val and Entity objects, by reference. For tests.
+    member _.IsSameDelta(other: DeclarationResult) =
+        let same (mine: seq<'T>) (theirs: seq<'T>) =
+            Seq.length mine = Seq.length theirs && Seq.forall2 (fun a b -> obj.ReferenceEquals(a, b)) mine theirs
+
+        same delta.AllValsAndMembers other.Delta.AllValsAndMembers
+        && same delta.AllEntities other.Delta.AllEntities
 
 [<Sealed>]
 type FileResult
@@ -273,6 +290,88 @@ module internal DeclarationCheck =
         let vals = after.AllValsAndMembers |> Seq.filter (oldVals.Contains >> not) |> List.ofSeq
         let entities = after.AllEntities |> Seq.filter (oldEntities.Contains >> not) |> List.ofSeq
         Construct.NewModuleOrNamespaceType after.ModuleOrNamespaceKind entities vals
+
+    /// Merges the declarations' deltas in order onto what the scope held before them, as publishing them did: a
+    /// fragment combines its namespaces with the file's, and anything else adds its values and entities.
+    let mergeDeltas fileLevel (scopeContents: ModuleOrNamespaceType) (deltas: ModuleOrNamespaceType list) =
+        if fileLevel then
+            CombineCcuContentFragments(scopeContents :: deltas)
+        else
+            (scopeContents, deltas)
+            ||> List.fold (fun acc delta ->
+                let acc = (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
+                (acc, delta.AllValsAndMembers) ||> Seq.fold (fun acc v -> acc.AddVal v))
+
+    /// What checking left in cenv that CheckImplFileTail reads, to replay into the finish's own cenv.
+    let leftoversOf (cenv: TcFileState) : TcFileState -> unit =
+        let css = cenv.css
+        let preDefaults = css.PostInferenceChecksPreDefaults.ToArray()
+        let final = css.PostInferenceChecksFinal.ToArray()
+        // Oldest first for each type variable, so adding them again keeps their order
+        let extraCxs = css.ExtraCxs.Fold (fun stamp cx acc -> (stamp, cx) :: acc) []
+        let unionsWithDeferredAttributes = css.UnionsWithDeferredAttributes
+        let deferredUnionNullnessChecks = css.DeferredUnionNullnessChecks
+        let createsGeneratedProvidedTypes = cenv.createsGeneratedProvidedTypes
+        let namedDebugPoints = Array.ofSeq cenv.namedDebugPointsForInlinedCode
+
+        fun into ->
+            into.css.PostInferenceChecksPreDefaults.AddRange preDefaults
+            into.css.PostInferenceChecksFinal.AddRange final
+
+            for stamp, cx in extraCxs do
+                into.css.ExtraCxs.Add(stamp, cx)
+
+            into.css.UnionsWithDeferredAttributes <- Set.union into.css.UnionsWithDeferredAttributes unionsWithDeferredAttributes
+            into.css.DeferredUnionNullnessChecks <- deferredUnionNullnessChecks @ into.css.DeferredUnionNullnessChecks
+
+            if createsGeneratedProvidedTypes then
+                into.createsGeneratedProvidedTypes <- true
+
+            for KeyValue(key, m) in namedDebugPoints do
+                into.namedDebugPointsForInlinedCode[key] <- m
+
+    /// A checker state of its own (solver, caches, sink), with a new initial environment and accumulator for the file.
+    let newCheckerState (state: CompilerState) (tcState: TcState) rootSigOpt file (sink: TcResultsSinkImpl) =
+        CreateImplFileCheckState(
+            state.tcGlobals,
+            state.tcImports.GetImportMap(),
+            tcState.Ccu,
+            conditionalDefines state,
+            TcResultsSink.WithSink sink,
+            state.tcConfig.internalTestSpanStackReferring,
+            tcState.TcEnvFromImpls,
+            rootSigOpt,
+            file,
+            state.tcConfig.diagnosticsOptions
+        )
+
+    /// The results of several sinks as one sink's, in order.
+    let mergeSinks (g: TcGlobals) (sinks: TcResultsSinkImpl list) =
+        let all (pick: TcResolutions -> ResizeArray<'T>) =
+            ResizeArray(sinks |> Seq.collect (fun sink -> pick (sink.GetResolutions())))
+
+        let resolutions =
+            TcResolutions(
+                all (fun r -> r.CapturedEnvs),
+                all (fun r -> r.CapturedExpressionTypings),
+                all (fun r -> r.CapturedNameResolutions),
+                all (fun r -> r.CapturedMethodGroupResolutions),
+                all (fun r -> r.CapturedRelatedSymbolUses)
+            )
+
+        let formatSpecifierLocations =
+            sinks |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations()) |> Array.ofSeq
+
+        let symbolUses =
+            TcSymbolUses(g, resolutions.CapturedNameResolutions, resolutions.CapturedRelatedSymbolUses, formatSpecifierLocations)
+
+        let openDeclarations =
+            sinks
+            |> Seq.collect (fun sink -> sink.GetOpenDeclarations())
+            |> Seq.distinctBy (fun x -> x.Range, x.AppliedScope, x.IsOwnNamespace)
+            |> Array.ofSeq
+
+        resolutions, symbolUses, openDeclarations
 
     let fingerprintOf (contribution: ModuleOrNamespaceType) =
         match SignatureFingerprint.compute contribution EmptyTopAttrs with
@@ -424,29 +523,31 @@ type DeclarationChecker =
                     errorR (Error(FSComp.SR.buildImplementationAlreadyGiven (RichText.mkModule qualNameOfFile.Text), input.Range))
 
                 let sink = TcResultsSinkImpl(state.tcGlobals)
-
-                let cenv, envFile, moduleTyAcc =
-                    CreateImplFileCheckState(
-                        state.tcGlobals,
-                        state.tcImports.GetImportMap(),
-                        tcState.Ccu,
-                        DeclarationCheck.conditionalDefines state,
-                        TcResultsSink.WithSink sink,
-                        state.tcConfig.internalTestSpanStackReferring,
-                        tcState.TcEnvFromImpls,
-                        rootSigOpt,
-                        file,
-                        state.tcConfig.diagnosticsOptions
-                    )
-
+                let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
                 let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
                 let diagnostics = DeclarationCheck.diagnosticsOf state parse.FileName capturing
 
                 let start =
-                    FileStart(ctx, parse, file, moduleNamesDict, tcState, rootSigOpt, cenv, envFile, moduleTyAcc, scope, sink, diagnostics, logger.ErrorCount)
+                    FileStart(
+                        ctx,
+                        parse,
+                        file,
+                        moduleNamesDict,
+                        tcState,
+                        rootSigOpt,
+                        scope,
+                        scope.Env.eModuleOrNamespaceTypeAccumulator.Value,
+                        sink,
+                        DeclarationCheck.leftoversOf cenv,
+                        diagnostics,
+                        logger.ErrorCount
+                    )
 
                 start, DeclEnv scope.Env
 
+    /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
+    /// state and accumulator, so calls may come in any order, again, or at the same time, and leave the file setup
+    /// and other results as they were.
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
@@ -454,9 +555,20 @@ type DeclarationChecker =
         // Cancellable.run hands ct to the cancellable computation; code outside it calls CheckAndThrow, which reads
         // the ambient token, and nothing else sets that one.
         use _ = FSharp.Compiler.Cancellable.UsingToken ct
-        let env = envBefore.Env
-        let accumulator = env.eModuleOrNamespaceTypeAccumulator
-        let accumulatedBefore = accumulator.Value
+        let sink = TcResultsSinkImpl(state.tcGlobals)
+        let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
+        let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
+
+        // A fragment publishes by combining its namespaces with the file's, which builds new namespace entities, so
+        // only from an empty start is what it adds the whole of what it leaves.
+        let contentsAtStart =
+            if DeclarationCheck.splitsFragment start.File then
+                contentsBefore
+            else
+                Construct.NewEmptyModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind
+
+        let accumulator = ref contentsAtStart
+        let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
 
         let checkedDecl, envAfter, envAtEnd =
             let scope = start.Scope
@@ -464,8 +576,6 @@ type DeclarationChecker =
             if not scope.ChecksDeclarations then
                 ([], [], []), env, env
             else
-                let cenv = start.Cenv
-
                 TcModuleOrNamespaceElementNonMutRec cenv scope.Parent scope.TypeNames decl.ScopeRange env decl.Syntax
                 |> cenv.stackGuard.GuardCancellable
                 |> Cancellable.run ct
@@ -473,32 +583,47 @@ type DeclarationChecker =
                     | ValueOrCancelled.Value result -> result
                     | ValueOrCancelled.Cancelled exn -> raise exn
 
-        let fingerprint =
-            DeclarationCheck.fingerprintOf (DeclarationCheck.contribution accumulatedBefore accumulator.Value)
+        let delta = DeclarationCheck.contribution contentsAtStart accumulator.Value
 
         let leavesFreeTypars =
             not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter))
 
         DeclarationResult(
             decl.Key,
-            fingerprint,
+            DeclarationCheck.fingerprintOf delta,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.ErrorCount,
             leavesFreeTypars,
             DeclEnv envAfter,
             envAtEnd,
-            checkedDecl
+            checkedDecl,
+            delta,
+            sink,
+            DeclarationCheck.leftoversOf cenv
         )
 
+    /// Builds the file from the declarations' results, in declaration order, and closes its inference scope. The
+    /// file's module type, accumulators and checker state are new each time, so it can run again over other results.
     static member FinishFile(start: FileStart, results: DeclarationResult[]) : FileResult =
         let state = start.Context.State
         let parse = start.Parse
         let file = start.File
-        let cenv = start.Cenv
         let tcState = start.TcState
         let capturing, logger = DeclarationCheck.newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+        let sink = TcResultsSinkImpl(state.tcGlobals)
+        let cenv, envFile, moduleTyAcc = DeclarationCheck.newCheckerState state tcState start.RootSigOpt file sink
+        start.Leftovers cenv
+
+        for result in results do
+            result.Leftovers cenv
+
+        let scopeContents =
+            DeclarationCheck.mergeDeltas
+                (not (DeclarationCheck.splitsFragment file))
+                start.ScopeContents
+                [ for result in results -> result.Delta ]
 
         let envAtEnd =
             match Array.tryLast results with
@@ -508,9 +633,10 @@ type DeclarationChecker =
         let fileContents =
             ExitImplFileDeclarations
                 cenv
-                start.EnvFile
+                envFile
                 tcState.ImplicitOpenDeclarations
                 start.Scope
+                scopeContents
                 [ for result in results -> result.Checked ]
                 envAtEnd
 
@@ -518,7 +644,7 @@ type DeclarationChecker =
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
 
         let _topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile =
-            CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file start.ModuleTyAcc fileContents
+            CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents
 
         let qualNameOfFile = file.QualifiedName
 
@@ -557,7 +683,13 @@ type DeclarationChecker =
                  implFile.Signature)
                 tcState
 
-        let sink = start.Sink
+        let resolutions, symbolUses, openDeclarations =
+            DeclarationCheck.mergeSinks
+                state.tcGlobals
+                [ yield start.Sink
+                  for result in results do
+                      yield result.Sink
+                  yield sink ]
 
         let scope =
             TypeCheckInfo(
@@ -571,12 +703,12 @@ type DeclarationChecker =
                 state.projectOptions.ProjectFileName,
                 parse.FileName,
                 Some state.projectOptions,
-                sink.GetResolutions(),
-                sink.GetSymbolUses(),
+                resolutions,
+                symbolUses,
                 tcEnvAtEnd.NameEnv,
                 None,
                 Some implFile,
-                sink.GetOpenDeclarations()
+                openDeclarations
             )
 
         let checkResults =
