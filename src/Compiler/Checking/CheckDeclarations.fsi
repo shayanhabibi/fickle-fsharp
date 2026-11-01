@@ -123,6 +123,10 @@ val ExitImplFileDeclarations:
     envAtEnd: TcEnv ->
         ModuleOrNamespaceContents * (AttributeTargets * Attrib) list * TcEnv
 
+/// The type names of a module's or namespace's declarations, which give a module of the same name among them the
+/// Module suffix
+val TypeNamesOfDeclarations: cenv: TcFileState -> env: TcEnv -> decls: SynModuleDecl list -> Set<string>
+
 /// Sets up checking the declarations of a non-recursive 'module M = ...' one at a time: the module, and the
 /// environment, parent and type names its declarations are checked in. None when that fails, after reporting it.
 val EnterNestedModuleDeclarations:

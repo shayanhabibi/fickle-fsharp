@@ -430,17 +430,21 @@ let (|NameofExpr|_|) (e: SynExpr) : NameofResult voption =
 let enumeratorMembers =
     [ "GetEnumerator"; "MoveNext"; "Current" ] |> List.map FileContentEntry.MemberName
 
-/// The members `e.[i]` can call on e
+/// The members `e.[i]`, `e[i]`, `e[a..b]` and their assignments can call on e
 let indexerMembers =
     [ "Item"; "GetSlice"; "SetSlice"; "GetReverseIndex" ]
     |> List.map FileContentEntry.MemberName
 
-/// The builder methods a computation expression can call, which may be extensions
+/// The builder methods a computation expression can call, which may be extensions: every name
+/// Checking/Expressions/CheckComputationExpressions.fs looks up on a builder, plus Dispose, which `use` calls on
+/// the resource. Bind{N}, Bind{N}Return and MergeSources{N} grow with the number of `and!` sources; past 16 they
+/// are not listed.
 let builderMembers =
     [
         yield! [ "Bind"; "BindReturn"; "Combine"; "Delay"; "For"; "MergeSources"; "Quote"; "Return"; "ReturnFrom" ]
-        yield! [ "Run"; "Source"; "TryFinally"; "TryWith"; "Using"; "While"; "Yield"; "YieldFrom"; "Zero"; "Dispose" ]
-        for n in 2..9 do
+        yield! [ "ReturnFromFinal"; "Run"; "Source"; "TryFinally"; "TryWith"; "Using"; "While"; "Yield"; "YieldFrom" ]
+        yield! [ "YieldFromFinal"; "Zero"; "Dispose" ]
+        for n in 2..16 do
             yield $"Bind{n}"
             yield $"Bind{n}Return"
             yield $"MergeSources{n}"
@@ -550,7 +554,15 @@ let visitSynExpr (e: SynExpr) : FileContentEntry list =
             | SynExpr.Do(expr, _) -> visit expr continuation
             | SynExpr.Assert(expr, _) -> visit expr continuation
             | SynExpr.App(funcExpr = funcExpr; argExpr = argExpr) ->
-                visit funcExpr (fun funcNodes -> visit argExpr (fun argNodes -> funcNodes @ argNodes |> continuation))
+                // `e[i]` and `e[a..b]` are applications to a list: indexers or slices, whether assigned to or not.
+                // An application of a function to a list literal has the same shape, so that counts too.
+                let implied =
+                    match argExpr with
+                    | SynExpr.ArrayOrList _
+                    | SynExpr.ArrayOrListComputed _ -> indexerMembers
+                    | _ -> []
+
+                visit funcExpr (fun funcNodes -> visit argExpr (fun argNodes -> implied @ funcNodes @ argNodes |> continuation))
             | SynExpr.TypeApp(expr = expr; typeArgs = typeArgs) ->
                 visit expr (fun exprNodes -> exprNodes @ List.collect visitSynType typeArgs |> continuation)
             | SynExpr.LetOrUse({ Bindings = bindings; Body = body }) ->

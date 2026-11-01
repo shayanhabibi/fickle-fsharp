@@ -69,23 +69,48 @@ type DeclarationContent =
       /// every earlier declaration
       HasUnresolvable: bool
       /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a type or module abbreviation,
-      /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown
+      /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
+      /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
+      /// filters every declaration's diagnostics with the latest parse's scopes, so they need no dependency.
       AffectsAllLater: bool }
 
 /// A top-level declaration of an implementation file, or a declaration of a non-recursive nested module, or the
 /// header of such a module (its attributes and name, which the module's declarations are checked inside).
 [<Sealed>]
 type ParsedDeclaration
-    internal (key: DeclarationKey, decl: SynModuleDecl, range: range, scopem: range, text: string, depth: int, isModuleHeader: bool) =
+    internal
+    (
+        key: DeclarationKey,
+        decl: SynModuleDecl,
+        range: range,
+        scopem: range,
+        text: string,
+        headerInputs: string,
+        within: DeclarationKey option,
+        siblings: SynModuleDecl list,
+        depth: int,
+        isModuleHeader: bool
+    ) =
     member _.Key = key
     /// The declaration's range; for a module header, from its start to the '=' after the module's name.
     member _.Range = range
     /// A hash of the declaration's source text. Unequal hashes mean the text changed; equal ones do not prove
     /// it is the same, so compare Text for that.
     member _.SyntaxHash = hash text
-    /// The declaration's source text, from the start of its range to its end. Compare Text, not SyntaxHash, to
-    /// decide a declaration is unchanged.
+    /// The declaration's source text, from the start of its range to its end. Text alone does not decide a module
+    /// header is unchanged: use IsUnchangedFrom, which also compares HeaderInputs.
     member _.Text = text
+    /// For a module, what checking it reads beyond its text: whether a type of the same name is among the
+    /// declarations around it (which gives the module the Module suffix), and for a module header the type names of
+    /// its body (which its declarations, and the modules among them, are checked with). Empty for other declarations.
+    member _.HeaderInputs = headerInputs
+    /// The key of the module header this declaration is directly inside, if any. A re-checked header gives the module
+    /// a new entity, the parent of its declarations' values, so every declaration under it must be checked again:
+    /// an edge from the header to them with no fingerprint cutoff.
+    member _.Within = within
+    /// Whether checking this declaration reads the same syntax as checking the other: same Text and HeaderInputs.
+    member x.IsUnchangedFrom(other: ParsedDeclaration) =
+        String.Equals(text, other.Text, StringComparison.Ordinal) && String.Equals(headerInputs, other.HeaderInputs, StringComparison.Ordinal)
     /// The whole declaration; for a module header, the whole module.
     member internal _.Syntax = decl
     /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
@@ -93,6 +118,8 @@ type ParsedDeclaration
     /// How many nested modules the declaration is in, below the file's scope
     member internal _.Depth = depth
     member internal _.IsModuleHeader = isModuleHeader
+    /// The declarations of the enclosing module or namespace, this one included: a module's suffix reads their types
+    member internal _.Siblings = siblings
 
 /// A project's options, references and initial checking state.
 [<Sealed>]
@@ -109,6 +136,20 @@ type FileSignature internal (fileName: string, apply: TcState -> TcState, module
     member internal _.ModuleNamesDict = moduleNamesDict
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
+
+/// Keeps every diagnostic as reported, before the warning options and #nowarn scopes filter it, and passes it on.
+/// The #nowarn scopes come from lexing the file: FinishFile filters what was kept again with the latest parse's.
+type internal RawDiagnostics(next: DiagnosticsLogger) =
+    inherit DiagnosticsLogger("RawDiagnostics")
+    let raw = ResizeArray<PhasedDiagnostic>()
+
+    override _.DiagnosticSink diagnostic =
+        raw.Add diagnostic
+        next.DiagnosticSink diagnostic
+
+    override _.ErrorCount = next.ErrorCount
+    override _.CheckForRealErrorsIgnoringWarnings = next.CheckForRealErrorsIgnoringWarnings
+    member _.Diagnostics = raw.ToArray()
 
 /// A non-recursive nested module whose declarations are checked one at a time.
 [<NoEquality; NoComparison>]
@@ -163,6 +204,7 @@ type FileStart
         sink: TcResultsSinkImpl,
         leftovers: TcFileState -> unit,
         diagnostics: FSharpDiagnostic[],
+        rawDiagnostics: PhasedDiagnostic[],
         errorCount: int
     ) =
     let sync = obj ()
@@ -181,6 +223,8 @@ type FileStart
     member internal _.Leftovers = leftovers
     /// What setting up the file reported.
     member internal _.Diagnostics = diagnostics
+    /// What setting up the file reported, before filtering
+    member internal _.RawDiagnostics = rawDiagnostics
     member internal _.ErrorCount = errorCount
     /// Held while finishing the file.
     member internal _.Sync = sync
@@ -205,6 +249,7 @@ type DeclarationResult
         key: DeclarationKey,
         fingerprint: string,
         diagnostics: FSharpDiagnostic[],
+        rawDiagnostics: PhasedDiagnostic[],
         errorCount: int,
         leavesFreeTypars: bool,
         envAfter: DeclEnv,
@@ -220,9 +265,12 @@ type DeclarationResult
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
     /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
     member _.Fingerprint = fingerprint
+    /// The declaration's diagnostics, filtered by the #nowarn scopes the file had when it was checked. FinishFile
+    /// filters them again with the scopes of the file's latest parse (a #nowarn is not a declaration).
     member _.Diagnostics = diagnostics
     member _.LeavesFreeTypars = leavesFreeTypars
     member _.EnvAfter = envAfter
+    member internal _.RawDiagnostics = rawDiagnostics
     member internal _.ErrorCount = errorCount
     /// The environment at the end of the enclosing scope if this is its last declaration.
     member internal _.EnvAtEnd = envAtEnd
@@ -343,7 +391,7 @@ module internal DeclarationCheck =
     let newLoggers (state: CompilerState) =
         let diagnosticsOptions = state.tcConfig.diagnosticsOptions
         let capturing = CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions)
-        capturing, GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, capturing)
+        capturing, RawDiagnostics(GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, capturing))
 
     let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
         DiagnosticHelpers.CreateDiagnostics(
@@ -355,6 +403,15 @@ module internal DeclarationCheck =
             state.tcConfig.flatErrors,
             None
         )
+
+    /// Diagnostics as reported, filtered by the warning options and the #nowarn scopes of the file's latest parse.
+    let refiltered (state: CompilerState) fileName (raw: PhasedDiagnostic[]) =
+        let capturing, logger = newLoggers state
+
+        for diagnostic in raw do
+            logger.DiagnosticSink diagnostic
+
+        diagnosticsOf state fileName capturing
 
     let stateBefore (state: CompilerState) (before: FileSignature list) =
         let tcState = (state.tcInitialState, before) ||> List.fold (fun tcState signature -> signature.Apply tcState)
@@ -469,6 +526,20 @@ module internal DeclarationCheck =
             close ()
 
         root.Contents, List.ofSeq root.Checked, root.EnvAtEnd
+
+    /// The names of the types among declarations, as TypeNamesInNonMutRecDecls collects them for module suffixes.
+    /// It also counts types whose type parameters fail that function's early measure check, so it can only hold more.
+    let typeNamesIn (decls: SynModuleDecl list) =
+        set
+            [ for decl in decls do
+                  match decl with
+                  | SynModuleDecl.Types(typeDefns, _) ->
+                      for SynTypeDefn(typeInfo = typeInfo; typeRepr = repr) in typeDefns do
+                          match repr, List.tryLast typeInfo.LongIdent with
+                          | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _), _ -> ()
+                          | _, Some id -> yield id.idText
+                          | _, None -> ()
+                  | _ -> () ]
 
     let isTypeAbbreviation (SynTypeDefn(typeRepr = repr)) =
         match repr with
@@ -710,15 +781,25 @@ type DeclarationChecker =
 
             let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
 
-            let declaration modulePath depth (decl: SynModuleDecl) (range: range) scopem isModuleHeader =
+            let declaration modulePath within siblings depth (decl: SynModuleDecl) (range: range) scopem headerInputs isModuleHeader =
                 let name, kind = DeclarationCheck.nameAndKind decl
                 let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
                 seen[(modulePath, name, kind)] <- ordinal + 1
                 let text = DeclarationCheck.textOfRange source range
                 let key = { ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }
-                ParsedDeclaration(key, decl, range, scopem, text, depth, isModuleHeader)
+                ParsedDeclaration(key, decl, range, scopem, text, headerInputs, within, siblings, depth, isModuleHeader)
 
-            let rec split modulePath depth (endm: range) (decls: SynModuleDecl list) =
+            let rec split modulePath within depth (endm: range) (decls: SynModuleDecl list) =
+                let typeNames = DeclarationCheck.typeNamesIn decls
+
+                // Whether the module gets the Module suffix for a type of its name among the declarations around it
+                let suffixInput (moduleInfo: SynComponentInfo) =
+                    let ownName = moduleInfo.LongIdent |> List.tryLast |> Option.map _.idText |> Option.defaultValue ""
+                    $"suffix=%b{typeNames.Contains ownName}"
+
+                let declaration modulePath within depth decl range scopem headerInputs isModuleHeader =
+                    declaration modulePath within decls depth decl range scopem headerInputs isModuleHeader
+
                 decls
                 |> List.mapi (fun i decl ->
                     // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end
@@ -742,13 +823,24 @@ type DeclarationChecker =
                             | Some equals -> equals.End
                             | None -> moduleInfo.Range.End
 
-                        let header = declaration modulePath depth decl (mkRange m.FileName m.Start headerEnd) scopem true
+                        // What TcNestedModuleHeader and EnterNestedModuleDeclarations read besides the header's text
+                        let headerInputs =
+                            let bodyTypes =
+                                DeclarationCheck.typeNamesIn moduleDecls |> Seq.sortWith (fun a b -> String.CompareOrdinal(a, b))
+
+                            $"%s{suffixInput moduleInfo};types=%s{String.Join(',', bodyTypes)}"
+
+                        let range = mkRange m.FileName m.Start headerEnd
+                        let header = declaration modulePath within depth decl range scopem headerInputs true
                         let path = modulePath @ [ DeclarationCheck.longIdentText moduleInfo.LongIdent ]
-                        header :: split path (depth + 1) m.EndRange moduleDecls
-                    | _ -> [ declaration modulePath depth decl decl.Range scopem false ])
+                        header :: split path (Some header.Key) (depth + 1) m.EndRange moduleDecls
+                    // A module checked whole (module rec, or without a name) reads its suffix the same way
+                    | SynModuleDecl.NestedModule(moduleInfo = moduleInfo) ->
+                        [ declaration modulePath within depth decl decl.Range scopem (suffixInput moduleInfo) false ]
+                    | _ -> [ declaration modulePath within depth decl decl.Range scopem "" false ])
                 |> List.concat
 
-            split modulePath 0 endm decls |> Array.ofList
+            split modulePath None 0 endm decls |> Array.ofList
 
     /// The names the declaration defines and uses. A module header has only its name and its attributes' uses.
     static member Content(decl: ParsedDeclaration) : DeclarationContent =
@@ -857,6 +949,7 @@ type DeclarationChecker =
                         sink,
                         DeclarationCheck.leftoversOf cenv,
                         diagnostics,
+                        logger.Diagnostics,
                         logger.ErrorCount
                     )
 
@@ -913,11 +1006,18 @@ type DeclarationChecker =
                 | frame :: _ -> frame.Entity.IsSome
                 | [] -> true)
 
+        // Only a module reads them, for its suffix: from its siblings' syntax, which its HeaderInputs cover, rather than
+        // from an environment that an earlier check of another declaration built
+        let typeNames =
+            match decl.Syntax with
+            | SynModuleDecl.NestedModule _ -> TypeNamesOfDeclarations cenv env decl.Siblings
+            | _ -> envBefore.TypeNames
+
         let checkedDecl, envAfter, envAtEnd, delta, nesting =
             if decl.IsModuleHeader then
                 let entered =
                     if checks then
-                        EnterNestedModuleDeclarations cenv envBefore.Parent envBefore.TypeNames env decl.Syntax
+                        EnterNestedModuleDeclarations cenv envBefore.Parent typeNames env decl.Syntax
                     else
                         None
 
@@ -953,7 +1053,7 @@ type DeclarationChecker =
                     if not checks then
                         ([], [], []), env, env
                     else
-                        TcModuleOrNamespaceElementNonMutRec cenv envBefore.Parent envBefore.TypeNames decl.ScopeRange env decl.Syntax
+                        TcModuleOrNamespaceElementNonMutRec cenv envBefore.Parent typeNames decl.ScopeRange env decl.Syntax
                         |> cenv.stackGuard.GuardCancellable
                         |> Cancellable.run ct
                         |> function
@@ -975,6 +1075,7 @@ type DeclarationChecker =
             decl.Key,
             DeclarationCheck.fingerprintOf delta checkedDecl,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
+            logger.Diagnostics,
             logger.ErrorCount,
             leavesFreeTypars,
             envAfter,
@@ -1054,9 +1155,11 @@ type DeclarationChecker =
         let diagnostics =
             Array.concat
                 [ yield parse.Diagnostics
-                  yield start.Diagnostics
+                  // With the #nowarn scopes of the latest parse, which an added or removed #nowarn changes without
+                  // changing any declaration
+                  yield DeclarationCheck.refiltered state parse.FileName start.RawDiagnostics
                   for result in results do
-                      yield result.Diagnostics
+                      yield DeclarationCheck.refiltered state parse.FileName result.RawDiagnostics
                   yield DeclarationCheck.diagnosticsOf state parse.FileName capturing ]
 
         let fingerprints =

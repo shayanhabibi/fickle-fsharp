@@ -6583,6 +6583,11 @@ let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFi
 
     elementsContents openDecls0 [ fragmentDefs ] envAtEnd
 
+/// The type names of a module's or namespace's declarations, which give a module of the same name among them the
+/// Module suffix, as TcModuleOrNamespaceElements collects them
+let TypeNamesOfDeclarations (cenv: cenv) (env: TcEnv) (decls: SynModuleDecl list) =
+    EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv env decls
+
 /// Does what the non-recursive SynModuleDecl.NestedModule case of TcModuleOrNamespaceElementNonMutRec does before
 /// the module's declarations: the module, and the environment, parent and type names its declarations are checked
 /// in. None when that fails, which reports the error and skips the module's declarations, as checking it whole does.
