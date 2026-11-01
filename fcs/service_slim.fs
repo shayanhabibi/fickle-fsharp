@@ -273,7 +273,7 @@ module internal SignatureFingerprint =
         and attribExpr (e: Expr) =
             match e with
             | Expr.Const (c, _, t) ->
-                add (sprintf "%A" c)
+                constant c
                 ty t
             | Expr.Op (TOp.Coerce, tinst, [ e ], _) ->
                 add "coerce"
@@ -290,6 +290,34 @@ module internal SignatureFingerprint =
                 add (string args.Length)
                 List.iter attribExpr args
             | _ -> raise NotDescribable
+
+        // Exact: %A rounds floating-point values, so two different constants could print the same.
+        and constant (c: Const) =
+            match c with
+            | Const.Bool b -> add ("bool " + string b)
+            | Const.SByte n -> add ("sbyte " + string n)
+            | Const.Byte n -> add ("byte " + string n)
+            | Const.Int16 n -> add ("int16 " + string n)
+            | Const.UInt16 n -> add ("uint16 " + string n)
+            | Const.Int32 n -> add ("int32 " + string n)
+            | Const.UInt32 n -> add ("uint32 " + string n)
+            | Const.Int64 n -> add ("int64 " + string n)
+            | Const.UInt64 n -> add ("uint64 " + string n)
+            | Const.IntPtr n -> add ("nativeint " + string n)
+            | Const.UIntPtr n -> add ("unativeint " + string n)
+            | Const.Single f -> add ("single " + string (BitConverter.SingleToInt32Bits f))
+            | Const.Double d -> add ("double " + string (BitConverter.DoubleToInt64Bits d))
+            | Const.Char ch -> add ("char " + string (int ch))
+            // The length keeps a separator inside the string from reading as the end of it
+            | Const.String s -> add ("string " + string s.Length + " " + s)
+            | Const.Decimal d -> add ("decimal " + String.Join(",", Decimal.GetBits d))
+            | Const.Unit -> add "unit"
+            | Const.Zero -> add "zero"
+
+        and optConstant (c: Const option) =
+            match c with
+            | Some c -> constant c
+            | None -> add "-"
 
         and argInfo (info: ArgReprInfo) =
             add (match info.Name with Some id -> id.idText | None -> "-")
@@ -317,7 +345,8 @@ module internal SignatureFingerprint =
             access v.Accessibility
             ty v.Type
             attribs v.Attribs
-            add (sprintf "%A %A %b %b %b" v.LiteralValue v.InlineInfo v.IsMutable v.IsCompilerGenerated v.IsExtensionMember)
+            optConstant v.LiteralValue
+            add (sprintf "%A %b %b %b" v.InlineInfo v.IsMutable v.IsCompilerGenerated v.IsExtensionMember)
 
             match v.ValReprInfo with
             | Some (ValReprInfo (typarInfos, argGroups, result)) ->
@@ -340,7 +369,8 @@ module internal SignatureFingerprint =
         and field (f: RecdField) =
             add f.LogicalName
             ty f.FormalType
-            add (sprintf "%b %b %b %A" f.IsMutable f.IsStatic f.IsVolatile f.LiteralValue)
+            add (sprintf "%b %b %b" f.IsMutable f.IsStatic f.IsVolatile)
+            optConstant f.LiteralValue
             access f.Accessibility
             attribs f.PropertyAttribs
             attribs f.FieldAttribs
@@ -469,10 +499,68 @@ module internal SignatureFingerprint =
             add mref.DeclaringTypeRef.QualifiedName
             add mref.Name
             add (string mref.GenericArity)
-            add (sprintf "%A" mref.CallingConv)
+            ilCallingConv mref.CallingConv
             add (string mref.ArgTypes.Length)
-            for argTy in mref.ArgTypes do add argTy.QualifiedName
-            add mref.ReturnType.QualifiedName
+            List.iter ilType mref.ArgTypes
+            ilType mref.ReturnType
+
+        and ilCallingConv (cc: ILCallingConv) = add (sprintf "%A %A" cc.ThisConv cc.BasicConv)
+
+        // Structural: ILType.QualifiedName fails on void, byref, pointer and function pointer types.
+        and ilType (t: ILType) =
+            match t with
+            | ILType.Void -> add "void"
+            | ILType.Array (shape, elementTy) ->
+                add (sprintf "array %A" shape)
+                ilType elementTy
+            | ILType.Value spec ->
+                add "value"
+                ilTypeSpec spec
+            | ILType.Boxed spec ->
+                add "boxed"
+                ilTypeSpec spec
+            | ILType.Ptr t ->
+                add "ptr"
+                ilType t
+            | ILType.Byref t ->
+                add "byref"
+                ilType t
+            | ILType.FunctionPointer signature ->
+                add "function pointer"
+                ilCallingConv signature.CallingConv
+                add (string signature.ArgTypes.Length)
+                List.iter ilType signature.ArgTypes
+                ilType signature.ReturnType
+            | ILType.TypeVar n -> add ("!" + string n)
+            | ILType.Modified (required, modifier, t) ->
+                add (sprintf "modified %b" required)
+                add modifier.QualifiedName
+                ilType t
+
+        and ilTypeSpec (spec: ILTypeSpec) =
+            add spec.TypeRef.QualifiedName
+            add (string spec.GenericArgs.Length)
+            List.iter ilType spec.GenericArgs
+
+        // Instructions carrying a type, method, field, token or label give NotDescribable rather than a lossy text.
+        and ilInstr (instr: ILInstr) =
+            match instr with
+            | AI_ldc (basicTy, c) ->
+                add (sprintf "ldc %A" basicTy)
+                match c with
+                | ILConst.I4 n -> add ("i4 " + string n)
+                | ILConst.I8 n -> add ("i8 " + string n)
+                | ILConst.R4 f -> add ("r4 " + string (BitConverter.SingleToInt32Bits f))
+                | ILConst.R8 d -> add ("r8 " + string (BitConverter.DoubleToInt64Bits d))
+            | I_ldstr s -> add ("ldstr " + string s.Length + " " + s)
+            | AI_conv _ | AI_conv_ovf _ | AI_conv_ovf_un _
+            | I_ldarg _ | I_ldarga _ | I_ldind _ | I_ldloc _ | I_ldloca _ | I_starg _ | I_stind _ | I_stloc _
+            | I_ldelem _ | I_stelem _ -> add (sprintf "%A" instr)
+            | _ ->
+                let text = sprintf "%A" instr
+                // A case without a payload prints as its bare name
+                if text |> Seq.exists Char.IsWhiteSpace then raise NotDescribable
+                add text
 
         and traitInfo (TTrait (supportTys, memberName, memberFlags, argTys, returnTy, _, solution, _)) =
             tys supportTys
@@ -518,7 +606,8 @@ module internal SignatureFingerprint =
         and expr (e: Expr) =
             match e with
             | Expr.Const (c, _, t) ->
-                add (sprintf "const %A" c)
+                add "const"
+                constant c
                 ty t
             | Expr.Val (vref, flag, _) ->
                 add "val"
@@ -650,7 +739,9 @@ module internal SignatureFingerprint =
             | DecisionTreeTest.ArrayLength (length, t) ->
                 add ("array length " + string length)
                 ty t
-            | DecisionTreeTest.Const c -> add (sprintf "const %A" c)
+            | DecisionTreeTest.Const c ->
+                add "const"
+                constant c
             | DecisionTreeTest.IsNull -> add "null"
             | DecisionTreeTest.IsInst (source, target) ->
                 add "is"
@@ -724,7 +815,8 @@ module internal SignatureFingerprint =
                 tyconRef tcref
             | TOp.TupleFieldGet (info, i) -> add (sprintf "tuple get %b %d" (evalTupInfoIsStruct info) i)
             | TOp.ILAsm (instrs, retTys) ->
-                add (sprintf "il %A" instrs)
+                add ("il " + string instrs.Length)
+                List.iter ilInstr instrs
                 tys retTys
             | TOp.RefAddrGet readonly -> add (sprintf "ref address %b" readonly)
             | TOp.Coerce -> add "coerce"

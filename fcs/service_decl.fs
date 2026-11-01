@@ -125,8 +125,10 @@ type FileStart
             match lastFinish with
             | null -> ()
             | log ->
-                lastFinish <- null
-                MutationLog.Undo log)
+                // Cleared only after every action ran: they restore saved values, so after an exception part-way the
+                // next call can run them all again.
+                MutationLog.Undo log
+                lastFinish <- null)
 
     member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
 
@@ -595,9 +597,14 @@ type DeclarationChecker =
                 start, DeclEnv scope.Env
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
-    /// state and accumulator, so calls may come in any order, again, or at the same time, and leave the file setup
-    /// and other results as they were. It first undoes what the latest FinishFile on the same FileStart changed in
-    /// the earlier declarations, so it sees them as their checks left them.
+    /// state and accumulator, so calls may come in any order, again, or at the same time, without publishing into
+    /// the file setup or another result's module contents. It first undoes what the latest FinishFile on the same
+    /// FileStart changed in the earlier declarations, so it sees them as their checks left them.
+    ///
+    /// A check still changes earlier results in place, and nothing undoes that: it can solve the inference variables
+    /// an earlier declaration left free (LeavesFreeTypars), and it marks the earlier values it uses as referenced
+    /// (SetHasBeenReferenced). The checker's guard (ruling R12, Task 13) re-checks a declaration that left free
+    /// inference variables when any later declaration of its file changes or is removed.
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         start.UndoLastFinish()
         let state = start.Context.State

@@ -47,7 +47,8 @@ type MutationLog =
     [<ThreadStatic; DefaultValue>]
     static val mutable private current: ResizeArray<unit -> unit> | null
 
-    /// The active log of this thread, or null.
+    /// The active log of this thread, or null. It is thread-static: a mutation made on another thread, such as work a
+    /// logged pass hands to the thread pool, is not recorded, and nothing reports that.
     static member Current
         with get () = MutationLog.current
         and set (log: ResizeArray<unit -> unit> | null) = MutationLog.current <- log
