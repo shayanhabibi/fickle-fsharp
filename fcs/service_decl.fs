@@ -208,15 +208,14 @@ type FileStart
         scopeContents: ModuleOrNamespaceType,
         sink: TcResultsSinkImpl,
         leftovers: TcFileState -> unit,
-        diagnostics: FSharpDiagnostic[],
-        rawDiagnostics: PhasedDiagnostic[],
-        errorCount: int
+        rawDiagnostics: PhasedDiagnostic[]
     ) =
     let sync = obj ()
     let mutable lastFinish: ResizeArray<unit -> unit> | null = null
 
     member internal _.Context = ctx
-    member internal _.Parse = parse
+    /// The parse the file was set up from.
+    member _.Parse = parse
     member internal _.File = file
     member internal _.ModuleNamesDict = moduleNamesDict
     member internal _.TcState = tcState
@@ -226,11 +225,8 @@ type FileStart
     member internal _.ScopeContents = scopeContents
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
-    /// What setting up the file reported.
-    member internal _.Diagnostics = diagnostics
-    /// What setting up the file reported, before filtering
+    /// What setting up the file reported, before filtering: FinishFile filters it with its parse's #nowarn scopes
     member internal _.RawDiagnostics = rawDiagnostics
-    member internal _.ErrorCount = errorCount
     /// Held while finishing the file.
     member internal _.Sync = sync
 
@@ -255,7 +251,6 @@ type DeclarationResult
         fingerprint: string,
         diagnostics: FSharpDiagnostic[],
         rawDiagnostics: PhasedDiagnostic[],
-        errorCount: int,
         leavesFreeTypars: bool,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
@@ -270,13 +265,14 @@ type DeclarationResult
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
     /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
     member _.Fingerprint = fingerprint
-    /// The declaration's diagnostics, filtered by the #nowarn scopes the file had when it was checked. FinishFile
-    /// filters them again with the scopes of the parse it is given (a #nowarn is not a declaration).
+    /// Provisional: the declaration's diagnostics filtered with the project's live options when it was checked,
+    /// whose #nowarn scopes are those of whichever version of the file was parsed last. FileResult.Diagnostics is
+    /// authoritative: FinishFile filters what the check reported with the scopes of the parse it is given.
     member _.Diagnostics = diagnostics
     member _.LeavesFreeTypars = leavesFreeTypars
     member _.EnvAfter = envAfter
+    /// What the check reported, before filtering
     member internal _.RawDiagnostics = rawDiagnostics
-    member internal _.ErrorCount = errorCount
     /// The environment at the end of the enclosing scope if this is its last declaration.
     member internal _.EnvAtEnd = envAtEnd
     member internal _.Checked = checkedDecl
@@ -941,7 +937,7 @@ type DeclarationChecker =
             match input with
             | ParsedInput.SigFile _ -> invalidOp "unreachable"
             | ParsedInput.ImplFile file ->
-                let capturing, logger = DeclarationCheck.newLoggers state
+                let _, logger = DeclarationCheck.newLoggers state
                 use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
                 use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
                 ResetGeneratedNames(input, state)
@@ -955,8 +951,6 @@ type DeclarationChecker =
                 let sink = TcResultsSinkImpl(state.tcGlobals)
                 let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
                 let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
-                let diagnostics = DeclarationCheck.diagnosticsOf state parse.FileName capturing
-
                 let start =
                     FileStart(
                         ctx,
@@ -969,9 +963,7 @@ type DeclarationChecker =
                         scope.Env.eModuleOrNamespaceTypeAccumulator.Value,
                         sink,
                         DeclarationCheck.leftoversOf cenv,
-                        diagnostics,
-                        logger.Diagnostics,
-                        logger.ErrorCount
+                        logger.Diagnostics
                     )
 
                 start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [])
@@ -1102,7 +1094,6 @@ type DeclarationChecker =
             DeclarationCheck.fingerprintOf delta checkedDecl,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
-            logger.ErrorCount,
             leavesFreeTypars,
             envAfter,
             envAtEnd,
@@ -1128,13 +1119,11 @@ type DeclarationChecker =
     /// full check would. Finishes on one FileStart are serialized, by its lock; a finish must not overlap a
     /// declaration check on the same FileStart.
     ///
-    /// The diagnostics come from `parse` (by default the FileStart's): its parse diagnostics, and its #nowarn scopes,
-    /// which filter every declaration's diagnostics again and decide which errors stop the finish pass from
-    /// reporting. Pass the parse of the file's current text when it is newer than the FileStart's: a #nowarn is not
-    /// a declaration, so adding or removing one changes no result.
-    static member FinishFile(start: FileStart, results: DeclarationResult[], ?parse: FSharpParseFileResults) : FileResult =
-        let parse = defaultArg parse start.Parse
-
+    /// The diagnostics come from `parse`, which must be the parse of the file's current text (the FileStart's own
+    /// parse only while the text is unchanged): its parse diagnostics, and its #nowarn scopes, which filter every
+    /// declaration's diagnostics again and decide which errors stop the finish pass from reporting. A #nowarn is not
+    /// a declaration, so adding or removing one changes no result: only this parse carries it.
+    static member FinishFile(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FileResult =
         if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
             invalidArg (nameof parse) "The parse is of another file than the FileStart's."
 
