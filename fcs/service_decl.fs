@@ -280,7 +280,7 @@ type DeclarationResult
         leftovers: TcFileState -> unit,
         nesting: Nesting,
         typedUses: DeclarationRef[],
-        references: (DeclarationRef * string)[]
+        references: (DeclarationRef * string list * string)[]
     ) =
     let mutable finishTypedUses: DeclarationRef[] = [||]
 
@@ -321,7 +321,8 @@ type DeclarationResult
         | atFinish -> Array.append typedUses atFinish |> Array.distinct |> Array.sort
 
     member internal _.SetFinishTypedUses(uses: DeclarationRef[]) = finishTypedUses <- uses
-    /// The module values of the project the check marked referenced: the declaration defining each, and its name
+    /// The module values of the project the check marked referenced: the declaration defining each, the path of the
+    /// module it is in, and its name
     member internal _.References = references
     member internal _.Start = start
     member internal _.Declaration = declaration
@@ -807,11 +808,28 @@ module internal DeclarationCheck =
                     yield! moduleValuesOf entity.ModuleOrNamespaceType
         }
 
+    /// The compilation path and name of the module a module value is in: a declaration holding modules whole can hold
+    /// values of the same name in several of them. The names are the same in every check of the declaration.
+    let modulePathOf (v: Val) =
+        match v.TryDeclaringEntity with
+        | Parent entity ->
+            let outer =
+                match entity.CompilationPathOpt with
+                | Some cpath -> cpath.MangledPath
+                | None -> []
+
+            outer @ [ entity.LogicalName ]
+        | ParentNone -> []
+
     /// Marks referenced exactly the module values of the results that the results' checks referenced (ruling R15).
     /// A check marks the values it uses, and a later check can mark an earlier result's value, or a value of an earlier
     /// version of a declaration that the current result no longer holds: so every flag is cleared, then each recorded
-    /// reference is found by its declaration's key and the value's name in the current results. Both are recorded in
-    /// the active mutation log, which the next finish or check undoes.
+    /// reference is found by its declaration's key, its module's path and its name in the current results. Both are
+    /// recorded in the active mutation log, which the next finish or check undoes.
+    ///
+    /// The flag only means something for a module value a signature hides, which the unused-value warning (FS1182)
+    /// reads: references from later files are not replayed, so after a finish a public value used only by later files
+    /// reads as unreferenced, as FSharpMemberOrFunctionOrValue shows it. No diagnostic depends on that.
     let replayReferences (fileName: string) (results: DeclarationResult[]) =
         let byKey = Dictionary<DeclarationKey, DeclarationResult>(HashIdentity.Structural)
 
@@ -823,13 +841,13 @@ module internal DeclarationCheck =
                 v.SetHasBeenReferencedTo false
 
         for result in results do
-            for declaration, name in result.References do
+            for declaration, path, name in result.References do
                 match declaration.Key with
                 | Some key when String.Equals(declaration.File, fileName, StringComparison.OrdinalIgnoreCase) ->
                     match byKey.TryGetValue key with
                     | true, target ->
                         for v in moduleValuesOf target.Delta do
-                            if v.LogicalName = name then
+                            if v.LogicalName = name && modulePathOf v = path then
                                 v.SetHasBeenReferencedTo true
                     | _ -> ()
                 | _ -> ()
@@ -1383,7 +1401,9 @@ type DeclarationChecker =
         // whatever result of that declaration is current
         let references =
             referenced
-            |> Seq.choose (fun v -> definitions.TryFind v.Stamp |> Option.map (fun declaration -> declaration, v.LogicalName))
+            |> Seq.choose (fun v ->
+                definitions.TryFind v.Stamp
+                |> Option.map (fun declaration -> declaration, DeclarationCheck.modulePathOf v, v.LogicalName))
             |> Seq.distinct
             |> Array.ofSeq
 
