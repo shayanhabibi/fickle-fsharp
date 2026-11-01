@@ -96,28 +96,28 @@ val CheckImplFileTail:
         TopAttribs * CheckedImplFile * TcEnv * bool * ModuleOrNamespaceType
 
 [<Sealed; NoEquality; NoComparison>]
-type ImplFileFragmentScope
+type ImplFileScopeKind
 
 [<NoEquality; NoComparison>]
 type ImplFileDeclarationScope =
     { Parent: ParentRef
       Env: TcEnv
       TypeNames: Set<string>
-      EndRange: range
-      Fragment: ImplFileFragmentScope option }
+      ChecksDeclarations: bool
+      Kind: ImplFileScopeKind }
 
 val EnterImplFileDeclarations:
     cenv: TcFileState ->
     env: TcEnv ->
     synImplFile: ParsedImplFileInput ->
     splitFragment: bool ->
-        ImplFileDeclarationScope option
+        ImplFileDeclarationScope
 
 val ExitImplFileDeclarations:
     cenv: TcFileState ->
     env: TcEnv ->
     openDecls0: OpenDeclaration list ->
-    scope: ImplFileDeclarationScope option ->
+    scope: ImplFileDeclarationScope ->
     compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list ->
     envAtEnd: TcEnv ->
         ModuleOrNamespaceContents * (AttributeTargets * Attrib) list * TcEnv

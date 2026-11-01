@@ -47,10 +47,14 @@ type DeclarationKey =
 
 /// A top-level declaration of an implementation file.
 [<Sealed>]
-type ParsedDeclaration internal (key: DeclarationKey, decl: SynModuleDecl, scopem: range, syntaxHash: int) =
+type ParsedDeclaration internal (key: DeclarationKey, decl: SynModuleDecl, scopem: range, text: string) =
     member _.Key = key
     member _.Range = decl.Range
-    member _.SyntaxHash = syntaxHash
+    /// A hash of the declaration's source text. Unequal hashes mean the text changed; equal ones do not prove
+    /// it is the same, so compare Text for that.
+    member _.SyntaxHash = hash text
+    /// The declaration's source text, from the start of its range to its end.
+    member internal _.Text = text
     member internal _.Syntax = decl
     /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
     member internal _.ScopeRange = scopem
@@ -63,9 +67,10 @@ type ProjectContext internal (state: CompilerState) =
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
 type FileSignature internal (fileName: string, apply: TcState -> TcState, moduleNamesDict: ModuleNamesDict) =
-    member _.FileName = fileName
+    member internal _.FileName = fileName
     member internal _.Apply tcState = apply tcState
-    /// The file's own entry of the names used to tell files with the same module name apart.
+    /// The module-name dictionary DeduplicateParsedInputModuleName gave for this file: every earlier file's entries
+    /// and its own. BeginFile merges these over the earlier files.
     member internal _.ModuleNamesDict = moduleNamesDict
 
 /// The environment a declaration is checked in.
@@ -87,7 +92,7 @@ type FileStart
         cenv: TcFileState,
         envFile: TcEnv,
         moduleTyAcc: ModuleOrNamespaceType ref,
-        scope: ImplFileDeclarationScope option,
+        scope: ImplFileDeclarationScope,
         sink: TcResultsSinkImpl,
         diagnostics: FSharpDiagnostic[],
         errorCount: int
@@ -333,14 +338,15 @@ type DeclarationChecker =
 
             let source =
                 match DeclarationCheck.sources.TryGetValue parse with
-                | true, source -> Some source
-                | _ -> None
+                | true, source -> source
+                | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be split: its declarations' text comes from the source it recorded."
 
             let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
 
             decls
             |> List.mapi (fun i decl ->
-                // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end.
+                // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end of
+                // the enclosing module, namespace or file. This is the only place the end is computed.
                 let scopem =
                     match List.tryItem (i + 1) decls with
                     | Some next -> unionRanges next.Range endm
@@ -350,13 +356,8 @@ type DeclarationChecker =
                 let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
                 seen[(modulePath, name, kind)] <- ordinal + 1
 
-                let syntaxHash =
-                    match source with
-                    | Some source -> hash (DeclarationCheck.textOfRange source decl.Range)
-                    // Without the source the range stands in: any edit before the declaration changes it too.
-                    | None -> hash decl.Range
-
-                ParsedDeclaration({ ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }, decl, scopem, syntaxHash))
+                let text = DeclarationCheck.textOfRange source decl.Range
+                ParsedDeclaration({ ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }, decl, scopem, text))
             |> Array.ofList
 
     static member CheckSignatureFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileSignature =
@@ -444,27 +445,25 @@ type DeclarationChecker =
                 let start =
                     FileStart(ctx, parse, file, moduleNamesDict, tcState, rootSigOpt, cenv, envFile, moduleTyAcc, scope, sink, diagnostics, logger.ErrorCount)
 
-                let env =
-                    match scope with
-                    | Some scope -> scope.Env
-                    | None -> envFile
-
-                start, DeclEnv env
+                start, DeclEnv scope.Env
 
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+        // Cancellable.run hands ct to the cancellable computation; code outside it calls CheckAndThrow, which reads
+        // the ambient token, and nothing else sets that one.
         use _ = FSharp.Compiler.Cancellable.UsingToken ct
         let env = envBefore.Env
         let accumulator = env.eModuleOrNamespaceTypeAccumulator
         let accumulatedBefore = accumulator.Value
 
         let checkedDecl, envAfter, envAtEnd =
-            match start.Scope with
-            // Setting up the file's fragment failed, which skips all its declarations.
-            | None -> ([], [], []), env, env
-            | Some scope ->
+            let scope = start.Scope
+
+            if not scope.ChecksDeclarations then
+                ([], [], []), env, env
+            else
                 let cenv = start.Cenv
 
                 TcModuleOrNamespaceElementNonMutRec cenv scope.Parent scope.TypeNames decl.ScopeRange env decl.Syntax
@@ -502,10 +501,9 @@ type DeclarationChecker =
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
 
         let envAtEnd =
-            match Array.tryLast results, start.Scope with
-            | Some last, _ -> last.EnvAtEnd
-            | None, Some scope -> scope.Env
-            | None, None -> start.EnvFile
+            match Array.tryLast results with
+            | Some last -> last.EnvAtEnd
+            | None -> start.Scope.Env
 
         let fileContents =
             ExitImplFileDeclarations

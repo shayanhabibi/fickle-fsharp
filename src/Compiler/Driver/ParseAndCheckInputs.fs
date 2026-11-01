@@ -1510,23 +1510,15 @@ let CheckOneInputWithCallback
                     Finisher(
                         node,
                         (fun tcState ->
-                            let rootSigs = Zmap.add qualNameOfFile sigFileType tcState.tcsRootSigs
-
-                            let tcSigEnv =
-                                AddLocalRootModuleOrNamespace tcGlobals amap m tcState.tcsTcSigEnv sigFileType
-
                             // Add the signature to the signature env (unless it had an explicit signature)
                             let ccuSigForFile = CombineCcuContentFragments [ sigFileType; tcState.tcsCcuSig ]
 
                             let partialResult = tcEnv, EmptyTopAttrs, None, ccuSigForFile, sigFileType
 
                             let tcState =
-                                { tcState with
-                                    tcsTcSigEnv = tcSigEnv
-                                    tcsRootSigs = rootSigs
-                                    tcsCreatesGeneratedProvidedTypes =
-                                        tcState.tcsCreatesGeneratedProvidedTypes || createsGeneratedProvidedTypes
-                                }
+                                AddSignatureFileToTcState
+                                    (tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
+                                    tcState
 
                             partialResult, tcState)
                     )
