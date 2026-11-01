@@ -1067,6 +1067,12 @@ type TcState =
     // a.fsi + b.fsi + c.fsi (after checking implementation file for c.fs)
     member x.CcuSig = x.tcsCcuSig
 
+    member x.TryFindRootSig qualNameOfFile = x.tcsRootSigs.TryFind qualNameOfFile
+
+    member x.HasRootImpl qualNameOfFile = Zset.contains qualNameOfFile x.tcsRootImpls
+
+    member x.ImplicitOpenDeclarations = x.tcsImplicitOpenDeclarations
+
     member x.NextStateAfterIncrementalFragment tcEnvAtEndOfLastInput =
         { x with
             tcsTcSigEnv = tcEnvAtEndOfLastInput
@@ -1165,6 +1171,19 @@ let AddCheckResultsToTcState
         }
 
     ccuSigForFile, tcState
+
+/// Adds a checked signature file to the state, as its finisher in CheckOneInputWithCallback does
+let AddSignatureFileToTcState (tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes) (tcState: TcState) =
+    { tcState with
+        tcsTcSigEnv = AddLocalRootModuleOrNamespace tcGlobals amap m tcState.tcsTcSigEnv sigFileType
+        tcsRootSigs = Zmap.add qualNameOfFile sigFileType tcState.tcsRootSigs
+        tcsCreatesGeneratedProvidedTypes = tcState.tcsCreatesGeneratedProvidedTypes || createsGeneratedProvidedTypes
+    }
+
+let AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes (tcState: TcState) =
+    { tcState with
+        tcsCreatesGeneratedProvidedTypes = tcState.tcsCreatesGeneratedProvidedTypes || createsGeneratedProvidedTypes
+    }
 
 type PartialResult = TcEnv * TopAttribs * CheckedImplFile option * ModuleOrNamespaceType * ModuleOrNamespaceType
 

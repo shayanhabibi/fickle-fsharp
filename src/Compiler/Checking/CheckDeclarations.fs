@@ -6194,51 +6194,40 @@ let MakeInitialEnv env =
     let moduleTyAcc = ref (Construct.NewEmptyModuleOrNamespaceType (Namespace false))
     { env with eModuleOrNamespaceTypeAccumulator = moduleTyAcc }, moduleTyAcc
 
-/// Check an entire implementation file
-/// Typecheck, then close the inference scope and then check the file meets its signature (if any)
-let CheckOneImplFile
-       // checkForErrors: A function to help us stop reporting cascading errors
+/// Make the checker state for one implementation file and its initial environment, with the file's module type accumulator
+let CreateImplFileCheckState
        (g, amap,
         thisCcu,
-        openDecls0,
-        checkForErrors,
         conditionalDefines,
         tcSink,
         isInternalTestSpanStackReferring,
-        env,
+        env: TcEnv,
         rootSigOpt: ModuleOrNamespaceType option,
         synImplFile,
         diagnosticOptions) =
+    let (ParsedImplFileInput (isScript = isScript)) = synImplFile
+    let cenv =
+        cenv.Create (g, isScript, amap, thisCcu, false, Option.isSome rootSigOpt,
+            conditionalDefines,
+            tcSink,
+            LightweightTcValForUsingInBuildMethodCall g env.TraitContext,
+            isInternalTestSpanStackReferring,
+            diagnosticOptions,
+            tcPat=TcPat,
+            tcSimplePats=TcSimplePats,
+            tcSequenceExpressionEntry=TcSequenceExpressionEntry,
+            tcArrayOrListSequenceExpression=TcArrayOrListComputedExpression,
+            tcComputationExpression=TcComputationExpression)
 
-    let (ParsedImplFileInput (fileName, isScript, qualNameOfFile, _, implFileFrags, isLastCompiland, _, _)) = synImplFile
-    let infoReader = InfoReader(g, amap)
+    let envinner, moduleTyAcc = MakeInitialEnv env
+    cenv, envinner, moduleTyAcc
 
-    cancellable {
-        use _ =
-            Activity.start "CheckDeclarations.CheckOneImplFile"
-                [|
-                    Activity.Tags.fileName, fileName
-                    Activity.Tags.qualifiedNameOfFile, qualNameOfFile.Text
-                |]
-        let cenv =
-            cenv.Create (g, isScript, amap, thisCcu, false, Option.isSome rootSigOpt,
-                conditionalDefines,
-                tcSink,
-                LightweightTcValForUsingInBuildMethodCall g (env: TcEnv).TraitContext,
-                isInternalTestSpanStackReferring,
-                diagnosticOptions,
-                tcPat=TcPat,
-                tcSimplePats=TcSimplePats,
-                tcSequenceExpressionEntry=TcSequenceExpressionEntry,
-                tcArrayOrListSequenceExpression=TcArrayOrListComputedExpression,
-                tcComputationExpression=TcComputationExpression)
-
-        let envinner, moduleTyAcc = MakeInitialEnv env
-
-        let defs = [ for x in implFileFrags -> SynModuleDecl.NamespaceFragment x ]
-        let! moduleContents, topAttrs, envAtEnd =
-            TcModuleOrNamespaceElements cenv ParentNone qualNameOfFile.Range envinner PreXmlDoc.Empty None openDecls0 defs
-            |> cenv.stackGuard.GuardCancellable
+/// Close the inference scope of a checked implementation file, then check the file meets its signature (if any)
+let CheckImplFileTail (cenv: cenv) checkForErrors (env: TcEnv) (rootSigOpt: ModuleOrNamespaceType option) synImplFile (moduleTyAcc: ModuleOrNamespaceType ref) (moduleContents, topAttrs, envAtEnd: TcEnv) =
+        let g = cenv.g
+        let (ParsedImplFileInput (fileName, isScript, qualNameOfFile, _, _, isLastCompiland, _, _)) = synImplFile
+        let infoReader = InfoReader(g, cenv.amap)
+        let thisCcu = cenv.thisCcu
 
         let implFileTypePriorToSig = moduleTyAcc.Value
 
@@ -6323,7 +6312,7 @@ let CheckOneImplFile
                        (g, cenv.amap,  reportErrors, cenv.infoReader,
                         env.eInternalsVisibleCompPaths, cenv.thisCcu, tcVal, envAtEnd.DisplayEnv,
                         implFileTy, implFileContents, extraAttribs, isLastCompiland,
-                        isInternalTestSpanStackReferring)
+                        cenv.isInternalTestSpanStackReferring)
 
                 with RecoverableException exn ->
                     errorRecovery exn m
@@ -6352,8 +6341,270 @@ let CheckOneImplFile
         let implFile = CheckedImplFile (qualNameOfFile, implFileTy, implFileContents, hasExplicitEntryPoint, isScript, anonRecdTypes, namedDebugPointsForInlinedCode)
 
         // implFile.Signature is a fresh copy or the explicit signature; only the inferred type shares its entities with the symbol uses
-        return (topAttrs, implFile, envAtEnd, cenv.createsGeneratedProvidedTypes, implFileTypePriorToSig)
+        (topAttrs, implFile, envAtEnd, cenv.createsGeneratedProvidedTypes, implFileTypePriorToSig)
+
+/// Check an entire implementation file
+/// Typecheck, then close the inference scope and then check the file meets its signature (if any)
+let CheckOneImplFile
+       // checkForErrors: A function to help us stop reporting cascading errors
+       (g, amap,
+        thisCcu,
+        openDecls0,
+        checkForErrors,
+        conditionalDefines,
+        tcSink,
+        isInternalTestSpanStackReferring,
+        env,
+        rootSigOpt: ModuleOrNamespaceType option,
+        synImplFile,
+        diagnosticOptions) =
+
+    let (ParsedImplFileInput (fileName, _, qualNameOfFile, _, implFileFrags, _, _, _)) = synImplFile
+
+    cancellable {
+        use _ =
+            Activity.start "CheckDeclarations.CheckOneImplFile"
+                [|
+                    Activity.Tags.fileName, fileName
+                    Activity.Tags.qualifiedNameOfFile, qualNameOfFile.Text
+                |]
+        let cenv, envinner, moduleTyAcc =
+            CreateImplFileCheckState (g, amap, thisCcu, conditionalDefines, tcSink, isInternalTestSpanStackReferring, env, rootSigOpt, synImplFile, diagnosticOptions)
+
+        let defs = [ for x in implFileFrags -> SynModuleDecl.NamespaceFragment x ]
+        let! moduleContents, topAttrs, envAtEnd =
+            TcModuleOrNamespaceElements cenv ParentNone qualNameOfFile.Range envinner PreXmlDoc.Empty None openDecls0 defs
+            |> cenv.stackGuard.GuardCancellable
+
+        return CheckImplFileTail cenv checkForErrors env rootSigOpt synImplFile moduleTyAcc (moduleContents, topAttrs, envAtEnd)
      }
+
+//--------------------------------------------------------------------------
+// Checking the top-level declarations of an implementation file one at a time
+//--------------------------------------------------------------------------
+
+/// What finishing a fragment whose declarations were checked one at a time needs from its setup
+[<NoEquality; NoComparison>]
+type ImplFileFragmentScope =
+    { Syntax: SynModuleOrNamespace
+      EnclosingNamespacePath: Ident list
+      EnvNS: TcEnv
+      ModTyRoot: ModuleOrNamespaceType
+      NsInfo: (ModuleOrNamespace option * ModuleOrNamespaceType ref) option
+      /// For a module fragment: the module, its type accumulator and the scope the module is reported in
+      Module: (ModuleOrNamespace * ModuleOrNamespaceType ref * range) option }
+
+/// Where the top-level declarations of an implementation file are checked one at a time, by
+/// TcModuleOrNamespaceElementNonMutRec. For a file of one non-recursive fragment it is the inside of
+/// that module or namespace, and the declarations are the fragment's; otherwise it is the file level,
+/// and the declarations are the fragments.
+[<NoEquality; NoComparison>]
+type ImplFileDeclarationScope =
+    { Parent: ParentRef
+      Env: TcEnv
+      TypeNames: Set<string>
+      EndRange: range
+      Fragment: ImplFileFragmentScope option }
+
+/// Sets up what checking the file's fragments with TcModuleOrNamespaceElements does before it reaches the
+/// declarations: the cases for SynModuleDecl.NamespaceFragment and, for 'module M', the continuing
+/// SynModuleDecl.NestedModule, in TcModuleOrNamespaceElementNonMutRec. None when that setup fails, which there
+/// skips the whole fragment.
+let EnterImplFileDeclarations (cenv: cenv) (env: TcEnv) synImplFile (splitFragment: bool) =
+    let g = cenv.g
+    let (ParsedImplFileInput (_, _, qualNameOfFile, _, implFileFrags, _, _, _)) = synImplFile
+    let fileDefs = [ for x in implFileFrags -> SynModuleDecl.NamespaceFragment x ]
+
+    // As TcModuleOrNamespaceElements for the file
+    if cenv.compilingCanonicalFslibModuleType then
+        ensureCcuHasModuleOrNamespaceAtPath cenv.thisCcu env.ePath env.eCompPath (PreXmlDoc.Empty.ToXmlDoc(cenv.diagnosticOptions.CheckXmlDocs, Some []))
+
+    match implFileFrags with
+    | [ SynModuleOrNamespace(longId, false, kind, defs, xml, attribs, vis, m, _) as fragment ] when splitFragment ->
+        cenv.synArgNameGenerator.Reset()
+        try
+            let endm = m.EndRange
+
+            do for id in longId do
+                 CheckNamespaceModuleOrTypeName g id
+
+            let enclosingNamespacePath, moduleDecl =
+                if kind.IsModule then
+                    let nsp, modName =
+                        match longId with
+                        | [] -> [], mkSynId m.EndRange ""
+                        | _ -> List.frontAndBack longId
+                    let synTy = Some(SynType.LongIdent(SynLongIdent([modName], [], [])))
+                    nsp, Some (SynComponentInfo(attribs, None, [], synTy, xml, false, vis, m))
+                else
+                    longId, None
+
+            let envNS = LocateEnv kind.IsModule cenv.thisCcu env enclosingNamespacePath
+            let envNS = ImplicitlyOpenOwnNamespace cenv.tcSink g cenv.amap m enclosingNamespacePath envNS
+            CallEnvSink cenv.tcSink (m, envNS.NameEnv, env.eAccessRights)
+
+            let modTyNS = envNS.eModuleOrNamespaceTypeAccumulator.Value
+            let modTyRoot, modulNSs = BuildRootModuleType enclosingNamespacePath envNS.eCompPath modTyNS
+            let modulNSOpt = List.tryHead modulNSs
+
+            modulNSs |> List.iter (fun moduleEntity ->
+              let modref = mkLocalModuleRef moduleEntity
+              let item = Item.ModuleOrNamespaces [modref]
+              CallNameResolutionSink cenv.tcSink (moduleEntity.Range, env.NameEnv, item, emptyTyparInst, ItemOccurrence.Binding, env.AccessRights))
+
+            let nsInfo = Some (modulNSOpt, envNS.eModuleOrNamespaceTypeAccumulator)
+
+            // As TcModuleOrNamespaceElements for the fragment's declarations
+            if cenv.compilingCanonicalFslibModuleType then
+                ensureCcuHasModuleOrNamespaceAtPath cenv.thisCcu envNS.ePath envNS.eCompPath (xml.ToXmlDoc(cenv.diagnosticOptions.CheckXmlDocs, Some []))
+
+            let parent, envInner, moduleScope =
+                match moduleDecl with
+                | None -> ParentNone, envNS, None
+                | Some compInfo ->
+                    let modDecl = SynModuleDecl.NestedModule(compInfo, false, defs, true, m, SynModuleDeclNestedModuleTrivia.Zero)
+                    let typeNames = EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv envNS [modDecl]
+                    let scopem = unionRanges modDecl.Range endm
+                    cenv.synArgNameGenerator.Reset()
+
+                    let (SynComponentInfo(Attributes attribs, _, _, _, xml, _, vis, im)) = compInfo
+                    let id = ComputeModuleName compInfo.LongIdent
+
+                    let modAttrs = TcAttributes cenv envNS AttributeTargets.ModuleDecl attribs
+                    let moduleKind = EstablishTypeDefinitionCores.ComputeModuleOrNamespaceKind g true typeNames modAttrs id.idText
+                    let modName = EstablishTypeDefinitionCores.AdjustModuleName moduleKind id.idText
+                    CheckForDuplicateConcreteType envNS modName im
+                    CheckForDuplicateModule envNS id.idText id.idRange
+                    let vis, _ = ComputeAccessAndCompPath g envNS None id.idRange vis None ParentNone
+
+                    let id = ident (modName, id.idRange)
+
+                    CheckNamespaceModuleOrTypeName g id
+
+                    let envForModule, moduleTyAcc = MakeInnerEnv true envNS id moduleKind
+                    let moduleTy = Construct.NewEmptyModuleOrNamespaceType moduleKind
+
+                    let checkXmlDocs = cenv.diagnosticOptions.CheckXmlDocs
+                    let xmlDoc = xml.ToXmlDoc(checkXmlDocs, Some [])
+                    let moduleEntity = Construct.NewModuleOrNamespace (Some envNS.eCompPath) vis id xmlDoc modAttrs (MaybeLazy.Strict moduleTy)
+
+                    if cenv.compilingCanonicalFslibModuleType then
+                        ensureCcuHasModuleOrNamespaceAtPath cenv.thisCcu envForModule.ePath envForModule.eCompPath (xml.ToXmlDoc(checkXmlDocs, Some []))
+
+                    Parent (mkLocalModuleRef moduleEntity), envForModule, Some (moduleEntity, moduleTyAcc, scopem)
+
+            Some
+                { Parent = parent
+                  Env = envInner
+                  TypeNames = EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv envInner defs
+                  EndRange = endm
+                  Fragment =
+                    Some
+                        { Syntax = fragment
+                          EnclosingNamespacePath = enclosingNamespacePath
+                          EnvNS = envNS
+                          ModTyRoot = modTyRoot
+                          NsInfo = nsInfo
+                          Module = moduleScope } }
+        with RecoverableException exn ->
+            errorRecovery exn m
+            None
+    | _ ->
+        Some
+            { Parent = ParentNone
+              Env = env
+              TypeNames = EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv env fileDefs
+              EndRange = qualNameOfFile.Range
+              Fragment = None }
+
+/// Builds the file's contents from its checked declarations as TcModuleOrNamespaceElements does, with what the
+/// cases for the fragment and its module do after their declarations. env is the file's initial environment.
+let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFileDeclarationScope option) (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) (envAtEnd: TcEnv) =
+    let g = cenv.g
+
+    let fileContents (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) envAtEnd =
+        let moduleDefs = List.collect p13 compiledDefs
+        let moduleDefs = match openDecls0 with [] -> moduleDefs | _ -> TMDefOpens openDecls0 :: moduleDefs
+        TMDefs moduleDefs, List.collect p33 compiledDefs, envAtEnd
+
+    match scope with
+    | None -> fileContents [] env
+    | Some { Fragment = None } -> fileContents compiledDefs envAtEnd
+    | Some { Fragment = Some fragmentScope } ->
+
+    let (SynModuleOrNamespace(kind = kind; range = m)) = fragmentScope.Syntax
+    let enclosingNamespacePath = fragmentScope.EnclosingNamespacePath
+    let envNS = fragmentScope.EnvNS
+
+    let fragmentDefs =
+        try
+            let moduleContents = TMDefs (List.collect p13 compiledDefs)
+            let topAttrs = List.collect p33 compiledDefs
+
+            let moduleContents, topAttrs, envAtEnd =
+                match fragmentScope.Module with
+                | None -> moduleContents, topAttrs, envAtEnd
+                | Some (moduleEntity, moduleTyAcc, scopem) ->
+                    try
+                        moduleEntity.entity_modul_type <- MaybeLazy.Strict moduleTyAcc.Value
+
+                        let moduleEntity =
+                          tryAddExtensionAttributeIfNotAlreadyPresentForModule
+                              g
+                              (fun tryFindExtensionAttribute ->
+                                  match moduleContents with
+                                  | ModuleOrNamespaceContents.TMDefs(defs) ->
+                                      defs
+                                      |> Seq.tryPick (function
+                                          | ModuleOrNamespaceContents.TMDefLet (Binding.TBind(var = v),_) ->
+                                              tryFindExtensionAttribute v.Attribs
+                                          | _ -> None)
+                                  | _ -> None
+                              )
+                              moduleEntity
+
+                        let moduleDef = TMDefRec(false, [], [], [ModuleOrNamespaceBinding.Module(moduleEntity, moduleContents)], m)
+
+                        PublishModuleDefn cenv envNS moduleEntity
+
+                        AddLocalSubModuleAndReport cenv.tcSink scopem g cenv.amap m envNS moduleEntity |> ignore
+
+                        // A continuing module: the environment at its end is the one inside it
+                        TMDefs [ moduleDef ], topAttrs, envAtEnd
+                    with RecoverableException exn ->
+                        errorRecovery exn m
+                        TMDefs [], [], envNS
+
+            MutRecBindingChecking.TcMutRecDefns_UpdateNSContents fragmentScope.NsInfo
+            let openDecls =
+                if isNil enclosingNamespacePath then
+                    []
+                else
+                    let env = AddLocalRootModuleOrNamespace g cenv.amap m env fragmentScope.ModTyRoot
+
+                    let env, openDecls =
+                        match TryStripPrefixPath g enclosingNamespacePath with
+                        | Some(p, _) -> TcOpenModuleOrNamespaceDecl cenv.tcSink g cenv.amap m.EndRange env ([p], m.EndRange)
+                        | None -> env, []
+
+                    env.eModuleOrNamespaceTypeAccumulator.Value <-
+                        CombineCcuContentFragments [env.eModuleOrNamespaceTypeAccumulator.Value; fragmentScope.ModTyRoot]
+                    openDecls
+
+            let moduleContentsRoot = BuildRootModuleContents kind.IsModule enclosingNamespacePath envNS.eCompPath moduleContents
+
+            let defns =
+                match openDecls with
+                | [] -> [ moduleContentsRoot ]
+                | _ -> [ TMDefOpens openDecls; moduleContentsRoot ]
+
+            (defns, ([]: (unit -> unit) list), topAttrs), envAtEnd
+        with RecoverableException exn ->
+            errorRecovery exn m
+            ([], [], []), env
+
+    let compiled, envAtEnd = fragmentDefs
+    fileContents [ compiled ] envAtEnd
 
 
 

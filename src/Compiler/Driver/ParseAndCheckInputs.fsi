@@ -160,6 +160,12 @@ type TcState =
 
     member NextStateAfterIncrementalFragment: TcEnv -> TcState
 
+    member TryFindRootSig: QualifiedNameOfFile -> ModuleOrNamespaceType option
+
+    member HasRootImpl: QualifiedNameOfFile -> bool
+
+    member ImplicitOpenDeclarations: OpenDeclaration list
+
     member CreatesGeneratedProvidedTypes: bool
 
 type PartialResult = TcEnv * TopAttribs * CheckedImplFile option * ModuleOrNamespaceType * ModuleOrNamespaceType
@@ -208,6 +214,18 @@ val AddCheckResultsToTcState:
     implFileSigType: ModuleOrNamespaceType ->
         tcState: TcState ->
             ModuleOrNamespaceType * TcState
+
+val AddSignatureFileToTcState:
+    tcGlobals: TcGlobals *
+    amap: Import.ImportMap *
+    m: range *
+    qualNameOfFile: QualifiedNameOfFile *
+    sigFileType: ModuleOrNamespaceType *
+    createsGeneratedProvidedTypes: bool ->
+        tcState: TcState ->
+            TcState
+
+val AddCreatesGeneratedProvidedTypes: createsGeneratedProvidedTypes: bool -> tcState: TcState -> TcState
 
 val AddSignatureResultToTcImplEnv:
     tcImports: TcImports *

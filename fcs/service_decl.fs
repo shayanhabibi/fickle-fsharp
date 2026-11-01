@@ -1,0 +1,587 @@
+// Copyright (c) Microsoft Corporation.  All Rights Reserved.  See License.txt in the project root for license information.
+
+namespace FSharp.Compiler.Declarations
+
+open System
+open System.Collections.Generic
+open System.Runtime.CompilerServices
+open System.Threading
+
+open Internal.Utilities.Collections
+open Internal.Utilities.Library
+
+open FSharp.Compiler
+open FSharp.Compiler.CheckBasics
+open FSharp.Compiler.CheckDeclarations
+open FSharp.Compiler.CheckExpressions
+open FSharp.Compiler.CodeAnalysis
+open FSharp.Compiler.CompilerDiagnostics
+open FSharp.Compiler.Diagnostics
+open FSharp.Compiler.DiagnosticsLogger
+open FSharp.Compiler.NameResolution
+open FSharp.Compiler.ParseAndCheckInputs
+open FSharp.Compiler.SourceCodeServices
+open FSharp.Compiler.Syntax
+open FSharp.Compiler.Text
+open FSharp.Compiler.Text.Range
+open FSharp.Compiler.TypedTree
+
+type DeclarationKind =
+    | Value
+    | Type
+    | Exception
+    | Module
+    | Open
+    | ModuleAbbrev
+    | Attribute
+    | Do
+    | RecGroup
+    | Augmentation
+
+type DeclarationKey =
+    { ModulePath: string list
+      Name: string
+      Kind: DeclarationKind
+      /// The number of earlier declarations of the file with the same module path, name and kind
+      Ordinal: int }
+
+/// A top-level declaration of an implementation file.
+[<Sealed>]
+type ParsedDeclaration internal (key: DeclarationKey, decl: SynModuleDecl, scopem: range, syntaxHash: int) =
+    member _.Key = key
+    member _.Range = decl.Range
+    member _.SyntaxHash = syntaxHash
+    member internal _.Syntax = decl
+    /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
+    member internal _.ScopeRange = scopem
+
+/// A project's options, references and initial checking state.
+[<Sealed>]
+type ProjectContext internal (state: CompilerState) =
+    member internal _.State = state
+
+/// What a file adds to the state later files are checked in.
+[<Sealed>]
+type FileSignature internal (fileName: string, apply: TcState -> TcState, moduleNamesDict: ModuleNamesDict) =
+    member _.FileName = fileName
+    member internal _.Apply tcState = apply tcState
+    /// The file's own entry of the names used to tell files with the same module name apart.
+    member internal _.ModuleNamesDict = moduleNamesDict
+
+/// The environment a declaration is checked in.
+[<Sealed>]
+type DeclEnv internal (env: TcEnv) =
+    member internal _.Env = env
+
+/// An implementation file set up for checking its declarations one at a time.
+[<Sealed>]
+type FileStart
+    internal
+    (
+        ctx: ProjectContext,
+        parse: FSharpParseFileResults,
+        file: ParsedImplFileInput,
+        moduleNamesDict: ModuleNamesDict,
+        tcState: TcState,
+        rootSigOpt: ModuleOrNamespaceType option,
+        cenv: TcFileState,
+        envFile: TcEnv,
+        moduleTyAcc: ModuleOrNamespaceType ref,
+        scope: ImplFileDeclarationScope option,
+        sink: TcResultsSinkImpl,
+        diagnostics: FSharpDiagnostic[],
+        errorCount: int
+    ) =
+    member internal _.Context = ctx
+    member internal _.Parse = parse
+    member internal _.File = file
+    member internal _.ModuleNamesDict = moduleNamesDict
+    member internal _.TcState = tcState
+    member internal _.RootSigOpt = rootSigOpt
+    member internal _.Cenv = cenv
+    member internal _.EnvFile = envFile
+    member internal _.ModuleTyAcc = moduleTyAcc
+    member internal _.Scope = scope
+    member internal _.Sink = sink
+    /// What setting up the file reported.
+    member internal _.Diagnostics = diagnostics
+    member internal _.ErrorCount = errorCount
+
+type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
+
+[<Sealed>]
+type DeclarationResult
+    internal
+    (
+        key: DeclarationKey,
+        fingerprint: string,
+        diagnostics: FSharpDiagnostic[],
+        errorCount: int,
+        leavesFreeTypars: bool,
+        envAfter: DeclEnv,
+        envAtEnd: TcEnv,
+        checkedDecl: CheckedDeclaration
+    ) =
+    member _.Key = key
+    member _.Fingerprint = fingerprint
+    member _.Diagnostics = diagnostics
+    member _.LeavesFreeTypars = leavesFreeTypars
+    member _.EnvAfter = envAfter
+    member internal _.ErrorCount = errorCount
+    /// The environment at the end of the enclosing scope if this is its last declaration.
+    member internal _.EnvAtEnd = envAtEnd
+    member internal _.Checked = checkedDecl
+
+[<Sealed>]
+type FileResult
+    internal
+    (
+        diagnostics: FSharpDiagnostic[],
+        fingerprints: IReadOnlyDictionary<DeclarationKey, string>,
+        signature: FileSignature,
+        checkResults: FSharpCheckFileResults
+    ) =
+    member _.Diagnostics = diagnostics
+    member _.Fingerprints = fingerprints
+    member _.Signature = signature
+    member _.CheckResults = checkResults
+
+module internal DeclarationCheck =
+
+    /// The source each parse was made from, for hashing a declaration's text.
+    let sources = ConditionalWeakTable<FSharpParseFileResults, ISourceText>()
+
+    let textOfRange (source: ISourceText) (m: range) =
+        let sb = Text.StringBuilder()
+        let lastLine = min (m.EndLine - 1) (source.GetLineCount() - 1)
+
+        for line in m.StartLine - 1 .. lastLine do
+            let text = source.GetLineString line
+            let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
+            let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
+            sb.Append(text, first, max 0 (last - first)).Append('\n') |> ignore
+
+        sb.ToString()
+
+    let longIdentText (ids: Ident list) =
+        ids |> List.map (fun id -> id.idText) |> String.concat "."
+
+    let rec patNames (pat: SynPat) =
+        match pat with
+        | SynPat.Named(ident = SynIdent(id, _)) -> [ id.idText ]
+        | SynPat.LongIdent(longDotId = SynLongIdent(id = ids)) -> [ (List.last ids).idText ]
+        | SynPat.Typed(pat = pat)
+        | SynPat.Paren(pat = pat)
+        | SynPat.Attrib(pat = pat)
+        | SynPat.As(rhsPat = pat) -> patNames pat
+        | SynPat.Tuple(elementPats = pats) -> List.collect patNames pats
+        | SynPat.Wild _ -> [ "_" ]
+        | _ -> []
+
+    let typeDefnName (SynTypeDefn(typeInfo = info)) = longIdentText info.LongIdent
+
+    let isAugmentation (SynTypeDefn(typeRepr = repr)) =
+        match repr with
+        | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _) -> true
+        | _ -> false
+
+    let nameAndKind (decl: SynModuleDecl) =
+        match decl with
+        | SynModuleDecl.Let(isRecursive = isRec; bindings = binds) ->
+            let names = binds |> List.collect (fun (SynBinding(headPat = pat)) -> patNames pat)
+            String.Join(",", names), (if isRec then RecGroup else Value)
+        | SynModuleDecl.Types([ typeDefn ], _) ->
+            typeDefnName typeDefn, (if isAugmentation typeDefn then Augmentation else Type)
+        | SynModuleDecl.Types(typeDefns, _) ->
+            (match typeDefns with
+             | typeDefn :: _ -> typeDefnName typeDefn
+             | [] -> ""),
+            RecGroup
+        | SynModuleDecl.Exception(SynExceptionDefn(SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _))), _, _, _), _) ->
+            id.idText, Exception
+        | SynModuleDecl.NestedModule(moduleInfo = info; isRecursive = isRec) ->
+            longIdentText info.LongIdent, (if isRec then RecGroup else Module)
+        | SynModuleDecl.Open(target, _) ->
+            (match target with
+             | SynOpenDeclTarget.ModuleOrNamespace(SynLongIdent(id = ids), _) -> longIdentText ids
+             | SynOpenDeclTarget.Type(SynType.LongIdent(SynLongIdent(id = ids)), _) -> "type " + longIdentText ids
+             | SynOpenDeclTarget.Type _ -> "type"),
+            Open
+        | SynModuleDecl.ModuleAbbrev(ident = id) -> id.idText, ModuleAbbrev
+        | SynModuleDecl.Attributes(attrs, _) ->
+            attrs
+            |> List.collect (fun list -> list.Attributes)
+            |> List.map (fun attr -> longIdentText attr.TypeName.LongIdent)
+            |> String.concat ",",
+            Attribute
+        | SynModuleDecl.Expr _ -> "", Do
+        | SynModuleDecl.HashDirective(ParsedHashDirective(ident = ident), _) -> "#" + ident, Do
+        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = ids; isRecursive = isRec)) ->
+            longIdentText ids, (if isRec then RecGroup else Module)
+
+    /// Whether the declarations of the file are those of its only fragment; otherwise they are the fragments,
+    /// and recursive ones are one declaration.
+    let splitsFragment (file: ParsedImplFileInput) =
+        match file.Contents with
+        | [ SynModuleOrNamespace(isRecursive = false) ] -> true
+        | _ -> false
+
+    let newLoggers (state: CompilerState) =
+        let diagnosticsOptions = state.tcConfig.diagnosticsOptions
+        let capturing = CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions)
+        capturing, GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, capturing)
+
+    let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
+        DiagnosticHelpers.CreateDiagnostics(
+            state.tcConfig.diagnosticsOptions,
+            false,
+            fileName,
+            capturing.GetDiagnostics(),
+            suggestNamesForErrors,
+            state.tcConfig.flatErrors,
+            None
+        )
+
+    let stateBefore (state: CompilerState) (before: FileSignature list) =
+        let tcState = (state.tcInitialState, before) ||> List.fold (fun tcState signature -> signature.Apply tcState)
+
+        let moduleNamesDict =
+            (Map.empty, before)
+            ||> List.fold (fun (acc: ModuleNamesDict) signature ->
+                (acc, signature.ModuleNamesDict)
+                ||> Map.fold (fun acc qualifiedName files ->
+                    let known = acc |> Map.tryFind qualifiedName |> Option.defaultValue Map.empty
+                    acc |> Map.add qualifiedName (Map.foldBack Map.add files known)))
+
+        tcState, moduleNamesDict
+
+    let conditionalDefines (state: CompilerState) =
+        if state.tcConfig.noConditionalErasure then
+            None
+        else
+            Some state.tcConfig.conditionalDefines
+
+    /// What a declaration adds to the module type it is published into, as the values and entities that are new.
+    let contribution (before: ModuleOrNamespaceType) (after: ModuleOrNamespaceType) =
+        let oldVals = HashSet<Val>(before.AllValsAndMembers, HashIdentity.Reference)
+        let oldEntities = HashSet<Entity>(before.AllEntities, HashIdentity.Reference)
+        let vals = after.AllValsAndMembers |> Seq.filter (oldVals.Contains >> not) |> List.ofSeq
+        let entities = after.AllEntities |> Seq.filter (oldEntities.Contains >> not) |> List.ofSeq
+        Construct.NewModuleOrNamespaceType after.ModuleOrNamespaceKind entities vals
+
+    let fingerprintOf (contribution: ModuleOrNamespaceType) =
+        match SignatureFingerprint.compute contribution EmptyTopAttrs with
+        | Some fingerprint -> fingerprint
+        // Not describable: never equal to another fingerprint, so it always counts as changed.
+        | None -> "?" + Guid.NewGuid().ToString("N")
+
+    let implFileSignature (state: CompilerState) fileName qualNameOfFile (implFileSig: ModuleOrNamespaceType) createsGeneratedProvidedTypes moduleNamesDict =
+        let amap = state.tcImports.GetImportMap()
+
+        let apply (tcState: TcState) =
+            let hadSig = (tcState.TryFindRootSig qualNameOfFile).IsSome
+
+            let _, tcState =
+                AddCheckResultsToTcState
+                    (state.tcGlobals, amap, hadSig, None, TcResultsSink.NoSink, tcState.TcEnvFromImpls, qualNameOfFile, implFileSig)
+                    tcState
+
+            AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
+
+        FileSignature(fileName, apply, moduleNamesDict)
+
+[<AbstractClass; Sealed>]
+type DeclarationChecker =
+
+    static member CreateProject(options: FSharpProjectOptions) : Async<ProjectContext> =
+        async {
+            let! state = initializeCompilerState options ignore
+            return ProjectContext state
+        }
+
+    static member Parse(ctx: ProjectContext, fileName: string, source: string) : FSharpParseFileResults =
+        let state = ctx.State
+        let parsingOptions = FSharpParsingOptions.FromTcConfig(state.tcConfig, state.projectOptions.SourceFiles, false)
+        let sourceText = SourceText.ofString source
+
+        let parseErrors, parseTree, anyErrors =
+            ParseAndCheckFile.parseFile (
+                sourceText,
+                fileName,
+                parsingOptions,
+                userOpName,
+                suggestNamesForErrors,
+                state.tcConfig.flatErrors,
+                captureIdentifiersWhenParsing,
+                CancellationToken.None
+            )
+
+        let parse = FSharpParseFileResults(parseErrors, parseTree, anyErrors, [||])
+        DeclarationCheck.sources.AddOrUpdate(parse, sourceText)
+        parse
+
+    static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] =
+        match parse.ParseTree with
+        | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
+        | ParsedInput.ImplFile file ->
+            let modulePath, endm, decls =
+                if DeclarationCheck.splitsFragment file then
+                    let (SynModuleOrNamespace(longId = longId; decls = decls; range = m)) = List.exactlyOne file.Contents
+                    longId |> List.map (fun id -> id.idText), m.EndRange, decls
+                else
+                    [], file.QualifiedName.Range, [ for fragment in file.Contents -> SynModuleDecl.NamespaceFragment fragment ]
+
+            let source =
+                match DeclarationCheck.sources.TryGetValue parse with
+                | true, source -> Some source
+                | _ -> None
+
+            let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
+
+            decls
+            |> List.mapi (fun i decl ->
+                // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end.
+                let scopem =
+                    match List.tryItem (i + 1) decls with
+                    | Some next -> unionRanges next.Range endm
+                    | None -> unionRanges decl.Range endm
+
+                let name, kind = DeclarationCheck.nameAndKind decl
+                let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
+                seen[(modulePath, name, kind)] <- ordinal + 1
+
+                let syntaxHash =
+                    match source with
+                    | Some source -> hash (DeclarationCheck.textOfRange source decl.Range)
+                    // Without the source the range stands in: any edit before the declaration changes it too.
+                    | None -> hash decl.Range
+
+                ParsedDeclaration({ ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }, decl, scopem, syntaxHash))
+            |> Array.ofList
+
+    static member CheckSignatureFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileSignature =
+        let state = ctx.State
+
+        match parse.ParseTree with
+        | ParsedInput.ImplFile _ -> invalidArg (nameof parse) "Expected a signature file."
+        | ParsedInput.SigFile _ ->
+            let tcState, moduleNamesDict = DeclarationCheck.stateBefore state before
+            let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+
+            match input with
+            | ParsedInput.ImplFile _ -> invalidOp "unreachable"
+            | ParsedInput.SigFile file ->
+                let _, logger = DeclarationCheck.newLoggers state
+                use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+                ResetGeneratedNames(input, state)
+                let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
+                let amap = state.tcImports.GetImportMap()
+
+                let _, sigFileType, createsGeneratedProvidedTypes =
+                    CheckOneSigFile
+                        (state.tcGlobals,
+                         amap,
+                         tcState.Ccu,
+                         checkForErrors,
+                         DeclarationCheck.conditionalDefines state,
+                         TcResultsSink.NoSink,
+                         state.tcConfig.internalTestSpanStackReferring,
+                         state.tcConfig.diagnosticsOptions)
+                        tcState.TcEnvFromSignatures
+                        file
+                    |> Cancellable.runWithoutCancellation
+
+                let qualNameOfFile = file.QualifiedName
+                let m = input.Range
+
+                let apply =
+                    AddSignatureFileToTcState (state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
+
+                FileSignature(parse.FileName, apply, moduleNamesDict)
+
+    static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclEnv =
+        let state = ctx.State
+
+        match parse.ParseTree with
+        | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
+        | ParsedInput.ImplFile _ ->
+            let tcState, moduleNamesDict = DeclarationCheck.stateBefore state before
+            let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+
+            match input with
+            | ParsedInput.SigFile _ -> invalidOp "unreachable"
+            | ParsedInput.ImplFile file ->
+                let capturing, logger = DeclarationCheck.newLoggers state
+                use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+                use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+                ResetGeneratedNames(input, state)
+
+                let qualNameOfFile = file.QualifiedName
+                let rootSigOpt = tcState.TryFindRootSig qualNameOfFile
+
+                if tcState.HasRootImpl qualNameOfFile then
+                    errorR (Error(FSComp.SR.buildImplementationAlreadyGiven (RichText.mkModule qualNameOfFile.Text), input.Range))
+
+                let sink = TcResultsSinkImpl(state.tcGlobals)
+
+                let cenv, envFile, moduleTyAcc =
+                    CreateImplFileCheckState(
+                        state.tcGlobals,
+                        state.tcImports.GetImportMap(),
+                        tcState.Ccu,
+                        DeclarationCheck.conditionalDefines state,
+                        TcResultsSink.WithSink sink,
+                        state.tcConfig.internalTestSpanStackReferring,
+                        tcState.TcEnvFromImpls,
+                        rootSigOpt,
+                        file,
+                        state.tcConfig.diagnosticsOptions
+                    )
+
+                let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
+                let diagnostics = DeclarationCheck.diagnosticsOf state parse.FileName capturing
+
+                let start =
+                    FileStart(ctx, parse, file, moduleNamesDict, tcState, rootSigOpt, cenv, envFile, moduleTyAcc, scope, sink, diagnostics, logger.ErrorCount)
+
+                let env =
+                    match scope with
+                    | Some scope -> scope.Env
+                    | None -> envFile
+
+                start, DeclEnv env
+
+    static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
+        let state = start.Context.State
+        let capturing, logger = DeclarationCheck.newLoggers state
+        use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+        use _ = FSharp.Compiler.Cancellable.UsingToken ct
+        let env = envBefore.Env
+        let accumulator = env.eModuleOrNamespaceTypeAccumulator
+        let accumulatedBefore = accumulator.Value
+
+        let checkedDecl, envAfter, envAtEnd =
+            match start.Scope with
+            // Setting up the file's fragment failed, which skips all its declarations.
+            | None -> ([], [], []), env, env
+            | Some scope ->
+                let cenv = start.Cenv
+
+                TcModuleOrNamespaceElementNonMutRec cenv scope.Parent scope.TypeNames decl.ScopeRange env decl.Syntax
+                |> cenv.stackGuard.GuardCancellable
+                |> Cancellable.run ct
+                |> function
+                    | ValueOrCancelled.Value result -> result
+                    | ValueOrCancelled.Cancelled exn -> raise exn
+
+        let fingerprint =
+            DeclarationCheck.fingerprintOf (DeclarationCheck.contribution accumulatedBefore accumulator.Value)
+
+        let leavesFreeTypars =
+            not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter))
+
+        DeclarationResult(
+            decl.Key,
+            fingerprint,
+            DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
+            logger.ErrorCount,
+            leavesFreeTypars,
+            DeclEnv envAfter,
+            envAtEnd,
+            checkedDecl
+        )
+
+    static member FinishFile(start: FileStart, results: DeclarationResult[]) : FileResult =
+        let state = start.Context.State
+        let parse = start.Parse
+        let file = start.File
+        let cenv = start.Cenv
+        let tcState = start.TcState
+        let capturing, logger = DeclarationCheck.newLoggers state
+        use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+        use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+
+        let envAtEnd =
+            match Array.tryLast results, start.Scope with
+            | Some last, _ -> last.EnvAtEnd
+            | None, Some scope -> scope.Env
+            | None, None -> start.EnvFile
+
+        let fileContents =
+            ExitImplFileDeclarations
+                cenv
+                start.EnvFile
+                tcState.ImplicitOpenDeclarations
+                start.Scope
+                [ for result in results -> result.Checked ]
+                envAtEnd
+
+        let earlierErrors = start.ErrorCount + (results |> Array.sumBy (fun result -> result.ErrorCount))
+        let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
+
+        let _topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile =
+            CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file start.ModuleTyAcc fileContents
+
+        let qualNameOfFile = file.QualifiedName
+
+        let signature =
+            DeclarationCheck.implFileSignature
+                state
+                parse.FileName
+                qualNameOfFile
+                implFile.Signature
+                createsGeneratedProvidedTypes
+                start.ModuleNamesDict
+
+        let diagnostics =
+            Array.concat
+                [ yield parse.Diagnostics
+                  yield start.Diagnostics
+                  for result in results do
+                      yield result.Diagnostics
+                  yield DeclarationCheck.diagnosticsOf state parse.FileName capturing ]
+
+        let fingerprints =
+            Dictionary<DeclarationKey, string>(HashIdentity.Structural)
+
+        for result in results do
+            fingerprints[result.Key] <- result.Fingerprint
+
+        let ccuSigForFile, _ =
+            AddCheckResultsToTcState
+                (state.tcGlobals,
+                 state.tcImports.GetImportMap(),
+                 start.RootSigOpt.IsSome,
+                 None,
+                 TcResultsSink.NoSink,
+                 tcState.TcEnvFromImpls,
+                 qualNameOfFile,
+                 implFile.Signature)
+                tcState
+
+        let sink = start.Sink
+
+        let scope =
+            TypeCheckInfo(
+                state.tcConfig,
+                state.tcGlobals,
+                ccuSigForFile,
+                ownSigForFile,
+                tcState.Ccu,
+                state.tcImports,
+                tcEnvAtEnd.AccessRights,
+                state.projectOptions.ProjectFileName,
+                parse.FileName,
+                Some state.projectOptions,
+                sink.GetResolutions(),
+                sink.GetSymbolUses(),
+                tcEnvAtEnd.NameEnv,
+                None,
+                Some implFile,
+                sink.GetOpenDeclarations()
+            )
+
+        let checkResults =
+            FSharpCheckFileResults(parse.FileName, diagnostics, Some scope, parse.DependencyFiles, None, true)
+
+        FileResult(diagnostics, fingerprints, signature, checkResults)
