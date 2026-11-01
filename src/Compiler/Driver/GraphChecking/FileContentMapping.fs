@@ -435,10 +435,25 @@ let indexerMembers =
     [ "Item"; "GetSlice"; "SetSlice"; "GetReverseIndex" ]
     |> List.map FileContentEntry.MemberName
 
+/// The builder methods `let! … and! …` with this many sources can call, as CheckComputationExpressions.fs names
+/// them: Bind{n}, Bind{n}Return, and MergeSources, MergeSources3 … MergeSources{n}.
+let sourceMembers (sources: int) =
+    if sources < 2 then
+        []
+    else
+        [
+            yield $"Bind{sources}"
+            yield $"Bind{sources}Return"
+            yield "MergeSources"
+            for n in 3..sources do
+                yield $"MergeSources{n}"
+        ]
+        |> List.map FileContentEntry.MemberName
+
 /// The builder methods a computation expression can call, which may be extensions: every name
 /// Checking/Expressions/CheckComputationExpressions.fs looks up on a builder, plus Dispose, which `use` calls on
-/// the resource. Bind{N}, Bind{N}Return and MergeSources{N} grow with the number of `and!` sources; past 16 they
-/// are not listed.
+/// the resource. Bind{N}, Bind{N}Return and MergeSources{N} grow with the number of `and!` sources: each
+/// `let! … and! …` also lists its own (sourceMembers).
 let builderMembers =
     [
         yield! [ "Bind"; "BindReturn"; "Combine"; "Delay"; "For"; "MergeSources"; "Quote"; "Return"; "ReturnFrom" ]
@@ -565,8 +580,9 @@ let visitSynExpr (e: SynExpr) : FileContentEntry list =
                 visit funcExpr (fun funcNodes -> visit argExpr (fun argNodes -> implied @ funcNodes @ argNodes |> continuation))
             | SynExpr.TypeApp(expr = expr; typeArgs = typeArgs) ->
                 visit expr (fun exprNodes -> exprNodes @ List.collect visitSynType typeArgs |> continuation)
-            | SynExpr.LetOrUse({ Bindings = bindings; Body = body }) ->
-                visit body (fun nodes -> List.collect visitBinding bindings @ nodes |> continuation)
+            | SynExpr.LetOrUse({ Bindings = bindings; Body = body } as letOrUse) ->
+                let implied = if letOrUse.IsBang then sourceMembers bindings.Length else []
+                visit body (fun nodes -> implied @ List.collect visitBinding bindings @ nodes |> continuation)
             | SynExpr.TryWith(tryExpr = tryExpr; withCases = withCases) ->
                 visit tryExpr (fun nodes -> nodes @ List.collect visitSynMatchClause withCases |> continuation)
             | SynExpr.TryFinally(tryExpr = tryExpr; finallyExpr = finallyExpr) ->
@@ -596,13 +612,20 @@ let visitSynExpr (e: SynExpr) : FileContentEntry list =
             | SynExpr.NamedIndexedPropertySet(longDotId, expr1, expr2, _) ->
                 visit expr1 (fun nodes1 ->
                     visit expr2 (fun nodes2 ->
-                        [ yield! visitExprLongIdent longDotId; yield! nodes1; yield! nodes2 ]
+                        // mkSynAssign makes `M.arr[i] <- v` this: the checker makes it an indexer or slice set
+                        [
+                            yield! indexerMembers
+                            yield! visitExprLongIdent longDotId
+                            yield! nodes1
+                            yield! nodes2
+                        ]
                         |> continuation))
             | SynExpr.DotNamedIndexedPropertySet(targetExpr, longDotId, argExpr, rhsExpr, _) ->
                 let continuations = List.map visit [ targetExpr; argExpr; rhsExpr ]
 
+                // mkSynAssign makes `x.P[i] <- v` this: the checker makes it an indexer or slice set
                 let finalContinuation nodes =
-                    visitDotted longDotId @ List.concat nodes |> continuation
+                    indexerMembers @ visitDotted longDotId @ List.concat nodes |> continuation
 
                 Continuation.sequence continuations finalContinuation
             | SynExpr.TypeTest(expr, targetType, _) -> visit expr (fun nodes -> nodes @ visitSynType targetType |> continuation)

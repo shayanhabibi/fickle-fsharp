@@ -71,7 +71,7 @@ type DeclarationContent =
       /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a type or module abbreviation,
       /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
       /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
-      /// filters every declaration's diagnostics with the latest parse's scopes, so they need no dependency.
+      /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
       AffectsAllLater: bool }
 
 /// A top-level declaration of an implementation file, or a declaration of a non-recursive nested module, or the
@@ -124,7 +124,11 @@ type ParsedDeclaration
 /// A project's options, references and initial checking state.
 [<Sealed>]
 type ProjectContext internal (state: CompilerState) =
+    let parseLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
     member internal _.State = state
+    /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
+    /// copied: parses of one file serialize, parses of different files do not.
+    member internal _.ParseLock(fileName: string) = parseLocks.GetOrAdd(fileName, fun _ -> obj ())
 
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
@@ -138,7 +142,8 @@ type FileSignature internal (fileName: string, apply: TcState -> TcState, module
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
 /// Keeps every diagnostic as reported, before the warning options and #nowarn scopes filter it, and passes it on.
-/// The #nowarn scopes come from lexing the file: FinishFile filters what was kept again with the latest parse's.
+/// The #nowarn scopes come from lexing the file: FinishFile filters what was kept again with those of the parse it
+/// is given.
 type internal RawDiagnostics(next: DiagnosticsLogger) =
     inherit DiagnosticsLogger("RawDiagnostics")
     let raw = ResizeArray<PhasedDiagnostic>()
@@ -266,7 +271,7 @@ type DeclarationResult
     /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
     member _.Fingerprint = fingerprint
     /// The declaration's diagnostics, filtered by the #nowarn scopes the file had when it was checked. FinishFile
-    /// filters them again with the scopes of the file's latest parse (a #nowarn is not a declaration).
+    /// filters them again with the scopes of the parse it is given (a #nowarn is not a declaration).
     member _.Diagnostics = diagnostics
     member _.LeavesFreeTypars = leavesFreeTypars
     member _.EnvAfter = envAfter
@@ -388,14 +393,16 @@ module internal DeclarationCheck =
         | [ SynModuleOrNamespace(isRecursive = false) ] -> true
         | _ -> false
 
-    let newLoggers (state: CompilerState) =
-        let diagnosticsOptions = state.tcConfig.diagnosticsOptions
+    /// Loggers filtering by these options, whose #nowarn scopes may be a parse's copy.
+    let newLoggersWith (diagnosticsOptions: FSharpDiagnosticOptions) =
         let capturing = CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions)
         capturing, RawDiagnostics(GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, capturing))
 
-    let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
+    let newLoggers (state: CompilerState) = newLoggersWith state.tcConfig.diagnosticsOptions
+
+    let diagnosticsWith (state: CompilerState) (diagnosticsOptions: FSharpDiagnosticOptions) fileName (capturing: CompilationDiagnosticLogger) =
         DiagnosticHelpers.CreateDiagnostics(
-            state.tcConfig.diagnosticsOptions,
+            diagnosticsOptions,
             false,
             fileName,
             capturing.GetDiagnostics(),
@@ -404,14 +411,20 @@ module internal DeclarationCheck =
             None
         )
 
-    /// Diagnostics as reported, filtered by the warning options and the #nowarn scopes of the file's latest parse.
-    let refiltered (state: CompilerState) fileName (raw: PhasedDiagnostic[]) =
-        let capturing, logger = newLoggers state
+    let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
+        diagnosticsWith state state.tcConfig.diagnosticsOptions fileName capturing
+
+    /// Diagnostics as reported, filtered by these options (a parse's copy, with its #nowarn scopes).
+    let refiltered (state: CompilerState) diagnosticsOptions fileName (raw: PhasedDiagnostic[]) =
+        let capturing, logger = newLoggersWith diagnosticsOptions
 
         for diagnostic in raw do
             logger.DiagnosticSink diagnostic
 
-        diagnosticsOf state fileName capturing
+        diagnosticsWith state diagnosticsOptions fileName capturing
+
+    /// Each parse's copy of the project's diagnostic options, holding the #nowarn scopes that parse recorded.
+    let warnOptions = ConditionalWeakTable<FSharpParseFileResults, FSharpDiagnosticOptions>()
 
     let stateBefore (state: CompilerState) (before: FileSignature list) =
         let tcState = (state.tcInitialState, before) ||> List.fold (fun tcState signature -> signature.Apply tcState)
@@ -747,20 +760,28 @@ type DeclarationChecker =
         let parsingOptions = FSharpParsingOptions.FromTcConfig(state.tcConfig, state.projectOptions.SourceFiles, false)
         let sourceText = SourceText.ofString source
 
-        let parseErrors, parseTree, anyErrors =
-            ParseAndCheckFile.parseFile (
-                sourceText,
-                fileName,
-                parsingOptions,
-                userOpName,
-                suggestNamesForErrors,
-                state.tcConfig.flatErrors,
-                captureIdentifiersWhenParsing,
-                CancellationToken.None
-            )
+        // Lexing records the file's #nowarn scopes in the project's diagnostic options, replacing the last parse's:
+        // copy them while no other parse of this file can replace them
+        let (parseErrors, parseTree, anyErrors), warnOptions =
+            lock (ctx.ParseLock fileName) (fun () ->
+                let parsed =
+                    ParseAndCheckFile.parseFile (
+                        sourceText,
+                        fileName,
+                        parsingOptions,
+                        userOpName,
+                        suggestNamesForErrors,
+                        state.tcConfig.flatErrors,
+                        captureIdentifiersWhenParsing,
+                        CancellationToken.None
+                    )
+
+                let options = parsingOptions.DiagnosticOptions
+                parsed, lock options (fun () -> { options with WarnScopeData = options.WarnScopeData }))
 
         let parse = FSharpParseFileResults(parseErrors, parseTree, anyErrors, [||])
         DeclarationCheck.sources.AddOrUpdate(parse, sourceText)
+        DeclarationCheck.warnOptions.AddOrUpdate(parse, warnOptions)
         parse
 
     static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] =
@@ -1006,11 +1027,16 @@ type DeclarationChecker =
                 | frame :: _ -> frame.Entity.IsSome
                 | [] -> true)
 
-        // Only a module reads them, for its suffix: from its siblings' syntax, which its HeaderInputs cover, rather than
-        // from an environment that an earlier check of another declaration built
+        // Only a module reads them, for its suffix, and the whole check collects them once, in the environment where
+        // the enclosing module's declarations start. Inside a nested module, that is what its header collected. At the
+        // file's scope it is redone from the siblings' syntax (which HeaderInputs covers) in the scope's environment,
+        // so a FileStart made before a sibling type was added still gives the suffix. A cenv of its own keeps the
+        // attribute resolutions it reports out of this declaration's sink.
         let typeNames =
             match decl.Syntax with
-            | SynModuleDecl.NestedModule _ -> TypeNamesOfDeclarations cenv env decl.Siblings
+            | SynModuleDecl.NestedModule _ when decl.Depth = 0 ->
+                let scratch, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+                TypeNamesOfDeclarations scratch start.Scope.Env decl.Siblings
             | _ -> envBefore.TypeNames
 
         let checkedDecl, envAfter, envAtEnd, delta, nesting =
@@ -1101,7 +1127,17 @@ type DeclarationChecker =
     /// next finish or declaration check on this FileStart, so a finish over the same or other results gives what a
     /// full check would. Finishes on one FileStart are serialized, by its lock; a finish must not overlap a
     /// declaration check on the same FileStart.
-    static member FinishFile(start: FileStart, results: DeclarationResult[]) : FileResult =
+    ///
+    /// The diagnostics come from `parse` (by default the FileStart's): its parse diagnostics, and its #nowarn scopes,
+    /// which filter every declaration's diagnostics again and decide which errors stop the finish pass from
+    /// reporting. Pass the parse of the file's current text when it is newer than the FileStart's: a #nowarn is not
+    /// a declaration, so adding or removing one changes no result.
+    static member FinishFile(start: FileStart, results: DeclarationResult[], ?parse: FSharpParseFileResults) : FileResult =
+        let parse = defaultArg parse start.Parse
+
+        if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
+            invalidArg (nameof parse) "The parse is of another file than the FileStart's."
+
         lock start.Sync (fun () ->
             start.UndoLastFinish()
             let log = ResizeArray()
@@ -1109,17 +1145,32 @@ type DeclarationChecker =
             MutationLog.Current <- log
 
             try
-                DeclarationChecker.Finish(start, results)
+                DeclarationChecker.Finish(start, results, parse)
             finally
                 MutationLog.Current <- outer
                 start.SetLastFinish log)
 
-    static member private Finish(start: FileStart, results: DeclarationResult[]) : FileResult =
+    static member private Finish(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FileResult =
         let state = start.Context.State
-        let parse = start.Parse
         let file = start.File
         let tcState = start.TcState
-        let capturing, logger = DeclarationCheck.newLoggers state
+
+        let options =
+            match DeclarationCheck.warnOptions.TryGetValue parse with
+            | true, options -> options
+            | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can finish a file: its #nowarn scopes are the ones it recorded."
+
+        // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration
+        let earlierDiagnostics =
+            Array.concat
+                [ yield DeclarationCheck.refiltered state options parse.FileName start.RawDiagnostics
+                  for result in results do
+                      yield DeclarationCheck.refiltered state options parse.FileName result.RawDiagnostics ]
+
+        let earlierErrors =
+            earlierDiagnostics |> Array.sumBy (fun d -> if d.Severity = FSharpDiagnosticSeverity.Error then 1 else 0)
+
+        let capturing, logger = DeclarationCheck.newLoggersWith options
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
         let sink = TcResultsSinkImpl(state.tcGlobals)
@@ -1135,7 +1186,6 @@ type DeclarationChecker =
         let fileContents =
             ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
 
-        let earlierErrors = start.ErrorCount + (results |> Array.sumBy (fun result -> result.ErrorCount))
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
 
         let _topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile =
@@ -1154,13 +1204,9 @@ type DeclarationChecker =
 
         let diagnostics =
             Array.concat
-                [ yield parse.Diagnostics
-                  // With the #nowarn scopes of the latest parse, which an added or removed #nowarn changes without
-                  // changing any declaration
-                  yield DeclarationCheck.refiltered state parse.FileName start.RawDiagnostics
-                  for result in results do
-                      yield DeclarationCheck.refiltered state parse.FileName result.RawDiagnostics
-                  yield DeclarationCheck.diagnosticsOf state parse.FileName capturing ]
+                [ parse.Diagnostics
+                  earlierDiagnostics
+                  DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
 
         let fingerprints =
             Dictionary<DeclarationKey, string>(HashIdentity.Structural)
