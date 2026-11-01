@@ -9,6 +9,7 @@ open System.Threading
 
 open Internal.Utilities.Collections
 open Internal.Utilities.Library
+open Internal.Utilities.Library.Extras
 
 open FSharp.Compiler
 open FSharp.Compiler.CheckBasics
@@ -18,10 +19,12 @@ open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.CompilerDiagnostics
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.DiagnosticsLogger
+open FSharp.Compiler.GraphChecking
 open FSharp.Compiler.NameResolution
 open FSharp.Compiler.ParseAndCheckInputs
 open FSharp.Compiler.SourceCodeServices
 open FSharp.Compiler.Syntax
+open FSharp.Compiler.SyntaxTreeOps
 open FSharp.Compiler.TcGlobals
 open FSharp.Compiler.Text
 open FSharp.Compiler.Text.Range
@@ -41,26 +44,55 @@ type DeclarationKind =
     | Augmentation
 
 type DeclarationKey =
-    { ModulePath: string list
+    { /// The file's module or namespace, then the nested modules the declaration is in
+      ModulePath: string list
       Name: string
       Kind: DeclarationKind
       /// The number of earlier declarations of the file with the same module path, name and kind
       Ordinal: int }
 
-/// A top-level declaration of an implementation file.
+/// The names a declaration defines and uses, from its syntax. A use can resolve to a definition through any of the
+/// lists: Defines holds every kind of name, so a dependency on a name is a dependency on every declaration defining it.
+type DeclarationContent =
+    { /// Values, types, union cases, record fields, members, custom operation names and modules, including those
+      /// inside a nested module or namespace fragment the declaration holds whole
+      Defines: string[]
+      /// Names resolved in the environment: unqualified identifiers, every segment of qualified ones, types, attributes
+      /// (with and without the Attribute suffix) and opened modules. Locally bound names are included.
+      Uses: string[]
+      /// Names after a dot and members constructs call implicitly (computation expression builders, enumerators,
+      /// indexers, trait calls): each may be a member or extension of any type
+      MemberUses: string[]
+      /// Record labels and union cases, including names after a dot, which can be record fields
+      FieldOrCaseUses: string[]
+      /// Something resolves to a name the syntax does not show, such as the `?` operator: the declaration depends on
+      /// every earlier declaration
+      HasUnresolvable: bool
+      /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a type or module abbreviation,
+      /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown
+      AffectsAllLater: bool }
+
+/// A top-level declaration of an implementation file, or a declaration of a non-recursive nested module, or the
+/// header of such a module (its attributes and name, which the module's declarations are checked inside).
 [<Sealed>]
-type ParsedDeclaration internal (key: DeclarationKey, decl: SynModuleDecl, scopem: range, text: string) =
+type ParsedDeclaration
+    internal (key: DeclarationKey, decl: SynModuleDecl, range: range, scopem: range, text: string, depth: int, isModuleHeader: bool) =
     member _.Key = key
-    member _.Range = decl.Range
+    /// The declaration's range; for a module header, from its start to the '=' after the module's name.
+    member _.Range = range
     /// A hash of the declaration's source text. Unequal hashes mean the text changed; equal ones do not prove
     /// it is the same, so compare Text for that.
     member _.SyntaxHash = hash text
     /// The declaration's source text, from the start of its range to its end. Compare Text, not SyntaxHash, to
     /// decide a declaration is unchanged.
     member _.Text = text
+    /// The whole declaration; for a module header, the whole module.
     member internal _.Syntax = decl
     /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
     member internal _.ScopeRange = scopem
+    /// How many nested modules the declaration is in, below the file's scope
+    member internal _.Depth = depth
+    member internal _.IsModuleHeader = isModuleHeader
 
 /// A project's options, references and initial checking state.
 [<Sealed>]
@@ -76,10 +108,44 @@ type FileSignature internal (fileName: string, apply: TcState -> TcState, module
     /// and its own. BeginFile merges these over the earlier files.
     member internal _.ModuleNamesDict = moduleNamesDict
 
+type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
+
+/// A non-recursive nested module whose declarations are checked one at a time.
+[<NoEquality; NoComparison>]
+type internal ModuleFrame =
+    { /// None when setting up the module failed, which skips its declarations
+      Entity: ModuleOrNamespace option
+      /// The module declaration's scope in its parent, and its range
+      ScopeRange: range
+      Range: range
+      /// The environment, parent and type names the module's header was checked in
+      OuterEnv: TcEnv
+      OuterParent: ParentRef
+      OuterTypeNames: Set<string>
+      /// What the module's declarations checked so far left, latest first
+      Checked: CheckedDeclaration list }
+
 /// The environment a declaration is checked in.
 [<Sealed>]
-type DeclEnv internal (env: TcEnv) =
+type DeclEnv internal (env: TcEnv, parent: ParentRef, typeNames: Set<string>, frames: ModuleFrame list) =
     member internal _.Env = env
+    member internal _.Parent = parent
+    member internal _.TypeNames = typeNames
+    /// The nested modules the environment is inside, innermost first
+    member internal _.Frames = frames
+
+/// Where a result goes when the file is built from the results.
+[<NoEquality; NoComparison>]
+type internal Nesting =
+    /// A declaration, in as many nested modules
+    | InModules of depth: int
+    /// The header of a nested module that is in as many nested modules
+    | ModuleHeader of depth: int * frame: ModuleFrame
+
+    member x.Depth =
+        match x with
+        | InModules depth
+        | ModuleHeader(depth, _) -> depth
 
 /// An implementation file set up for checking its declarations one at a time.
 [<Sealed>]
@@ -132,8 +198,6 @@ type FileStart
 
     member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
 
-type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
-
 [<Sealed>]
 type DeclarationResult
     internal
@@ -149,7 +213,8 @@ type DeclarationResult
         delta: ModuleOrNamespaceType,
         deltaCombines: bool,
         sink: TcResultsSinkImpl,
-        leftovers: TcFileState -> unit
+        leftovers: TcFileState -> unit,
+        nesting: Nesting
     ) =
     member _.Key = key
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
@@ -162,12 +227,14 @@ type DeclarationResult
     /// The environment at the end of the enclosing scope if this is its last declaration.
     member internal _.EnvAtEnd = envAtEnd
     member internal _.Checked = checkedDecl
-    /// What the declaration publishes into the module or namespace it is in.
+    /// What the declaration publishes into the module or namespace it is in; for a module header, the module without
+    /// contents, which FinishFile does not merge (it finishes the module from its declarations).
     member internal _.Delta: ModuleOrNamespaceType = delta
     /// Whether the delta is combined into the file's contents, as a namespace fragment's is, rather than added.
     member internal _.DeltaCombines = deltaCombines
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
+    member internal _.Nesting = nesting
 
     /// Whether the two results contribute the same Val and Entity objects, by reference and in the same order.
     /// For tests.
@@ -327,16 +394,134 @@ module internal DeclarationCheck =
             not path.IsEmpty
         | _ -> false
 
-    /// Merges the declarations' deltas in order onto what the scope held before them, as publishing them did: a
+    /// Merges a declaration's delta onto what its module or namespace held before it, as publishing it did: a
     /// namespace fragment combines its namespaces with the file's, and anything else adds its values and entities.
-    let mergeDeltas (scopeContents: ModuleOrNamespaceType) (deltas: (ModuleOrNamespaceType * bool) list) =
-        (scopeContents, deltas)
-        ||> List.fold (fun acc (delta, combines) ->
-            if combines then
-                CombineCcuContentFragments [ acc; delta ]
-            else
-                let acc = (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
-                (acc, delta.AllValsAndMembers) ||> Seq.fold (fun acc v -> acc.AddVal v))
+    let mergeDelta (acc: ModuleOrNamespaceType) (delta: ModuleOrNamespaceType) combines =
+        if combines then
+            CombineCcuContentFragments [ acc; delta ]
+        else
+            let acc = (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
+            (acc, delta.AllValsAndMembers) ||> Seq.fold (fun acc v -> acc.AddVal v)
+
+    /// A module or namespace being built from results at finish.
+    [<NoEquality; NoComparison>]
+    type Level =
+        { /// None for the file's scope
+          Frame: ModuleFrame option
+          mutable Contents: ModuleOrNamespaceType
+          Checked: ResizeArray<CheckedDeclaration>
+          mutable EnvAtEnd: TcEnv }
+
+    /// Builds the scope's contents, checked declarations and environment at its end from the results in order,
+    /// finishing each nested module after its declarations, as checking the file whole does.
+    let assemble (cenv: TcFileState) (scopeContents: ModuleOrNamespaceType) (scopeEnv: TcEnv) (results: DeclarationResult[]) =
+        let root =
+            { Frame = None
+              Contents = scopeContents
+              Checked = ResizeArray()
+              EnvAtEnd = scopeEnv }
+
+        let levels = Stack<Level>()
+        levels.Push root
+
+        let close () =
+            let level = levels.Pop()
+            let parent = levels.Peek()
+
+            match level.Frame with
+            | Some({ Entity = Some entity } as frame) ->
+                let outerEnv = { frame.OuterEnv with eModuleOrNamespaceTypeAccumulator = ref parent.Contents }
+
+                let checkedDecl, _, envAtEnd =
+                    ExitNestedModuleDeclarations cenv frame.ScopeRange outerEnv frame.Range entity level.Contents (List.ofSeq level.Checked) level.EnvAtEnd
+
+                parent.Contents <- outerEnv.eModuleOrNamespaceTypeAccumulator.Value
+                parent.Checked.Add checkedDecl
+                parent.EnvAtEnd <- envAtEnd
+            | Some frame ->
+                parent.Checked.Add(([], [], []))
+                parent.EnvAtEnd <- frame.OuterEnv
+            | None -> ()
+
+        for result in results do
+            while levels.Count - 1 > result.Nesting.Depth do
+                close ()
+
+            match result.Nesting with
+            | ModuleHeader(_, frame) ->
+                let kind =
+                    match frame.Entity with
+                    | Some entity -> entity.ModuleOrNamespaceType.ModuleOrNamespaceKind
+                    | None -> ModuleOrNamespaceKind.ModuleOrType
+
+                levels.Push
+                    { Frame = Some frame
+                      Contents = Construct.NewEmptyModuleOrNamespaceType kind
+                      Checked = ResizeArray()
+                      EnvAtEnd = frame.OuterEnv }
+            | InModules _ ->
+                let level = levels.Peek()
+                level.Contents <- mergeDelta level.Contents result.Delta result.DeltaCombines
+                level.Checked.Add result.Checked
+                level.EnvAtEnd <- result.EnvAtEnd
+
+        while levels.Count > 1 do
+            close ()
+
+        root.Contents, List.ofSeq root.Checked, root.EnvAtEnd
+
+    let isTypeAbbreviation (SynTypeDefn(typeRepr = repr)) =
+        match repr with
+        | SynTypeDefnRepr.Simple(SynTypeDefnSimpleRepr.TypeAbbrev _, _) -> true
+        | _ -> false
+
+    /// Whether every later declaration depends on this one. For a module or fragment checked whole, that holds when
+    /// anything in it would, except an open, whose scope ends with the module.
+    let rec affectsAllLater (decl: SynModuleDecl) =
+        let inner (decl: SynModuleDecl) =
+            match decl with
+            | SynModuleDecl.Open _ -> false
+            | _ -> affectsAllLater decl
+
+        match decl with
+        | SynModuleDecl.Open _
+        | SynModuleDecl.ModuleAbbrev _
+        | SynModuleDecl.Attributes _
+        | SynModuleDecl.Expr _
+        | SynModuleDecl.HashDirective _ -> true
+        | SynModuleDecl.Types(typeDefns, _) -> List.exists isTypeAbbreviation typeDefns
+        | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes); decls = decls) ->
+            findSynAttribute "AutoOpen" attributes || List.exists inner decls
+        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(attribs = attributes; decls = decls)) ->
+            findSynAttribute "AutoOpen" attributes || List.exists inner decls
+        | SynModuleDecl.Let _
+        | SynModuleDecl.Exception _ -> false
+
+    /// The uses in the entries of a declaration's syntax.
+    let usesOf (entries: FileContentEntry list) =
+        let uses = HashSet<string>()
+        let members = HashSet<string>()
+        let fields = HashSet<string>()
+        let mutable unresolvable = false
+
+        let rec visit (entry: FileContentEntry) =
+            match entry with
+            | FileContentEntry.Name name
+            | FileContentEntry.ModuleName name -> uses.Add name |> ignore
+            | FileContentEntry.OpenStatement path -> uses.UnionWith path
+            | FileContentEntry.MemberName name -> members.Add name |> ignore
+            | FileContentEntry.FieldOrCaseName name -> fields.Add name |> ignore
+            | FileContentEntry.Unresolvable -> unresolvable <- true
+            | FileContentEntry.TopLevelNamespace(content = content)
+            | FileContentEntry.NestedModule(nestedContent = content) -> List.iter visit content
+            // Its segments are names already, except after a dot on an expression, where they are members
+            | FileContentEntry.PrefixedIdentifier _ -> ()
+
+        List.iter visit entries
+        uses, members, fields, unresolvable
+
+    let sorted (names: seq<string>) =
+        names |> Seq.distinct |> Seq.toArray |> Array.sortWith (fun a b -> String.CompareOrdinal(a, b))
 
     /// What checking left in cenv that CheckImplFileTail reads, to replay into the finish's own cenv.
     let leftoversOf (cenv: TcFileState) : TcFileState -> unit =
@@ -380,6 +565,38 @@ module internal DeclarationCheck =
             file,
             state.tcConfig.diagnosticsOptions
         )
+
+    /// The environment after leaving nested modules until the environment is in only `depth` of them, as the first
+    /// declaration after a module is checked in. FinishFile finishes the modules again and reports what that finds,
+    /// so what this reports is dropped. It gives each module its contents so far as its type, as FinishFile does.
+    let exitModules (state: CompilerState) (start: FileStart) (envBefore: DeclEnv) depth =
+        if envBefore.Frames.Length <= depth then
+            envBefore
+        else
+            use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+            let cenv, _, _ = newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+
+            let rec exit (env: DeclEnv) =
+                match env.Frames with
+                | frame :: outer when env.Frames.Length > depth ->
+                    let outerEnv =
+                        { frame.OuterEnv with
+                            eModuleOrNamespaceTypeAccumulator = ref frame.OuterEnv.eModuleOrNamespaceTypeAccumulator.Value }
+
+                    let envAfter =
+                        match frame.Entity with
+                        | Some entity ->
+                            let moduleContents = env.Env.eModuleOrNamespaceTypeAccumulator.Value
+                            let _, envAfter, _ =
+                                ExitNestedModuleDeclarations cenv frame.ScopeRange outerEnv frame.Range entity moduleContents (List.rev frame.Checked) env.Env
+
+                            envAfter
+                        | None -> outerEnv
+
+                    exit (DeclEnv(envAfter, frame.OuterParent, frame.OuterTypeNames, outer))
+                | _ -> env
+
+            exit envBefore
 
     /// The results of several sinks as one sink's, in order.
     let mergeSinks (g: TcGlobals) (sinks: TcResultsSinkImpl list) =
@@ -493,22 +710,71 @@ type DeclarationChecker =
 
             let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
 
-            decls
-            |> List.mapi (fun i decl ->
-                // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end of
-                // the enclosing module, namespace or file. This is the only place the end is computed.
-                let scopem =
-                    match List.tryItem (i + 1) decls with
-                    | Some next -> unionRanges next.Range endm
-                    | None -> unionRanges decl.Range endm
-
+            let declaration modulePath depth (decl: SynModuleDecl) (range: range) scopem isModuleHeader =
                 let name, kind = DeclarationCheck.nameAndKind decl
                 let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
                 seen[(modulePath, name, kind)] <- ordinal + 1
+                let text = DeclarationCheck.textOfRange source range
+                let key = { ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }
+                ParsedDeclaration(key, decl, range, scopem, text, depth, isModuleHeader)
 
-                let text = DeclarationCheck.textOfRange source decl.Range
-                ParsedDeclaration({ ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }, decl, scopem, text))
-            |> Array.ofList
+            let rec split modulePath depth (endm: range) (decls: SynModuleDecl list) =
+                decls
+                |> List.mapi (fun i decl ->
+                    // As TcModuleOrNamespaceElementsNonMutRec: a declaration's scope runs from the next one to the end
+                    // of the enclosing module, namespace or file. This is the only place the end is computed.
+                    let scopem =
+                        match List.tryItem (i + 1) decls with
+                        | Some next -> unionRanges next.Range endm
+                        | None -> unionRanges decl.Range endm
+
+                    match decl with
+                    // A module with a name, and not recursive: its header, then its declarations, as checking the
+                    // module checks them, with its end as theirs
+                    | SynModuleDecl.NestedModule(
+                        moduleInfo = SynComponentInfo(synType = Some _) as moduleInfo
+                        isRecursive = false
+                        decls = moduleDecls
+                        range = m
+                        trivia = trivia) ->
+                        let headerEnd =
+                            match trivia.EqualsRange with
+                            | Some equals -> equals.End
+                            | None -> moduleInfo.Range.End
+
+                        let header = declaration modulePath depth decl (mkRange m.FileName m.Start headerEnd) scopem true
+                        let path = modulePath @ [ DeclarationCheck.longIdentText moduleInfo.LongIdent ]
+                        header :: split path (depth + 1) m.EndRange moduleDecls
+                    | _ -> [ declaration modulePath depth decl decl.Range scopem false ])
+                |> List.concat
+
+            split modulePath 0 endm decls |> Array.ofList
+
+    /// The names the declaration defines and uses. A module header has only its name and its attributes' uses.
+    static member Content(decl: ParsedDeclaration) : DeclarationContent =
+        let entries, (defines, unreadableName) =
+            match decl.Syntax with
+            | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes) as moduleInfo) when decl.IsModuleHeader ->
+                FileContentMapping.visitSynAttributes attributes, ([ for id in moduleInfo.LongIdent -> id.idText ], false)
+            | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(attribs = attributes; decls = decls)) ->
+                FileContentMapping.visitSynAttributes attributes @ List.collect FileContentMapping.visitSynModuleDecl decls,
+                TrieMapping.declarationNames decl.Syntax
+            | syntax -> FileContentMapping.visitSynModuleDecl syntax, TrieMapping.declarationNames syntax
+
+        let uses, members, fields, unresolvable = DeclarationCheck.usesOf entries
+
+        let affectsAllLater =
+            match decl.Syntax with
+            | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes)) when decl.IsModuleHeader ->
+                findSynAttribute "AutoOpen" attributes
+            | syntax -> DeclarationCheck.affectsAllLater syntax
+
+        { Defines = DeclarationCheck.sorted defines
+          Uses = DeclarationCheck.sorted uses
+          MemberUses = DeclarationCheck.sorted members
+          FieldOrCaseUses = DeclarationCheck.sorted fields
+          HasUnresolvable = unresolvable
+          AffectsAllLater = affectsAllLater || unreadableName }
 
     static member CheckSignatureFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileSignature =
         let state = ctx.State
@@ -594,7 +860,7 @@ type DeclarationChecker =
                         logger.ErrorCount
                     )
 
-                start, DeclEnv scope.Env
+                start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [])
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time, without publishing into
@@ -605,7 +871,15 @@ type DeclarationChecker =
     /// an earlier declaration left free (LeavesFreeTypars), and it marks the earlier values it uses as referenced
     /// (SetHasBeenReferenced). The checker's guard (ruling R12, Task 13) re-checks a declaration that left free
     /// inference variables when any later declaration of its file changes or is removed.
+    ///
+    /// A nested module's header creates the module's entity, the parent of the values its declarations define, and
+    /// those declarations are checked in the environment it leads to. So when a header is checked again, the module's
+    /// declarations must be checked again after it. The first declaration after a module gives the module its
+    /// contents so far as its type, as FinishFile does: the module's entity is shared, and the last of them wins.
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
+        if decl.Depth > envBefore.Frames.Length then
+            invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+
         start.UndoLastFinish()
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
@@ -615,6 +889,7 @@ type DeclarationChecker =
         use _ = FSharp.Compiler.Cancellable.UsingToken ct
         let sink = TcResultsSinkImpl(state.tcGlobals)
         let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
+        let envBefore = DeclarationCheck.exitModules state start envBefore decl.Depth
         let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
         // Combining builds new namespace entities, so only from an empty start is what such a fragment adds the
@@ -631,23 +906,70 @@ type DeclarationChecker =
         let accumulator = ref contentsAtStart
         let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
 
-        let checkedDecl, envAfter, envAtEnd =
-            let scope = start.Scope
+        // As checking the whole file: nothing in a scope or module whose setup failed is checked
+        let checks =
+            start.Scope.ChecksDeclarations
+            && (match envBefore.Frames with
+                | frame :: _ -> frame.Entity.IsSome
+                | [] -> true)
 
-            if not scope.ChecksDeclarations then
-                ([], [], []), env, env
+        let checkedDecl, envAfter, envAtEnd, delta, nesting =
+            if decl.IsModuleHeader then
+                let entered =
+                    if checks then
+                        EnterNestedModuleDeclarations cenv envBefore.Parent envBefore.TypeNames env decl.Syntax
+                    else
+                        None
+
+                let frame =
+                    { Entity = entered |> Option.map (fun (entity, _, _, _) -> entity)
+                      ScopeRange = decl.ScopeRange
+                      Range = decl.Syntax.Range
+                      OuterEnv = env
+                      OuterParent = envBefore.Parent
+                      OuterTypeNames = envBefore.TypeNames
+                      Checked = [] }
+
+                let envAfter =
+                    match entered with
+                    | Some(_, envForModule, parent, typeNames) -> DeclEnv(envForModule, parent, typeNames, frame :: envBefore.Frames)
+                    | None -> DeclEnv(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames)
+
+                // What the header decides about the module (its name, kind, attributes, access), without the contents
+                // the module's declarations give it, which FinishFile replaces
+                let delta =
+                    match frame.Entity with
+                    | Some entity ->
+                        let header =
+                            { entity with
+                                entity_modul_type = MaybeLazy.Strict(Construct.NewEmptyModuleOrNamespaceType entity.ModuleOrNamespaceType.ModuleOrNamespaceKind) }
+
+                        Construct.NewModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind [ header ] []
+                    | None -> Construct.NewEmptyModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind
+
+                ([], [], []), envAfter, envAfter.Env, delta, ModuleHeader(decl.Depth, frame)
             else
-                TcModuleOrNamespaceElementNonMutRec cenv scope.Parent scope.TypeNames decl.ScopeRange env decl.Syntax
-                |> cenv.stackGuard.GuardCancellable
-                |> Cancellable.run ct
-                |> function
-                    | ValueOrCancelled.Value result -> result
-                    | ValueOrCancelled.Cancelled exn -> raise exn
+                let checkedDecl, envAfter, envAtEnd =
+                    if not checks then
+                        ([], [], []), env, env
+                    else
+                        TcModuleOrNamespaceElementNonMutRec cenv envBefore.Parent envBefore.TypeNames decl.ScopeRange env decl.Syntax
+                        |> cenv.stackGuard.GuardCancellable
+                        |> Cancellable.run ct
+                        |> function
+                            | ValueOrCancelled.Value result -> result
+                            | ValueOrCancelled.Cancelled exn -> raise exn
 
-        let delta = DeclarationCheck.contribution contentsAtStart accumulator.Value
+                let frames =
+                    match envBefore.Frames with
+                    | frame :: outer -> { frame with Checked = checkedDecl :: frame.Checked } :: outer
+                    | [] -> []
+
+                let delta = DeclarationCheck.contribution contentsAtStart accumulator.Value
+                checkedDecl, DeclEnv(envAfter, envBefore.Parent, envBefore.TypeNames, frames), envAtEnd, delta, InModules decl.Depth
 
         let leavesFreeTypars =
-            not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter))
+            not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env))
 
         DeclarationResult(
             decl.Key,
@@ -655,13 +977,14 @@ type DeclarationChecker =
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.ErrorCount,
             leavesFreeTypars,
-            DeclEnv envAfter,
+            envAfter,
             envAtEnd,
             checkedDecl,
             delta,
             deltaCombines,
             sink,
-            DeclarationCheck.leftoversOf cenv
+            DeclarationCheck.leftoversOf cenv,
+            nesting
         )
 
     /// Builds the file from the declarations' results, in declaration order, closes its inference scope, and takes
@@ -670,7 +993,7 @@ type DeclarationChecker =
     /// The file's accumulators, namespace entities and checker state are new each time. A 'module X.Y' file's module
     /// entity is not: it is the setup's, the parent of the declarations' values, shared by every finish on this
     /// FileStart. Each finish gives it a new type, so the last finish wins, and an earlier FileResult shows that
-    /// finish's module contents.
+    /// finish's module contents. The same holds for a nested module's entity, which its header's result holds.
     ///
     /// Closing the inference scope changes the declarations' typed trees in place: defaults and other solutions of
     /// their inference variables, trait solutions, closed augmentations. These are recorded and undone before the
@@ -705,23 +1028,11 @@ type DeclarationChecker =
         for result in results do
             result.Leftovers cenv
 
-        let scopeContents =
-            DeclarationCheck.mergeDeltas start.ScopeContents [ for result in results -> result.Delta, result.DeltaCombines ]
-
-        let envAtEnd =
-            match Array.tryLast results with
-            | Some last -> last.EnvAtEnd
-            | None -> start.Scope.Env
+        let scopeContents, compiledDefs, envAtEnd =
+            DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results
 
         let fileContents =
-            ExitImplFileDeclarations
-                cenv
-                envFile
-                tcState.ImplicitOpenDeclarations
-                start.Scope
-                scopeContents
-                [ for result in results -> result.Checked ]
-                envAtEnd
+            ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
 
         let earlierErrors = start.ErrorCount + (results |> Array.sumBy (fun result -> result.ErrorCount))
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0

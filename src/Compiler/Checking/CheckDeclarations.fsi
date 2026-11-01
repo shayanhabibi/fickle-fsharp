@@ -123,6 +123,29 @@ val ExitImplFileDeclarations:
     envAtEnd: TcEnv ->
         ModuleOrNamespaceContents * (AttributeTargets * Attrib) list * TcEnv
 
+/// Sets up checking the declarations of a non-recursive 'module M = ...' one at a time: the module, and the
+/// environment, parent and type names its declarations are checked in. None when that fails, after reporting it.
+val EnterNestedModuleDeclarations:
+    cenv: TcFileState ->
+    parent: ParentRef ->
+    typeNames: Set<string> ->
+    env: TcEnv ->
+    synDecl: SynModuleDecl ->
+        (ModuleOrNamespace * TcEnv * ParentRef * Set<string>) option
+
+/// Finishes a non-recursive 'module M = ...' whose declarations were checked one at a time: gives the module
+/// moduleContents as its type, publishes it into env's accumulator and adds it to env.
+val ExitNestedModuleDeclarations:
+    cenv: TcFileState ->
+    scopem: range ->
+    env: TcEnv ->
+    m: range ->
+    moduleEntity: ModuleOrNamespace ->
+    moduleContents: ModuleOrNamespaceType ->
+    compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list ->
+    envAtEnd: TcEnv ->
+        (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) * TcEnv * TcEnv
+
 val CheckOneSigFile:
     TcGlobals *
     ImportMap *

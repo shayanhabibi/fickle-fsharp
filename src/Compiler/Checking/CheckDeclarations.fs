@@ -6583,6 +6583,41 @@ let ExitImplFileDeclarations (cenv: cenv) (env: TcEnv) openDecls0 (scope: ImplFi
 
     elementsContents openDecls0 [ fragmentDefs ] envAtEnd
 
+/// Does what the non-recursive SynModuleDecl.NestedModule case of TcModuleOrNamespaceElementNonMutRec does before
+/// the module's declarations: the module, and the environment, parent and type names its declarations are checked
+/// in. None when that fails, which reports the error and skips the module's declarations, as checking it whole does.
+let EnterNestedModuleDeclarations (cenv: cenv) parent typeNames (env: TcEnv) (synDecl: SynModuleDecl) =
+    match synDecl with
+    | SynModuleDecl.NestedModule(compInfo, false, moduleDefs, _, _, _) ->
+        cenv.synArgNameGenerator.Reset()
+        try
+            let (SynComponentInfo(xmlDoc = xml)) = compInfo
+            let moduleEntity, envForModule, _ = TcNestedModuleHeader cenv parent typeNames env compInfo
+
+            // As TcModuleOrNamespaceElements for the module's declarations
+            if cenv.compilingCanonicalFslibModuleType then
+                let checkXmlDocs = cenv.diagnosticOptions.CheckXmlDocs
+                ensureCcuHasModuleOrNamespaceAtPath cenv.thisCcu envForModule.ePath envForModule.eCompPath (xml.ToXmlDoc(checkXmlDocs, Some []))
+
+            let moduleTypeNames = EstablishTypeDefinitionCores.TypeNamesInNonMutRecDecls cenv envForModule moduleDefs
+            Some (moduleEntity, envForModule, Parent (mkLocalModuleRef moduleEntity), moduleTypeNames)
+        with RecoverableException exn ->
+            errorRecovery exn synDecl.Range
+            None
+    | _ -> invalidArg (nameof synDecl) "Expected a non-recursive nested module."
+
+/// Does what the non-recursive SynModuleDecl.NestedModule case of TcModuleOrNamespaceElementNonMutRec does after the
+/// module's declarations: gives the module moduleContents as its type, publishes it into env's accumulator and adds
+/// it to env.
+let ExitNestedModuleDeclarations (cenv: cenv) scopem (env: TcEnv) m moduleEntity (moduleContents: ModuleOrNamespaceType) (compiledDefs: (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) list) (envAtEnd: TcEnv) =
+    // As TcModuleOrNamespaceElements for a list of non-recursive declarations
+    let elements = TMDefs (List.collect p13 compiledDefs), List.collect p33 compiledDefs, envAtEnd
+    try
+        FinishNestedModule cenv scopem env m false moduleEntity (ref moduleContents) elements
+    with RecoverableException exn ->
+        errorRecovery exn m
+        ([], [], []), env, env
+
 
 /// Check an entire signature file
 let CheckOneSigFile (g, amap, thisCcu, checkForErrors, conditionalDefines, tcSink, isInternalTestSpanStackReferring, diagnosticOptions) (tcEnv: TcEnv) (sigFile: ParsedSigFileInput) =
