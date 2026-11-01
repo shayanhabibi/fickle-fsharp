@@ -760,7 +760,7 @@ module internal MeasureOps =
         | TType_measure(Measure.Var v) ->
             match v.Solution with
             | Some(TType_measure ms) ->
-                v.typar_solution <- Some(TType_measure(normalizeMeasure g ms))
+                v.SetSolution(Some(TType_measure(normalizeMeasure g ms)))
                 ty
             | _ -> ty
         | _ -> ty

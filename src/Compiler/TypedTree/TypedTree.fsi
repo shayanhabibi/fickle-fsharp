@@ -30,6 +30,17 @@ type Stamp = int64
 
 type StampMap<'T> = Map<Stamp, 'T>
 
+/// Records how to undo mutations of inference state (type variables, augmentation closing) made on this thread
+/// while a log is active, so a pass that mutates shared typed trees can be undone and run again.
+[<Sealed; AbstractClass>]
+type MutationLog =
+
+    /// The active log of this thread, or null.
+    static member Current: (ResizeArray<unit -> unit> | null) with get, set
+
+    /// Runs undo actions, latest first.
+    static member Undo: log: ResizeArray<unit -> unit> -> unit
+
 [<RequireQualifiedAccess>]
 type ValInline =
 
@@ -1625,6 +1636,12 @@ type Typar =
 
     /// Sets the identifier associated with a type variable
     member SetIdent: id: Ident -> unit
+
+    /// Sets the solution of an inference variable
+    member SetSolution: solution: TType option -> unit
+
+    /// Records how to restore this type variable's state in the active mutation log, if any
+    member RecordUndo: unit -> unit
 
     /// Set whether this type parameter is a compat-flex type parameter (i.e. where "expr :> tp" only emits an optional warning)
     member SetIsCompatFlex: b: bool -> unit

@@ -124,10 +124,13 @@ module internal SignatureFingerprint =
 
     exception private NotDescribable
 
-    let compute (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) : string option =
+    /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
+    /// from 0 in the order they first appear.
+    let private describe (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) (inlineBodies: (Val * Expr) list) : string option =
         let sb = Text.StringBuilder()
         let add (s: string) = sb.Append(s).Append('|') |> ignore
         let typarNumbers = Collections.Generic.Dictionary<Typar, int>(HashIdentity.Reference)
+        let localNumbers = Collections.Generic.Dictionary<Val, int>(HashIdentity.Reference)
 
         let rec ty (t: TType) =
             match stripTyparEqns t with
@@ -144,11 +147,9 @@ module internal SignatureFingerprint =
             | TType_tuple (tupInfo, elementTys) ->
                 add (if evalTupInfoIsStruct tupInfo then "struct tuple" else "tuple")
                 tys elementTys
-            | TType_anon (anonInfo, fieldTys) ->
+            | TType_anon (info, fieldTys) ->
                 add "anon"
-                add anonInfo.Assembly.AssemblyName
-                add (string (evalAnonInfoIsStruct anonInfo))
-                for name in anonInfo.SortedNames do add name
+                anonInfo info
                 tys fieldTys
             | TType_var (tp, nullness) ->
                 typar tp
@@ -169,6 +170,11 @@ module internal SignatureFingerprint =
         and tys (l: TType list) =
             add (string l.Length)
             List.iter ty l
+
+        and anonInfo (info: AnonRecdTypeInfo) =
+            add info.Assembly.AssemblyName
+            add (string (evalAnonInfoIsStruct info))
+            for name in info.SortedNames do add name
 
         and nullnessOf (nullness: Nullness) = add (string (nullness.Evaluate()))
 
@@ -413,14 +419,360 @@ module internal SignatureFingerprint =
             add (string vals.Length)
             List.iter value vals
 
+        // Inline bodies, whose code the users of a value get a copy of. Values bound inside the body are numbered, and
+        // others named, so neither stamps nor ranges show.
+        and bindVal (v: Val) =
+            let n = localNumbers.Count
+            localNumbers[v] <- n
+            add ("local " + string n)
+            ty v.Type
+
+        and bindVals (vs: Val list) =
+            add (string vs.Length)
+            List.iter bindVal vs
+
+        and optBindVal (v: Val option) =
+            match v with
+            | Some v -> bindVal v
+            | None -> add "-"
+
+        and valRef (vref: ValRef) =
+            let local = if vref.IsLocalRef then localNumbers.TryGetValue vref.Deref else (false, 0)
+
+            match local with
+            | true, n -> add ("local " + string n)
+            | _ ->
+                add (fullDisplayTextOfValRef vref)
+                ty vref.Type
+
+        and useFlag (flag: ValUseFlag) =
+            match flag with
+            | PossibleConstrainedCall t ->
+                add "constrained"
+                ty t
+            | NormalValUse -> add "normal"
+            | CtorValUsedAsSuperInit -> add "super init"
+            | CtorValUsedAsSelfInit -> add "self init"
+            | VSlotDirectCall -> add "slot direct"
+
+        and tyconRef (tcref: TyconRef) = add (fullDisplayTextOfTyconRef tcref)
+
+        and unionCaseRef (ucref: UnionCaseRef) =
+            tyconRef ucref.TyconRef
+            add ucref.CaseName
+
+        and recdFieldRef (rfref: RecdFieldRef) =
+            tyconRef rfref.TyconRef
+            add rfref.FieldName
+
+        and ilMethodRef (mref: ILMethodRef) =
+            add mref.DeclaringTypeRef.QualifiedName
+            add mref.Name
+            add (string mref.GenericArity)
+            add (sprintf "%A" mref.CallingConv)
+            add (string mref.ArgTypes.Length)
+            for argTy in mref.ArgTypes do add argTy.QualifiedName
+            add mref.ReturnType.QualifiedName
+
+        and traitInfo (TTrait (supportTys, memberName, memberFlags, argTys, returnTy, _, solution, _)) =
+            tys supportTys
+            add memberName
+            add (sprintf "%A" memberFlags)
+            tys argTys
+            optTy returnTy
+
+            match solution.Value with
+            | None -> add "-"
+            | Some (FSMethSln (t, vref, minst, staticTyOpt)) ->
+                add "fs method"
+                ty t
+                valRef vref
+                tys minst
+                optTy staticTyOpt
+            | Some (FSRecdFieldSln (tinst, rfref, isSetProp)) ->
+                add "field"
+                tys tinst
+                recdFieldRef rfref
+                add (string isSetProp)
+            | Some (FSAnonRecdFieldSln (info, tinst, index)) ->
+                add "anon field"
+                anonInfo info
+                tys tinst
+                add (string index)
+            | Some (ILMethSln (t, extOpt, mref, minst, staticTyOpt)) ->
+                add "il method"
+                ty t
+                add (match extOpt with Some tref -> tref.QualifiedName | None -> "-")
+                ilMethodRef mref
+                tys minst
+                optTy staticTyOpt
+            | Some (ClosedExprSln e) ->
+                add "closed"
+                expr e
+            | Some BuiltInSln -> add "built in"
+
+        and exprs (es: Expr list) =
+            add (string es.Length)
+            List.iter expr es
+
+        and expr (e: Expr) =
+            match e with
+            | Expr.Const (c, _, t) ->
+                add (sprintf "const %A" c)
+                ty t
+            | Expr.Val (vref, flag, _) ->
+                add "val"
+                valRef vref
+                useFlag flag
+            | Expr.Sequential (e1, e2, kind, _) ->
+                add (sprintf "seq %A" kind)
+                expr e1
+                expr e2
+            | Expr.Lambda (_, ctorThisValOpt, baseValOpt, valParams, body, _, overallTy) ->
+                add "lambda"
+                optBindVal ctorThisValOpt
+                optBindVal baseValOpt
+                bindVals valParams
+                expr body
+                ty overallTy
+            | Expr.TyLambda (_, tps, body, _, overallTy) ->
+                add "type lambda"
+                typars tps
+                expr body
+                ty overallTy
+            | Expr.App (f, fTy, tinst, args, _) ->
+                add "app"
+                expr f
+                ty fTy
+                tys tinst
+                exprs args
+            | Expr.LetRec (bindings, body, _, _) ->
+                add "let rec"
+                bindVals [ for TBind (v, _, _) in bindings -> v ]
+                for TBind (_, rhs, _) in bindings do expr rhs
+                expr body
+            | Expr.Let (TBind (v, rhs, _), body, _, _) ->
+                add "let"
+                expr rhs
+                bindVal v
+                expr body
+            | Expr.Obj (_, objTy, baseVal, ctorCall, overrides, interfaceImpls, _) ->
+                add "object"
+                ty objTy
+                optBindVal baseVal
+                expr ctorCall
+                objMethods overrides
+                add (string interfaceImpls.Length)
+                for interfaceTy, methods in interfaceImpls do
+                    ty interfaceTy
+                    objMethods methods
+            | Expr.Match (_, _, tree, targets, _, t) ->
+                add "match"
+                decisionTree tree
+                add (string targets.Length)
+                for TTarget (vs, target, flags) in targets do
+                    bindVals vs
+                    expr target
+                    add (sprintf "%A" flags)
+                ty t
+            | Expr.StaticOptimization (conditions, e1, e2, _) ->
+                add "static optimization"
+                add (string conditions.Length)
+                for condition in conditions do
+                    match condition with
+                    | TTyconEqualsTycon (t1, t2) ->
+                        add "equals"
+                        ty t1
+                        ty t2
+                    | TTyconIsStruct t ->
+                        add "struct"
+                        ty t
+                expr e1
+                expr e2
+            | Expr.Op (op, tinst, args, _) ->
+                add "op"
+                operation op
+                tys tinst
+                exprs args
+            | Expr.Quote (quoted, _, isFromQueryExpression, _, t) ->
+                add (sprintf "quote %b" isFromQueryExpression)
+                expr quoted
+                ty t
+            | Expr.WitnessArg (info, _) ->
+                add "witness"
+                traitInfo info
+            | Expr.TyChoose (tps, body, _) ->
+                add "type choose"
+                typars tps
+                expr body
+            | Expr.Link link -> expr link.Value
+            | Expr.DebugPoint (_, e) -> expr e
+
+        and objMethods (methods: ObjExprMethod list) =
+            add (string methods.Length)
+            for TObjExprMethod (ss, methodAttribs, tps, paramGroups, body, _) in methods do
+                slotSig ss
+                attribs methodAttribs
+                typars tps
+                add (string paramGroups.Length)
+                List.iter bindVals paramGroups
+                expr body
+
+        and decisionTree (tree: DecisionTree) =
+            match tree with
+            | TDSwitch (input, cases, defaultOpt, _) ->
+                add "switch"
+                expr input
+                add (string cases.Length)
+                for TCase (test, caseTree) in cases do
+                    decisionTest test
+                    decisionTree caseTree
+                match defaultOpt with
+                | Some d ->
+                    add "default"
+                    decisionTree d
+                | None -> add "-"
+            | TDSuccess (results, targetNum) ->
+                add ("success " + string targetNum)
+                exprs results
+            | TDBind (TBind (v, rhs, _), body) ->
+                add "bind"
+                expr rhs
+                bindVal v
+                decisionTree body
+
+        and decisionTest (test: DecisionTreeTest) =
+            match test with
+            | DecisionTreeTest.UnionCase (ucref, tinst) ->
+                add "case"
+                unionCaseRef ucref
+                tys tinst
+            | DecisionTreeTest.ArrayLength (length, t) ->
+                add ("array length " + string length)
+                ty t
+            | DecisionTreeTest.Const c -> add (sprintf "const %A" c)
+            | DecisionTreeTest.IsNull -> add "null"
+            | DecisionTreeTest.IsInst (source, target) ->
+                add "is"
+                ty source
+                ty target
+            | DecisionTreeTest.ActivePatternCase (activePatExpr, resTys, retKind, identity, idx, _) ->
+                add (sprintf "active pattern %A %d" retKind idx)
+                expr activePatExpr
+                tys resTys
+                match identity with
+                | Some (vref, tinst) ->
+                    valRef vref
+                    tys tinst
+                | None -> add "-"
+            | DecisionTreeTest.Error _ -> add "error"
+
+        and operation (op: TOp) =
+            match op with
+            | TOp.UnionCase ucref ->
+                add "union case"
+                unionCaseRef ucref
+            | TOp.ExnConstr tcref ->
+                add "exception"
+                tyconRef tcref
+            | TOp.Tuple info -> add (if evalTupInfoIsStruct info then "struct tuple" else "tuple")
+            | TOp.AnonRecd info ->
+                add "anon"
+                anonInfo info
+            | TOp.AnonRecdGet (info, i) ->
+                add ("anon get " + string i)
+                anonInfo info
+            | TOp.Array -> add "array"
+            | TOp.Bytes bytes -> add ("bytes " + Convert.ToBase64String bytes)
+            | TOp.UInt16s values -> add ("uint16s " + String.Join(",", values))
+            | TOp.While (_, marker) -> add (sprintf "while %A" marker)
+            | TOp.IntegerForLoop (_, _, style) -> add (sprintf "for %A" style)
+            | TOp.TryWith _ -> add "try with"
+            | TOp.TryFinally _ -> add "try finally"
+            | TOp.Recd (info, tcref) ->
+                add (sprintf "record %A" info)
+                tyconRef tcref
+            | TOp.ValFieldSet rfref ->
+                add "field set"
+                recdFieldRef rfref
+            | TOp.ValFieldGet rfref ->
+                add "field get"
+                recdFieldRef rfref
+            | TOp.ValFieldGetAddr (rfref, readonly) ->
+                add (sprintf "field address %b" readonly)
+                recdFieldRef rfref
+            | TOp.UnionCaseTagGet tcref ->
+                add "tag"
+                tyconRef tcref
+            | TOp.UnionCaseProof ucref ->
+                add "proof"
+                unionCaseRef ucref
+            | TOp.UnionCaseFieldGet (ucref, i) ->
+                add (sprintf "case field get %d" i)
+                unionCaseRef ucref
+            | TOp.UnionCaseFieldGetAddr (ucref, i, readonly) ->
+                add (sprintf "case field address %d %b" i readonly)
+                unionCaseRef ucref
+            | TOp.UnionCaseFieldSet (ucref, i) ->
+                add (sprintf "case field set %d" i)
+                unionCaseRef ucref
+            | TOp.ExnFieldGet (tcref, i) ->
+                add (sprintf "exception field get %d" i)
+                tyconRef tcref
+            | TOp.ExnFieldSet (tcref, i) ->
+                add (sprintf "exception field set %d" i)
+                tyconRef tcref
+            | TOp.TupleFieldGet (info, i) -> add (sprintf "tuple get %b %d" (evalTupInfoIsStruct info) i)
+            | TOp.ILAsm (instrs, retTys) ->
+                add (sprintf "il %A" instrs)
+                tys retTys
+            | TOp.RefAddrGet readonly -> add (sprintf "ref address %b" readonly)
+            | TOp.Coerce -> add "coerce"
+            | TOp.Reraise -> add "reraise"
+            | TOp.Return -> add "return"
+            // Labels come from a generator, so their numbers are not positional
+            | TOp.Goto _
+            | TOp.Label _ -> raise NotDescribable
+            | TOp.TraitCall info ->
+                add "trait call"
+                traitInfo info
+            | TOp.LValueOp (lop, vref) ->
+                add (sprintf "lvalue %A" lop)
+                valRef vref
+            | TOp.DebugLocalScope (vref, _) ->
+                add "scope"
+                valRef vref
+            | TOp.ILCall (isVirtual, isProtected, isStruct, isCtor, flag, isProperty, noTailCall, mref, enclTypeInst, methInst, retTys) ->
+                add (sprintf "il call %b %b %b %b %b %b" isVirtual isProtected isStruct isCtor isProperty noTailCall)
+                useFlag flag
+                ilMethodRef mref
+                tys enclTypeInst
+                tys methInst
+                tys retTys
+
         try
             moduleOrNamespace mty
             attribs topAttrs.mainMethodAttrs
             attribs topAttrs.netModuleAttrs
             attribs topAttrs.assemblyAttrs
+
+            for v, body in inlineBodies do
+                add "inline"
+                add v.LogicalName
+                ty v.Type
+                expr body
+
             Some (sb.ToString())
         with NotDescribable ->
             None
+
+    let compute (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) : string option = describe mty topAttrs []
+
+    /// What the code after a declaration sees of it: its contribution to the module or namespace it is in, and the
+    /// bodies of its inline values. Numbering starts again for each declaration, so a fingerprint depends neither on
+    /// other declarations nor on the order they were checked in.
+    let computeDeclaration (contribution: ModuleOrNamespaceType) (inlineBodies: (Val * Expr) list) : string option =
+        describe contribution EmptyTopAttrs inlineBodies
 
 [<AutoOpen>]
 module internal ParseAndCheck =

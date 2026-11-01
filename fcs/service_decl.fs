@@ -99,6 +99,9 @@ type FileStart
         diagnostics: FSharpDiagnostic[],
         errorCount: int
     ) =
+    let sync = obj ()
+    let mutable lastFinish: ResizeArray<unit -> unit> | null = null
+
     member internal _.Context = ctx
     member internal _.Parse = parse
     member internal _.File = file
@@ -113,6 +116,19 @@ type FileStart
     /// What setting up the file reported.
     member internal _.Diagnostics = diagnostics
     member internal _.ErrorCount = errorCount
+    /// Held while finishing the file.
+    member internal _.Sync = sync
+
+    /// Undoes what the latest finish changed in the declarations' typed trees, once.
+    member internal _.UndoLastFinish() =
+        lock sync (fun () ->
+            match lastFinish with
+            | null -> ()
+            | log ->
+                lastFinish <- null
+                MutationLog.Undo log)
+
+    member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
@@ -134,6 +150,8 @@ type DeclarationResult
         leftovers: TcFileState -> unit
     ) =
     member _.Key = key
+    /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
+    /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
     member _.Fingerprint = fingerprint
     member _.Diagnostics = diagnostics
     member _.LeavesFreeTypars = leavesFreeTypars
@@ -168,6 +186,7 @@ type FileResult
         checkResults: FSharpCheckFileResults
     ) =
     member _.Diagnostics = diagnostics
+    /// Each declaration's fingerprint after the file's inference scope is closed.
     member _.Fingerprints = fingerprints
     member _.Signature = signature
     member _.CheckResults = checkResults
@@ -388,8 +407,23 @@ module internal DeclarationCheck =
 
         resolutions, symbolUses, openDeclarations
 
-    let fingerprintOf (contribution: ModuleOrNamespaceType) =
-        match SignatureFingerprint.compute contribution EmptyTopAttrs with
+    /// The bindings of inline values in a declaration's typed tree, in order.
+    let rec inlineBodies (contents: ModuleOrNamespaceContents) =
+        let ofBinding (TBind(v, body, _)) = if v.ShouldInline then [ v, body ] else []
+
+        match contents with
+        | TMDefs defs -> List.collect inlineBodies defs
+        | TMDefLet(binding, _) -> ofBinding binding
+        | TMDefRec(bindings = bindings) ->
+            bindings
+            |> List.collect (function
+                | ModuleOrNamespaceBinding.Binding binding -> ofBinding binding
+                | ModuleOrNamespaceBinding.Module(_, def) -> inlineBodies def)
+        | TMDefOpens _
+        | TMDefDo _ -> []
+
+    let fingerprintOf (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
+        match SignatureFingerprint.computeDeclaration contribution (List.collect inlineBodies contents) with
         | Some fingerprint -> fingerprint
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
@@ -562,8 +596,10 @@ type DeclarationChecker =
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time, and leave the file setup
-    /// and other results as they were.
+    /// and other results as they were. It first undoes what the latest FinishFile on the same FileStart changed in
+    /// the earlier declarations, so it sees them as their checks left them.
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
+        start.UndoLastFinish()
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
@@ -608,7 +644,7 @@ type DeclarationChecker =
 
         DeclarationResult(
             decl.Key,
-            DeclarationCheck.fingerprintOf delta,
+            DeclarationCheck.fingerprintOf delta checkedDecl,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.ErrorCount,
             leavesFreeTypars,
@@ -621,9 +657,33 @@ type DeclarationChecker =
             DeclarationCheck.leftoversOf cenv
         )
 
-    /// Builds the file from the declarations' results, in declaration order, and closes its inference scope. The
-    /// file's module type, accumulators and checker state are new each time, so it can run again over other results.
+    /// Builds the file from the declarations' results, in declaration order, closes its inference scope, and takes
+    /// the declarations' final fingerprints.
+    ///
+    /// The file's accumulators, namespace entities and checker state are new each time. A 'module X.Y' file's module
+    /// entity is not: it is the setup's, the parent of the declarations' values, shared by every finish on this
+    /// FileStart. Each finish gives it a new type, so the last finish wins, and an earlier FileResult shows that
+    /// finish's module contents.
+    ///
+    /// Closing the inference scope changes the declarations' typed trees in place: defaults and other solutions of
+    /// their inference variables, trait solutions, closed augmentations. These are recorded and undone before the
+    /// next finish or declaration check on this FileStart, so a finish over the same or other results gives what a
+    /// full check would. Finishes on one FileStart are serialized, by its lock; a finish must not overlap a
+    /// declaration check on the same FileStart.
     static member FinishFile(start: FileStart, results: DeclarationResult[]) : FileResult =
+        lock start.Sync (fun () ->
+            start.UndoLastFinish()
+            let log = ResizeArray()
+            let outer = MutationLog.Current
+            MutationLog.Current <- log
+
+            try
+                DeclarationChecker.Finish(start, results)
+            finally
+                MutationLog.Current <- outer
+                start.SetLastFinish log)
+
+    static member private Finish(start: FileStart, results: DeclarationResult[]) : FileResult =
         let state = start.Context.State
         let parse = start.Parse
         let file = start.File
@@ -685,7 +745,7 @@ type DeclarationChecker =
             Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
         for result in results do
-            fingerprints[result.Key] <- result.Fingerprint
+            fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked
 
         let ccuSigForFile, _ =
             AddCheckResultsToTcState
