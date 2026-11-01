@@ -150,6 +150,13 @@ val ExitNestedModuleDeclarations:
     envAtEnd: TcEnv ->
         (ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list) * TcEnv * TcEnv
 
+/// Adds to env what checking synDecl in scope scopem adds to the environment after it, taking what it defines from
+/// defs (the values and entities that check published) instead of checking it again. Opens and module abbreviations
+/// are resolved again in env. For name resolution only: it reports nothing and publishes nothing. Not for the header
+/// of a module whose declarations are checked one at a time.
+val ExtendEnvWithDeclaration:
+    cenv: TcFileState -> scopem: range -> env: TcEnv -> synDecl: SynModuleDecl -> defs: ModuleOrNamespaceType -> TcEnv
+
 val CheckOneSigFile:
     TcGlobals *
     ImportMap *

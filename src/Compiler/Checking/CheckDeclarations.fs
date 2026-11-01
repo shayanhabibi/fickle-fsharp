@@ -6623,6 +6623,76 @@ let ExitNestedModuleDeclarations (cenv: cenv) scopem (env: TcEnv) m moduleEntity
         errorRecovery exn m
         ([], [], []), env, env
 
+/// Adds to env what checking synDecl in scope scopem adds to the environment after it, taking what it defines from
+/// defs (the values and entities that check published) instead of checking it again. Opens and module abbreviations
+/// are resolved again in env, so they reach the modules env holds now. For name resolution only: it reports nothing
+/// and publishes nothing. Not for the header of a module whose declarations are checked one at a time.
+let rec ExtendEnvWithDeclaration (cenv: cenv) scopem (env: TcEnv) (synDecl: SynModuleDecl) (defs: ModuleOrNamespaceType) =
+    let g = cenv.g
+    let amap = cenv.amap
+    let entities = List.ofSeq defs.AllEntities
+    let vals = List.ofSeq defs.AllValsAndMembers
+    let modules = entities |> List.filter (fun e -> e.IsModuleOrNamespace)
+
+    // As TcMutRecDefns_ComputeEnvs adds a group of types and their members
+    let addTyconsAndMembers env =
+        let tycons = entities |> List.filter (fun e -> not e.IsModuleOrNamespace)
+        let env = AddLocalTycons g amap scopem tycons env
+        let env = (env, tycons |> List.filter (fun e -> e.IsFSharpException)) ||> List.fold (AddLocalExnDefnAndReport TcResultsSink.NoSink scopem)
+        AddLocalVals g TcResultsSink.NoSink scopem vals env
+
+    try
+        match ElimSynModuleDeclExpr synDecl with
+        | SynModuleDecl.Open(target, m) -> TcOpenDecl cenv (unionRanges m.EndRange scopem) env target |> fst
+        | SynModuleDecl.ModuleAbbrev(id, p, m) -> MutRecBindingChecking.TcModuleAbbrevDecl cenv scopem env (id, p, m)
+        // The values its patterns bind, as TcLetBindings adds them
+        | SynModuleDecl.Let _ ->
+            AddLocalVals g TcResultsSink.NoSink scopem (vals |> List.filter (fun v -> not v.IsMember && not v.IsCompilerGenerated)) env
+        | SynModuleDecl.Exception _
+        | SynModuleDecl.Types _ -> addTyconsAndMembers env
+        | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(synType = None)) -> env
+        | SynModuleDecl.NestedModule(range = m) -> (env, modules) ||> List.fold (AddLocalSubModule g amap m)
+        | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = longId; kind = kind; decls = decls; range = m)) ->
+            // As EnterNamespaceFragment and FinishNamespaceFragment
+            let enclosingNamespacePath = if kind.IsModule then List.truncate (max 0 (longId.Length - 1)) longId else longId
+
+            if not (isNil enclosingNamespacePath) then
+                AddLocalRootModuleOrNamespace g amap m env defs
+            elif kind.IsModule then
+                // 'module X' continues to its end: the environment after it is the one at the end of X's declarations
+                match modules with
+                | moduleEntity :: _ ->
+                    let envForModule, _ = MakeInnerEnv true env moduleEntity.Id moduleEntity.ModuleOrNamespaceType.ModuleOrNamespaceKind
+                    ExtendEnvWithDeclarations cenv m.EndRange envForModule decls moduleEntity.ModuleOrNamespaceType
+                | [] -> env
+            else
+                // namespace global: the environment at the end of its declarations
+                ExtendEnvWithDeclarations cenv m.EndRange env decls defs
+        | SynModuleDecl.Attributes _
+        | SynModuleDecl.HashDirective _
+        | SynModuleDecl.Expr _ -> env
+    with RecoverableException _ ->
+        env
+
+/// ExtendEnvWithDeclaration over declarations checked as one, each defining what defs holds within its range.
+and ExtendEnvWithDeclarations (cenv: cenv) endm (env: TcEnv) (decls: SynModuleDecl list) (defs: ModuleOrNamespaceType) =
+    let rec loop env decls =
+        match decls with
+        | [] -> env
+        | (decl: SynModuleDecl) :: rest ->
+            let scopem =
+                match rest with
+                | next :: _ -> unionRanges next.Range endm
+                | [] -> unionRanges decl.Range endm
+
+            let within (m: range) = rangeContainsRange decl.Range m
+            let entities = defs.AllEntities |> Seq.filter (fun e -> within e.Range) |> List.ofSeq
+            let vals = defs.AllValsAndMembers |> Seq.filter (fun v -> within v.Range) |> List.ofSeq
+            let declDefs = Construct.NewModuleOrNamespaceType defs.ModuleOrNamespaceKind entities vals
+            loop (ExtendEnvWithDeclaration cenv scopem env decl declDefs) rest
+
+    loop env decls
+
 
 /// Check an entire signature file
 let CheckOneSigFile (g, amap, thisCcu, checkForErrors, conditionalDefines, tcSink, isInternalTestSpanStackReferring, diagnosticOptions) (tcEnv: TcEnv) (sigFile: ParsedSigFileInput) =

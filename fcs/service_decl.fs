@@ -29,6 +29,7 @@ open FSharp.Compiler.TcGlobals
 open FSharp.Compiler.Text
 open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
+open FSharp.Compiler.TypedTreeBasics
 open FSharp.Compiler.TypedTreeOps
 
 type DeclarationKind =
@@ -51,6 +52,10 @@ type DeclarationKey =
       /// The number of earlier declarations of the file with the same module path, name and kind
       Ordinal: int }
 
+/// A declaration of the project that a typed use resolves to: the declaration with Key in File. Key is None for what a
+/// signature file declares, which is checked whole: a use of it depends on that file's text.
+type DeclarationRef = { File: string; Key: DeclarationKey option }
+
 /// The names a declaration defines and uses, from its syntax. A use can resolve to a definition through any of the
 /// lists: Defines holds every kind of name, so a dependency on a name is a dependency on every declaration defining it.
 type DeclarationContent =
@@ -72,7 +77,13 @@ type DeclarationContent =
       /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
       /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
       /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
-      AffectsAllLater: bool }
+      AffectsAllLater: bool
+      /// The names, as written, of the types the declaration augments (`type T with ...`; a group `type A with ... and
+      /// B with ...` augments both), sorted; empty for anything else. Checking an intrinsic augmentation adds its
+      /// members to T's entity, which T's result holds, so T's declaration and its augmentations re-check together,
+      /// T first, whenever any of them re-checks: re-checking T gives a new entity, which only the augmentations
+      /// checked after it extend.
+      Augments: string[] }
 
 /// A top-level declaration of an implementation file, or a declaration of a non-recursive nested module, or the
 /// header of such a module (its attributes and name, which the module's declarations are checked inside).
@@ -132,12 +143,15 @@ type ProjectContext internal (state: CompilerState) =
 
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
-type FileSignature internal (fileName: string, apply: TcState -> TcState, moduleNamesDict: ModuleNamesDict) =
+type FileSignature
+    internal (fileName: string, apply: TcState -> TcState, moduleNamesDict: ModuleNamesDict, definitions: Map<Stamp, DeclarationRef>) =
     member internal _.FileName = fileName
     member internal _.Apply tcState = apply tcState
     /// The module-name dictionary DeduplicateParsedInputModuleName gave for this file: every earlier file's entries
     /// and its own. BeginFile merges these over the earlier files.
     member internal _.ModuleNamesDict = moduleNamesDict
+    /// The declaration defining each entity and value later files see of this file, by stamp
+    member internal _.Definitions = definitions
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
@@ -173,12 +187,16 @@ type internal ModuleFrame =
 
 /// The environment a declaration is checked in.
 [<Sealed>]
-type DeclEnv internal (env: TcEnv, parent: ParentRef, typeNames: Set<string>, frames: ModuleFrame list) =
+type DeclEnv
+    internal (env: TcEnv, parent: ParentRef, typeNames: Set<string>, frames: ModuleFrame list, definitions: Map<Stamp, DeclarationRef>) =
     member internal _.Env = env
     member internal _.Parent = parent
     member internal _.TypeNames = typeNames
     /// The nested modules the environment is inside, innermost first
     member internal _.Frames = frames
+    /// The declaration defining each entity and value of the project the environment holds, by stamp: those of
+    /// earlier files, and of every declaration the environment was built from, including earlier versions of them
+    member internal _.Definitions = definitions
 
 /// Where a result goes when the file is built from the results.
 [<NoEquality; NoComparison>]
@@ -247,11 +265,13 @@ type FileStart
 type DeclarationResult
     internal
     (
-        key: DeclarationKey,
+        start: FileStart,
+        declaration: ParsedDeclaration,
         fingerprint: string,
         diagnostics: FSharpDiagnostic[],
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
+        dependsOnLaterDeclarations: bool,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
         checkedDecl: CheckedDeclaration,
@@ -259,9 +279,12 @@ type DeclarationResult
         deltaCombines: bool,
         sink: TcResultsSinkImpl,
         leftovers: TcFileState -> unit,
-        nesting: Nesting
+        nesting: Nesting,
+        typedUses: DeclarationRef[]
     ) =
-    member _.Key = key
+    let mutable finishTypedUses: DeclarationRef[] = [||]
+
+    member _.Key = declaration.Key
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
     /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
     member _.Fingerprint = fingerprint
@@ -269,8 +292,39 @@ type DeclarationResult
     /// whose #nowarn scopes are those of whichever version of the file was parsed last. FileResult.Diagnostics is
     /// authoritative: FinishFile filters what the check reported with the scopes of the parse it is given.
     member _.Diagnostics = diagnostics
+
+    /// Whether the environment after the declaration holds inference variables nothing has solved yet
+    /// (ComputeUngeneralizableTypars of it is not empty), as `let r = ref []` leaves. A later declaration's check can
+    /// solve them in place, and nothing undoes that, so the result depends on every later declaration of its file:
+    /// see DependsOnLaterDeclarations.
     member _.LeavesFreeTypars = leavesFreeTypars
+
+    /// Whether later checks change this result in place, so that (ruling R12) it depends on every later declaration
+    /// of its file: when one changes, is added or is removed, discard this result and re-check the declaration from
+    /// its environment before it, and everything after it. True when it LeavesFreeTypars, and when the unused-value
+    /// warning is on (FS1182, by --warnon or --warnaserror) in a file with a signature and the declaration defines a
+    /// module value: such a value the signature leaves out is reported unused unless something references it, and
+    /// checking a later declaration marks it referenced (SetHasBeenReferenced), which nothing undoes.
+    member _.DependsOnLaterDeclarations = dependsOnLaterDeclarations
+
     member _.EnvAfter = envAfter
+
+    /// The declarations of the project this declaration depends on through types, which its names may not show:
+    /// those defining every entity, value and trait solution in its checked contents, in the types of what it binds
+    /// and in what its checker reported resolving (so a tree damaged by error recovery is still covered), and then,
+    /// for each type of the project among them, the types it is made of (fields, union cases, base type, interfaces,
+    /// abbreviation, type parameter constraints), transitively. Assemblies the project references are left out: they
+    /// do not change within a session. Taken at the check, and again at the latest FinishFile given this result, which
+    /// can solve more; this is the union of both.
+    member _.TypedUses =
+        match finishTypedUses with
+        | [||] -> typedUses
+        | atFinish -> Array.append typedUses atFinish |> Array.distinct |> Array.sort
+
+    member internal _.SetFinishTypedUses(uses: DeclarationRef[]) = finishTypedUses <- uses
+    member internal _.Start = start
+    member internal _.Declaration = declaration
+    member internal _.Ref = { File = start.Parse.FileName; Key = Some declaration.Key }
     /// What the check reported, before filtering
     member internal _.RawDiagnostics = rawDiagnostics
     /// The environment at the end of the enclosing scope if this is its last declaration.
@@ -673,7 +727,7 @@ module internal DeclarationCheck =
                             envAfter
                         | None -> outerEnv
 
-                    exit (DeclEnv(envAfter, frame.OuterParent, frame.OuterTypeNames, outer))
+                    exit (DeclEnv(envAfter, frame.OuterParent, frame.OuterTypeNames, outer, env.Definitions))
                 | _ -> env
 
             exit envBefore
@@ -727,7 +781,180 @@ module internal DeclarationCheck =
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
 
-    let implFileSignature (state: CompilerState) fileName qualNameOfFile (implFileSig: ModuleOrNamespaceType) createsGeneratedProvidedTypes moduleNamesDict =
+    /// The stamps of every entity and value in a module type, including those inside its modules.
+    let rec stampsOf (mty: ModuleOrNamespaceType) =
+        seq {
+            for entity in mty.AllEntities do
+                yield entity.Stamp
+
+                if entity.IsModuleOrNamespace then
+                    yield! stampsOf entity.ModuleOrNamespaceType
+
+            for v in mty.AllValsAndMembers do
+                yield v.Stamp
+        }
+
+    /// Records the declaration as the definition of what its delta publishes.
+    let addDefinitions (definitions: Map<Stamp, DeclarationRef>) (declaration: DeclarationRef) (delta: ModuleOrNamespaceType) =
+        (definitions, stampsOf delta) ||> Seq.fold (fun acc stamp -> Map.add stamp declaration acc)
+
+    let definitionsBefore (before: FileSignature list) =
+        (Map.empty, before) ||> List.fold (fun acc signature -> Map.foldBack Map.add signature.Definitions acc)
+
+    /// What a signature file declares: its declarations are not checked one at a time, so the file stands for them.
+    let signatureDefinitions fileName (sigType: ModuleOrNamespaceType) =
+        addDefinitions Map.empty { File = fileName; Key = None } sigType
+
+    /// The definitions of a file's inferred signature, a copy of the file's contents with new stamps: each copied
+    /// entity and value is matched to the original by position and name, or by name where the counts differ.
+    let rec copiedDefinitions (own: Map<Stamp, DeclarationRef>) (contents: ModuleOrNamespaceType) (copy: ModuleOrNamespaceType) acc =
+        let pairs (originals: seq<'T>) (copies: seq<'T>) (name: 'T -> string) =
+            let originals, copies = Array.ofSeq originals, Array.ofSeq copies
+
+            if originals.Length = copies.Length then
+                Array.zip originals copies |> Array.filter (fun (o, c) -> name o = name c)
+            else
+                copies |> Array.choose (fun c -> originals |> Array.tryFind (fun o -> name o = name c) |> Option.map (fun o -> o, c))
+
+        let add acc (original: Stamp) (copied: Stamp) =
+            match own.TryFind original with
+            | Some declaration -> Map.add copied declaration acc
+            | None -> acc
+
+        let acc =
+            (acc, pairs contents.AllEntities copy.AllEntities _.LogicalName)
+            ||> Array.fold (fun acc (o, c) -> copiedDefinitions own o.ModuleOrNamespaceType c.ModuleOrNamespaceType (add acc o.Stamp c.Stamp))
+
+        (acc, pairs contents.AllValsAndMembers copy.AllValsAndMembers _.LogicalName)
+        ||> Array.fold (fun acc (o, c) -> add acc o.Stamp c.Stamp)
+
+    /// The types a type is made of, which its equality, comparison and other inferred properties come from.
+    let structureOf (tycon: Tycon) =
+        [ for field in tycon.AllFieldsArray -> field.FormalType
+          if tycon.IsUnionTycon then
+              for case in tycon.UnionCasesArray do
+                  for field in case.RecdFieldsArray -> field.FormalType
+          yield! Option.toList tycon.TypeContents.tcaug_super
+          yield! tycon.ImmediateInterfaceTypesOfFSharpTycon
+          yield! Option.toList tycon.TypeAbbrev ]
+
+    /// The declarations other than `self` that define what the declaration's checked contents, the types of what it
+    /// publishes and what its sink resolved refer to, closed over the types each type of the project is made of.
+    let typedUsesOf
+        (definitions: Map<Stamp, DeclarationRef>)
+        (self: DeclarationRef)
+        (delta: ModuleOrNamespaceType)
+        (contents: ModuleOrNamespaceContents list)
+        (sink: TcResultsSinkImpl option)
+        =
+        let refs = HashSet<DeclarationRef>(HashIdentity.Structural)
+        let seenTycons = HashSet<Stamp>()
+        let madeOf = Stack<Tycon>()
+
+        let addStamp stamp =
+            match definitions.TryFind stamp with
+            | Some declaration -> refs.Add declaration |> ignore; true
+            | None -> false
+
+        let addVal (v: Val) = addStamp v.Stamp |> ignore
+
+        // Only a type of the project can change, so only those are opened up
+        let addTycon (tycon: Tycon) =
+            if seenTycons.Add tycon.Stamp && addStamp tycon.Stamp then
+                madeOf.Push tycon
+
+        let addTyvars (ftyvs: FreeTyvars) =
+            Zset.iter addTycon ftyvs.FreeTycons
+            Zset.iter addVal ftyvs.FreeTraitSolutions
+
+        let addType ty = addTyvars (freeInType CollectAll ty)
+        let addTcref (tcref: TyconRef) = if tcref.IsLocalRef then addTycon tcref.Deref
+        let addVref (vref: ValRef) = if vref.IsLocalRef then addVal vref.Deref
+
+        let addFreeVars (fvs: FreeVars) =
+            Zset.iter addVal fvs.FreeLocals
+            Zset.iter (fun (rfref: RecdFieldRef) -> addTcref rfref.TyconRef) fvs.FreeRecdFields
+            Zset.iter (fun (ucref: UnionCaseRef) -> addTcref ucref.TyconRef) fvs.FreeUnionCases
+            Zset.iter addTycon fvs.FreeLocalTyconReprs
+            addTyvars fvs.FreeTyvars
+
+        let addItem (item: Item) =
+            match item with
+            | Item.Value vref
+            | Item.CustomBuilder(_, vref) ->
+                addVref vref
+                addType vref.Type
+            | Item.UnionCase(info, _)
+            | Item.UnionCaseField(info, _) -> addTcref info.TyconRef
+            | Item.ActivePatternResult(apOverallTy = ty)
+            | Item.DelegateCtor ty -> addType ty
+            | Item.ActivePatternCase apref -> addVref apref.ActivePatternVal
+            | Item.ExnCase tcref -> addTcref tcref
+            | Item.RecdField info -> addTcref info.TyconRef
+            | Item.Trait info -> addTyvars (accFreeInTrait CollectAll info emptyFreeTyvars)
+            | Item.Types(_, tys) -> List.iter addType tys
+            | Item.ModuleOrNamespaces modrefs -> List.iter addTcref modrefs
+            | Item.Property(info = pinfos) ->
+                for pinfo in pinfos do
+                    addType pinfo.ApparentEnclosingType
+                    Option.iter addVref pinfo.ArbitraryValRef
+            | Item.MethodGroup(methods = minfos)
+            | Item.CtorGroup(_, minfos) ->
+                for minfo in minfos do
+                    addType minfo.ApparentEnclosingType
+                    Option.iter addVref minfo.ArbitraryValRef
+            | Item.CustomOperation(_, _, Some minfo) ->
+                addType minfo.ApparentEnclosingType
+                Option.iter addVref minfo.ArbitraryValRef
+            | Item.Event einfo ->
+                addType einfo.ApparentEnclosingType
+                Option.iter addVref einfo.ArbitraryValRef
+            | Item.ILField finfo -> addType finfo.ApparentEnclosingType
+            | Item.ImplicitOp(_, sln) -> sln.Value |> Option.iter (fun sln -> addTyvars (accFreeInTraitSln CollectAll sln emptyFreeTyvars))
+            | _ -> ()
+
+        for c in contents do
+            addFreeVars (freeInModuleOrNamespace CollectAll c)
+
+        // The types of what it publishes, and what its own types are made of
+        let rec published (mty: ModuleOrNamespaceType) =
+            for v in mty.AllValsAndMembers do
+                addTyvars (freeInVal CollectAll v)
+
+            for entity in mty.AllEntities do
+                if entity.IsModuleOrNamespace then
+                    published entity.ModuleOrNamespaceType
+                elif seenTycons.Add entity.Stamp then
+                    madeOf.Push entity
+
+        published delta
+
+        match sink with
+        | Some sink ->
+            let resolutions = sink.GetResolutions()
+
+            for resolution in resolutions.CapturedNameResolutions do
+                addItem resolution.Item
+
+            for resolution in resolutions.CapturedMethodGroupResolutions do
+                addItem resolution.Item
+
+            for ty, _, _, _ in resolutions.CapturedExpressionTypings do
+                addType ty
+        | None -> ()
+
+        while madeOf.Count > 0 do
+            let tycon = madeOf.Pop()
+
+            for ty in structureOf tycon do
+                addType ty
+
+            addTyvars (accFreeInTypars CollectAll tycon.Typars emptyFreeTyvars)
+
+        refs.Remove self |> ignore
+        refs |> Array.ofSeq |> Array.sort
+
+    let implFileSignature (state: CompilerState) fileName qualNameOfFile (implFileSig: ModuleOrNamespaceType) createsGeneratedProvidedTypes moduleNamesDict definitions =
         let amap = state.tcImports.GetImportMap()
 
         let apply (tcState: TcState) =
@@ -740,7 +967,7 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict)
+        FileSignature(fileName, apply, moduleNamesDict, definitions)
 
 [<AbstractClass; Sealed>]
 type DeclarationChecker =
@@ -878,12 +1105,22 @@ type DeclarationChecker =
                 findSynAttribute "AutoOpen" attributes
             | syntax -> DeclarationCheck.affectsAllLater syntax
 
+        let augments =
+            match decl.Syntax with
+            | SynModuleDecl.Types(typeDefns, _) ->
+                typeDefns
+                |> List.filter DeclarationCheck.isAugmentation
+                |> List.map DeclarationCheck.typeDefnName
+                |> DeclarationCheck.sorted
+            | _ -> [||]
+
         { Defines = DeclarationCheck.sorted defines
           Uses = DeclarationCheck.sorted uses
           MemberUses = DeclarationCheck.sorted members
           FieldOrCaseUses = DeclarationCheck.sorted fields
           HasUnresolvable = unresolvable
-          AffectsAllLater = affectsAllLater || unreadableName }
+          AffectsAllLater = affectsAllLater || unreadableName
+          Augments = augments }
 
     static member CheckSignatureFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileSignature =
         let state = ctx.State
@@ -923,7 +1160,7 @@ type DeclarationChecker =
                 let apply =
                     AddSignatureFileToTcState (state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
 
-                FileSignature(parse.FileName, apply, moduleNamesDict)
+                FileSignature(parse.FileName, apply, moduleNamesDict, DeclarationCheck.signatureDefinitions parse.FileName sigFileType)
 
     static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclEnv =
         let state = ctx.State
@@ -966,7 +1203,7 @@ type DeclarationChecker =
                         logger.Diagnostics
                     )
 
-                start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [])
+                start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [], DeclarationCheck.definitionsBefore before)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time, without publishing into
@@ -975,8 +1212,11 @@ type DeclarationChecker =
     ///
     /// A check still changes earlier results in place, and nothing undoes that: it can solve the inference variables
     /// an earlier declaration left free (LeavesFreeTypars), and it marks the earlier values it uses as referenced
-    /// (SetHasBeenReferenced). The checker's guard (ruling R12, Task 13) re-checks a declaration that left free
-    /// inference variables when any later declaration of its file changes or is removed.
+    /// (SetHasBeenReferenced). DependsOnLaterDeclarations says when that matters: such a result is re-checked when
+    /// any later declaration of its file changes, is added or is removed.
+    ///
+    /// Check a declaration in the environment ExtendEnv assembles from the current results of the declarations before
+    /// it: the EnvAfter of an earlier check holds those declarations as they were then.
     ///
     /// A nested module's header creates the module's entity, the parent of the values its declarations define, and
     /// those declarations are checked in the environment it leads to. So when a header is checked again, the module's
@@ -1050,8 +1290,9 @@ type DeclarationChecker =
 
                 let envAfter =
                     match entered with
-                    | Some(_, envForModule, parent, typeNames) -> DeclEnv(envForModule, parent, typeNames, frame :: envBefore.Frames)
-                    | None -> DeclEnv(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames)
+                    | Some(_, envForModule, parent, typeNames) ->
+                        DeclEnv(envForModule, parent, typeNames, frame :: envBefore.Frames, envBefore.Definitions)
+                    | None -> DeclEnv(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames, envBefore.Definitions)
 
                 // What the header decides about the module (its name, kind, attributes, access), without the contents
                 // the module's declarations give it, which FinishFile replaces
@@ -1084,17 +1325,37 @@ type DeclarationChecker =
                     | [] -> []
 
                 let delta = DeclarationCheck.contribution contentsAtStart accumulator.Value
-                checkedDecl, DeclEnv(envAfter, envBefore.Parent, envBefore.TypeNames, frames), envAtEnd, delta, InModules decl.Depth
+                checkedDecl, DeclEnv(envAfter, envBefore.Parent, envBefore.TypeNames, frames, envBefore.Definitions), envAtEnd, delta, InModules decl.Depth
 
         let leavesFreeTypars =
             not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env))
 
+        // With FS1182 on, a module value of a file with a signature that the signature leaves out is reported unless
+        // something references it, and checking a later declaration marks it referenced, which nothing undoes
+        let referencedByLater =
+            let options = state.tcConfig.diagnosticsOptions
+
+            let rec hasValues (mty: ModuleOrNamespaceType) =
+                mty.AllValsAndMembers |> Seq.exists (fun v -> not v.IsMember)
+                || mty.AllEntities |> Seq.exists (fun e -> e.IsModuleOrNamespace && hasValues e.ModuleOrNamespaceType)
+
+            (List.contains 1182 options.WarnOn || List.contains 1182 options.WarnAsError)
+            && start.RootSigOpt.IsSome
+            && hasValues delta
+
+        let self = { File = start.Parse.FileName; Key = Some decl.Key }
+        let definitions = DeclarationCheck.addDefinitions envBefore.Definitions self delta
+        let envAfter = DeclEnv(envAfter.Env, envAfter.Parent, envAfter.TypeNames, envAfter.Frames, definitions)
+        let contents, _, _ = checkedDecl
+
         DeclarationResult(
-            decl.Key,
+            start,
+            decl,
             DeclarationCheck.fingerprintOf delta checkedDecl,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
             leavesFreeTypars,
+            leavesFreeTypars || referencedByLater,
             envAfter,
             envAtEnd,
             checkedDecl,
@@ -1102,8 +1363,81 @@ type DeclarationChecker =
             deltaCombines,
             sink,
             DeclarationCheck.leftoversOf cenv,
-            nesting
+            nesting,
+            DeclarationCheck.typedUsesOf definitions self delta contents (Some sink)
         )
+
+    /// The environment after the declaration of `result`, assembled from `envBefore` without checking it again: what
+    /// it defined (its values and entities), what it opened, its module structure. For name resolution it equals the
+    /// environment a fresh check of the declaration in envBefore would leave, with the definitions of this result.
+    /// A stored EnvAfter holds the earlier declarations as they were when it was checked; a declaration's environment
+    /// is instead built by folding ExtendEnv over the current results of the declarations before it, from the
+    /// environment BeginFile gave. Like CheckDeclaration, it first undoes what the latest FinishFile on the same
+    /// FileStart changed.
+    static member ExtendEnv(envBefore: DeclEnv, result: DeclarationResult) : DeclEnv =
+        let decl = result.Declaration
+
+        if decl.Depth > envBefore.Frames.Length then
+            invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+
+        let start = result.Start
+        start.UndoLastFinish()
+        let state = start.Context.State
+        use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+        use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+        let envBefore = DeclarationCheck.exitModules state start envBefore decl.Depth
+        // Its own checker state and sink: resolving an open or a module abbreviation again reports nothing
+        let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+        let definitions = DeclarationCheck.addDefinitions envBefore.Definitions result.Ref result.Delta
+        let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
+
+        match result.Nesting with
+        | ModuleHeader(_, frame) ->
+            // As CheckDeclaration for a header: the module is published when it is left, not here
+            let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = ref contentsBefore }
+
+            let frame =
+                { frame with
+                    OuterEnv = env
+                    OuterParent = envBefore.Parent
+                    OuterTypeNames = envBefore.TypeNames
+                    Checked = [] }
+
+            match frame.Entity with
+            | Some entity ->
+                // As TcNestedModuleHeader and EnterNestedModuleDeclarations, with the module the header's check made
+                let envForModule, _ = MakeInnerEnv true env entity.Id entity.ModuleOrNamespaceType.ModuleOrNamespaceKind
+
+                let moduleDecls =
+                    match decl.Syntax with
+                    | SynModuleDecl.NestedModule(decls = decls) -> decls
+                    | _ -> []
+
+                let typeNames = TypeNamesOfDeclarations cenv envForModule moduleDecls
+                DeclEnv(envForModule, Parent(mkLocalModuleRef entity), typeNames, frame :: envBefore.Frames, definitions)
+            | None -> DeclEnv(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames, definitions)
+        | InModules _ ->
+            let checks =
+                start.Scope.ChecksDeclarations
+                && (match envBefore.Frames with
+                    | frame :: _ -> frame.Entity.IsSome
+                    | [] -> true)
+
+            let accumulator = ref (DeclarationCheck.mergeDelta contentsBefore result.Delta result.DeltaCombines)
+            let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
+
+            let env =
+                if checks then
+                    ExtendEnvWithDeclaration cenv decl.ScopeRange env decl.Syntax result.Delta
+                else
+                    env
+
+            let frames =
+                match envBefore.Frames with
+                | frame :: outer -> { frame with Checked = result.Checked :: frame.Checked } :: outer
+                | [] -> []
+
+            DeclEnv(env, envBefore.Parent, envBefore.TypeNames, frames, definitions)
 
     /// Builds the file from the declarations' results, in declaration order, closes its inference scope, and takes
     /// the declarations' final fingerprints.
@@ -1182,6 +1516,19 @@ type DeclarationChecker =
 
         let qualNameOfFile = file.QualifiedName
 
+        // The finish can solve more of each declaration's types and traits; this is the last finish's view
+        for result in results do
+            let contents, _, _ = result.Checked
+            result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
+
+        // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
+        let definitions =
+            match start.RootSigOpt with
+            | Some _ -> Map.empty
+            | None ->
+                let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationCheck.addDefinitions acc result.Ref result.Delta)
+                DeclarationCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
+
         let signature =
             DeclarationCheck.implFileSignature
                 state
@@ -1190,6 +1537,7 @@ type DeclarationChecker =
                 implFile.Signature
                 createsGeneratedProvidedTypes
                 start.ModuleNamesDict
+                definitions
 
         let diagnostics =
             Array.concat
