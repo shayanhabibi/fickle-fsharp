@@ -290,7 +290,8 @@ type DeclarationResult
     member _.Fingerprint = fingerprint
     /// Provisional: the declaration's diagnostics filtered with the project's live options when it was checked,
     /// whose #nowarn scopes are those of whichever version of the file was parsed last. FileResult.Diagnostics is
-    /// authoritative: FinishFile filters what the check reported with the scopes of the parse it is given.
+    /// authoritative: FinishFile filters what the check reported with the scopes of the parse it is given, and
+    /// renders it after closing the inference scope, so its types show what defaults solved.
     member _.Diagnostics = diagnostics
 
     /// Whether the environment after the declaration holds inference variables nothing has solved yet
@@ -466,14 +467,15 @@ module internal DeclarationCheck =
     let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
         diagnosticsWith state state.tcConfig.diagnosticsOptions fileName capturing
 
-    /// Diagnostics as reported, filtered by these options (a parse's copy, with its #nowarn scopes).
-    let refiltered (state: CompilerState) diagnosticsOptions fileName (raw: PhasedDiagnostic[]) =
+    /// Diagnostics as reported, filtered by these options (a parse's copy, with its #nowarn scopes), not yet
+    /// rendered: their text shows the types as they are when diagnosticsWith renders them.
+    let refiltered diagnosticsOptions (raw: PhasedDiagnostic[]) =
         let capturing, logger = newLoggersWith diagnosticsOptions
 
         for diagnostic in raw do
             logger.DiagnosticSink diagnostic
 
-        diagnosticsWith state diagnosticsOptions fileName capturing
+        capturing
 
     /// Each parse's copy of the project's diagnostic options, holding the #nowarn scopes that parse recorded.
     let warnOptions = ConditionalWeakTable<FSharpParseFileResults, FSharpDiagnosticOptions>()
@@ -1520,6 +1522,9 @@ type DeclarationChecker =
     /// parse only while the text is unchanged): its parse diagnostics, and its #nowarn scopes, which filter every
     /// declaration's diagnostics again and decide which errors stop the finish pass from reporting. A #nowarn is not
     /// a declaration, so adding or removing one changes no result: only this parse carries it.
+    ///
+    /// An error that escapes closing the inference scope is recovered from as a full check's CheckOneInput does:
+    /// the file then adds nothing to later files' environments, and its check results have no implementation file.
     static member FinishFile(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FileResult =
         if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
             invalidArg (nameof parse) "The parse is of another file than the FileStart's."
@@ -1546,15 +1551,14 @@ type DeclarationChecker =
             | true, options -> options
             | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can finish a file: its #nowarn scopes are the ones it recorded."
 
-        // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration
+        // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration.
+        // Rendered after the tail, as a full check renders them, so their types show what the defaults solved.
         let earlierDiagnostics =
-            Array.concat
-                [ yield DeclarationCheck.refiltered state options parse.FileName start.RawDiagnostics
-                  for result in results do
-                      yield DeclarationCheck.refiltered state options parse.FileName result.RawDiagnostics ]
+            [| yield DeclarationCheck.refiltered options start.RawDiagnostics
+               for result in results do
+                   yield DeclarationCheck.refiltered options result.RawDiagnostics |]
 
-        let earlierErrors =
-            earlierDiagnostics |> Array.sumBy (fun d -> if d.Severity = FSharpDiagnosticSeverity.Error then 1 else 0)
+        let earlierErrors = earlierDiagnostics |> Array.sumBy (fun capturing -> capturing.ErrorCount)
 
         let capturing, logger = DeclarationCheck.newLoggersWith options
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
@@ -1569,14 +1573,20 @@ type DeclarationChecker =
         let scopeContents, compiledDefs, envAtEnd =
             DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results
 
-        let fileContents =
-            ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
-
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
         DeclarationCheck.replayReferences start.Parse.FileName results
 
-        let _topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile =
-            CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents
+        // Recovered from as CheckOneInput recovers in a full check, such as a default that fails where the tail does
+        // not catch it (SolveInternalUnknowns): the file then adds nothing to the files after it.
+        let tail =
+            try
+                let fileContents =
+                    ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
+
+                Some(CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents)
+            with RecoverableException exn ->
+                errorRecovery exn range0
+                None
 
         let qualNameOfFile = file.QualifiedName
 
@@ -1585,47 +1595,61 @@ type DeclarationChecker =
             let contents, _, _ = result.Checked
             result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
 
-        // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
-        let definitions =
-            match start.RootSigOpt with
-            | Some _ -> Map.empty
+        let signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
+            match tail with
+            | Some(_topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
+                // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
+                let definitions =
+                    match start.RootSigOpt with
+                    | Some _ -> Map.empty
+                    | None ->
+                        let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationCheck.addDefinitions acc result.Ref result.Delta)
+                        DeclarationCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
+
+                let signature =
+                    DeclarationCheck.implFileSignature
+                        state
+                        parse.FileName
+                        qualNameOfFile
+                        implFile.Signature
+                        createsGeneratedProvidedTypes
+                        start.ModuleNamesDict
+                        definitions
+
+                let ccuSigForFile, _ =
+                    AddCheckResultsToTcState
+                        (state.tcGlobals,
+                         state.tcImports.GetImportMap(),
+                         start.RootSigOpt.IsSome,
+                         None,
+                         TcResultsSink.NoSink,
+                         tcState.TcEnvFromImpls,
+                         qualNameOfFile,
+                         implFile.Signature)
+                        tcState
+
+                signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, Some implFile
             | None ->
-                let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationCheck.addDefinitions acc result.Ref result.Delta)
-                DeclarationCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
+                // What CheckOneInput's PartialResultOnError gives: the checker state as it was before the file
+                FileSignature(parse.FileName, id, start.ModuleNamesDict, Map.empty),
+                tcState.CcuSig,
+                Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
+                tcState.TcEnvFromSignatures,
+                None
 
-        let signature =
-            DeclarationCheck.implFileSignature
-                state
-                parse.FileName
-                qualNameOfFile
-                implFile.Signature
-                createsGeneratedProvidedTypes
-                start.ModuleNamesDict
-                definitions
-
+        // While the finish's solutions are in effect: the next finish or declaration check undoes them
         let diagnostics =
             Array.concat
-                [ parse.Diagnostics
-                  earlierDiagnostics
-                  DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
+                [ yield parse.Diagnostics
+                  for earlier in earlierDiagnostics do
+                      yield DeclarationCheck.diagnosticsWith state options parse.FileName earlier
+                  yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
 
         let fingerprints =
             Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
         for result in results do
             fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked
-
-        let ccuSigForFile, _ =
-            AddCheckResultsToTcState
-                (state.tcGlobals,
-                 state.tcImports.GetImportMap(),
-                 start.RootSigOpt.IsSome,
-                 None,
-                 TcResultsSink.NoSink,
-                 tcState.TcEnvFromImpls,
-                 qualNameOfFile,
-                 implFile.Signature)
-                tcState
 
         let resolutions, symbolUses, openDeclarations =
             DeclarationCheck.mergeSinks
@@ -1651,7 +1675,7 @@ type DeclarationChecker =
                 symbolUses,
                 tcEnvAtEnd.NameEnv,
                 None,
-                Some implFile,
+                implFileOpt,
                 openDeclarations
             )
 
