@@ -366,13 +366,17 @@ type FileResult
         diagnostics: FSharpDiagnostic[],
         fingerprints: IReadOnlyDictionary<DeclarationKey, string>,
         signature: FileSignature,
-        checkResults: FSharpCheckFileResults
+        checkResults: FSharpCheckFileResults,
+        phaseTicks: IReadOnlyDictionary<string, int64>
     ) =
     member _.Diagnostics = diagnostics
     /// Each declaration's fingerprint after the file's inference scope is closed.
     member _.Fingerprints = fingerprints
     member _.Signature = signature
     member _.CheckResults = checkResults
+    /// Stopwatch ticks of each part of the finish, in source order: refilter, leftovers, assemble, replay, tail,
+    /// typedUses, signature, render, fingerprints, sinks.
+    member _.PhaseTicks = phaseTicks
 
 module internal DeclarationCheck =
 
@@ -1607,6 +1611,13 @@ type DeclarationChecker =
         let state = start.Context.State
         let file = start.File
         let tcState = start.TcState
+        let phaseTicks = Dictionary<string, int64>()
+        let mutable phaseStart = System.Diagnostics.Stopwatch.GetTimestamp()
+
+        let endPhase name =
+            let now = System.Diagnostics.Stopwatch.GetTimestamp()
+            phaseTicks[name] <- now - phaseStart
+            phaseStart <- now
 
         let options =
             match DeclarationCheck.warnOptions.TryGetValue parse with
@@ -1621,6 +1632,7 @@ type DeclarationChecker =
                    yield DeclarationCheck.refiltered options result.RawDiagnostics |]
 
         let earlierErrors = earlierDiagnostics |> Array.sumBy (fun capturing -> capturing.ErrorCount)
+        endPhase "refilter"
 
         let capturing, logger = DeclarationCheck.newLoggersWith options
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
@@ -1632,11 +1644,15 @@ type DeclarationChecker =
         for result in results do
             result.Leftovers cenv
 
+        endPhase "leftovers"
+
         let scopeContents, compiledDefs, envAtEnd =
             DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results
 
+        endPhase "assemble"
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
         DeclarationCheck.replayReferences start.Parse.FileName results
+        endPhase "replay"
 
         // Recovered from as CheckOneInput recovers in a full check, such as a default that fails where the tail does
         // not catch it (SolveInternalUnknowns): the file then adds nothing to the files after it.
@@ -1650,12 +1666,15 @@ type DeclarationChecker =
                 errorRecovery exn range0
                 None
 
+        endPhase "tail"
         let qualNameOfFile = file.QualifiedName
 
         // The finish can solve more of each declaration's types and traits; this is the last finish's view
         for result in results do
             let contents, _, _ = result.Checked
             result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
+
+        endPhase "typedUses"
 
         let signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
             match tail with
@@ -1699,6 +1718,8 @@ type DeclarationChecker =
                 tcState.TcEnvFromSignatures,
                 None
 
+        endPhase "signature"
+
         // While the finish's solutions are in effect: the next finish or declaration check undoes them
         let diagnostics =
             Array.concat
@@ -1707,11 +1728,15 @@ type DeclarationChecker =
                       yield DeclarationCheck.diagnosticsWith state options parse.FileName earlier
                   yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
 
+        endPhase "render"
+
         let fingerprints =
             Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
         for result in results do
             fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck
+
+        endPhase "fingerprints"
 
         let resolutions, symbolUses, openDeclarations =
             DeclarationCheck.mergeSinks
@@ -1744,4 +1769,5 @@ type DeclarationChecker =
         let checkResults =
             FSharpCheckFileResults(parse.FileName, diagnostics, Some scope, parse.DependencyFiles, None, true)
 
-        FileResult(diagnostics, fingerprints, signature, checkResults)
+        endPhase "sinks"
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks)
