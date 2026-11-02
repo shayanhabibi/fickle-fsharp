@@ -132,6 +132,15 @@ type ParsedDeclaration
     /// The declarations of the enclosing module or namespace, this one included: a module's suffix reads their types
     member internal _.Siblings = siblings
 
+/// What FileDependencies computed from one parse of every file of the project.
+[<NoEquality; NoComparison>]
+type internal DependencySnapshot =
+    { Parses: FSharpParseFileResults[]
+      Dependencies: int[][]
+      /// The module-name dictionary each file is deduplicated against: every earlier file's entries, as checking the
+      /// whole project gives them
+      ModuleNamesBefore: ModuleNamesDict[] }
+
 /// A project's options, references and initial checking state.
 [<Sealed>]
 type ProjectContext internal (state: CompilerState) =
@@ -144,7 +153,8 @@ type ProjectContext internal (state: CompilerState) =
         state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
         indexes
 
-    let dependencies = ConditionalWeakTable<FSharpParseFileResults, string[]>()
+    let latestParses = System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
+    let mutable dependencies: DependencySnapshot option = None
     member internal _.State = state
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
@@ -156,13 +166,20 @@ type ProjectContext internal (state: CompilerState) =
         | true, idx -> Some idx
         | _ -> None
 
-    /// The files the latest FileDependencies given this parse found its file depends on.
-    member internal _.DependenciesOf(parse: FSharpParseFileResults) =
-        match dependencies.TryGetValue parse with
-        | true, files -> Some files
+    member internal _.SourceFiles = state.projectOptions.SourceFiles
+
+    /// The latest parse Parse made of each file, set while the file's parse lock is held.
+    member internal _.SetLatestParse(parse: FSharpParseFileResults) = latestParses[parse.FileName] <- parse
+
+    member internal _.LatestParse(fileName: string) =
+        match latestParses.TryGetValue fileName with
+        | true, parse -> Some parse
         | _ -> None
 
-    member internal _.SetDependencies(parse: FSharpParseFileResults, files: string[]) = dependencies.AddOrUpdate(parse, files)
+    /// What the latest FileDependencies computed. A reference, so reads and writes are atomic.
+    member internal _.Dependencies
+        with get () = dependencies
+        and set (snapshot: DependencySnapshot option) = dependencies <- snapshot
 
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
@@ -536,11 +553,81 @@ module internal DeclarationCheck =
         | true, options -> options
         | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be checked: its #nowarn scopes are the ones it recorded."
 
+    /// The fully qualified names of the entities a file declares where another file can declare the same name (ruling
+    /// R19), and the namespaces it puts them in: its top-level modules, and the modules, types, exceptions and module
+    /// abbreviations it declares directly in a namespace. Adding a file to the checker state combines these with every
+    /// earlier file's (CombineCcuContentFragments), which reports two modules or types of one name (FS0037, FS0248,
+    /// FS0249), and a module with a namespace's name (FS0247), whether or not either file uses the other. Types of
+    /// one name and different arity can coexist; they share an entry here, which only adds edges.
+    let declaredNames (input: ParsedInput) =
+        let entities = ResizeArray<string>()
+        let namespaces = ResizeArray<string>()
+        let pathOf (ids: LongIdent) = ids |> List.map _.idText
+
+        let addNamespaces (path: string list) =
+            for n in 1 .. path.Length do
+                namespaces.Add(String.concat "." (List.truncate n path))
+
+        let add (path: string list) (name: string) = entities.Add(String.concat "." (path @ [ name ]))
+
+        let addTop (path: string list) (isModule: bool) (inNamespace: string list -> unit) =
+            if isModule then
+                addNamespaces (List.truncate (max 0 (path.Length - 1)) path)
+                entities.Add(String.concat "." path)
+            else
+                addNamespaces path
+                inNamespace path
+
+        let lastName (ids: LongIdent) =
+            match List.tryLast ids with
+            | Some id -> id.idText
+            | None -> ""
+
+        match input with
+        | ParsedInput.ImplFile file ->
+            for SynModuleOrNamespace(longId = ids; kind = kind; decls = decls) in file.Contents do
+                addTop (pathOf ids) kind.IsModule (fun path ->
+                    for decl in decls do
+                        match decl with
+                        | SynModuleDecl.NestedModule(moduleInfo = moduleInfo) -> add path (longIdentText moduleInfo.LongIdent)
+                        | SynModuleDecl.Types(typeDefns, _) ->
+                            for SynTypeDefn(typeInfo = typeInfo) as typeDefn in typeDefns do
+                                if not (isAugmentation typeDefn) then
+                                    add path (lastName typeInfo.LongIdent)
+                        | SynModuleDecl.Exception(SynExceptionDefn(SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _))), _, _, _), _) ->
+                            add path id.idText
+                            add path (id.idText + "Exception")
+                        | SynModuleDecl.ModuleAbbrev(ident = id) -> add path id.idText
+                        | _ -> ())
+        | ParsedInput.SigFile file ->
+            for SynModuleOrNamespaceSig(longId = ids; kind = kind; decls = decls) in file.Contents do
+                addTop (pathOf ids) kind.IsModule (fun path ->
+                    for decl in decls do
+                        match decl with
+                        | SynModuleSigDecl.NestedModule(moduleInfo = moduleInfo) -> add path (longIdentText moduleInfo.LongIdent)
+                        | SynModuleSigDecl.Types(typeDefns, _) ->
+                            for SynTypeDefnSig(typeInfo = typeInfo; typeRepr = repr) in typeDefns do
+                                match repr with
+                                | SynTypeDefnSigRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _) -> ()
+                                | _ -> add path (lastName typeInfo.LongIdent)
+                        | SynModuleSigDecl.Exception(SynExceptionSig(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _)))), _) ->
+                            add path id.idText
+                            add path (id.idText + "Exception")
+                        | SynModuleSigDecl.ModuleAbbrev(ident = id) -> add path id.idText
+                        | _ -> ())
+
+        entities, namespaces
+
     /// Raises unless `before` is a sound setup for the file: earlier files of the project in file order, either every
-    /// one of them or at least those the latest FileDependencies given this parse found it depends on.
-    let checkBefore (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpParseFileResults) =
+    /// one of them, or at least those the latest FileDependencies found the file depends on. That list is used only
+    /// while it is current: it was computed from this parse of the file, and from the latest parse of each earlier
+    /// file, whose contents decide what the file depends on.
+    ///
+    /// For a setup from part of the earlier files, gives the module-name dictionary the file is deduplicated against,
+    /// as checking every earlier file gives it: the files in `before` alone would miss the names of the others.
+    let checkBefore (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpParseFileResults) : ModuleNamesDict option =
         match ctx.IndexOf parse.FileName with
-        | None -> ()
+        | None -> None
         | Some idx ->
             let mutable last = -1
 
@@ -555,19 +642,36 @@ module internal DeclarationCheck =
                         )
                     )
 
-            if before.Length < idx then
-                let present = HashSet<string>(before |> Seq.map _.FileName, StringComparer.OrdinalIgnoreCase)
+            if before.Length = idx then
+                None
+            else
+                let isCurrent (snapshot: DependencySnapshot) =
+                    snapshot.Parses.Length > idx
+                    && obj.ReferenceEquals(snapshot.Parses[idx], parse)
+                    && Seq.forall
+                        (fun earlier ->
+                            match ctx.LatestParse snapshot.Parses[earlier].FileName with
+                            | Some latest -> obj.ReferenceEquals(latest, snapshot.Parses[earlier])
+                            | None -> false)
+                        (seq { 0 .. idx - 1 })
 
-                match ctx.DependenciesOf parse with
-                | Some dependencies ->
-                    match dependencies |> Array.tryFind (present.Contains >> not) with
+                match ctx.Dependencies with
+                | Some snapshot when isCurrent snapshot ->
+                    let present = HashSet<string>(before |> Seq.map _.FileName, StringComparer.OrdinalIgnoreCase)
+
+                    match snapshot.Dependencies[idx] |> Array.tryFind (fun dep -> not (present.Contains snapshot.Parses[dep].FileName)) with
                     | Some missing ->
-                        raise (ArgumentException($"%s{parse.FileName} depends on %s{missing}, which the files before it miss.", nameof before))
-                    | None -> ()
-                | None ->
+                        raise (
+                            ArgumentException(
+                                $"%s{parse.FileName} depends on %s{snapshot.Parses[missing].FileName}, which the files before it miss.",
+                                nameof before
+                            )
+                        )
+                    | None -> Some snapshot.ModuleNamesBefore[idx]
+                | _ ->
                     raise (
                         ArgumentException(
-                            $"The files before %s{parse.FileName} are not every earlier file, and FileDependencies has not been given this parse, so its dependencies are unknown.",
+                            $"The files before %s{parse.FileName} are not every earlier file, and FileDependencies has not been given this parse with the latest parse of every earlier file, so its dependencies are unknown.",
                             nameof before
                         )
                     )
@@ -599,8 +703,9 @@ module internal DeclarationCheck =
 
     /// The checker state after `before` and the implementation file to check in it, as BeginFile and CheckFile set
     /// them up.
-    let implFileState (state: CompilerState) (before: FileSignature list) (parse: FSharpParseFileResults) =
-        let tcState, moduleNamesDict = stateBefore state before
+    let implFileState (state: CompilerState) (before: FileSignature list) (moduleNamesBefore: ModuleNamesDict option) (parse: FSharpParseFileResults) =
+        let tcState, chainModuleNames = stateBefore state before
+        let moduleNamesDict = defaultArg moduleNamesBefore chainModuleNames
         let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
         match input with
@@ -1233,28 +1338,28 @@ type DeclarationChecker =
         let sourceText = SourceText.ofString source
 
         // Lexing records the file's #nowarn scopes in the project's diagnostic options, replacing the last parse's:
-        // copy them while no other parse of this file can replace them
-        let (parseErrors, parseTree, anyErrors), warnOptions =
-            lock (ctx.ParseLock fileName) (fun () ->
-                let parsed =
-                    ParseAndCheckFile.parseFile (
-                        sourceText,
-                        fileName,
-                        parsingOptions,
-                        userOpName,
-                        suggestNamesForErrors,
-                        state.tcConfig.flatErrors,
-                        captureIdentifiersWhenParsing,
-                        CancellationToken.None
-                    )
+        // copy them while no other parse of this file can replace them. The latest parse of the file is recorded under
+        // the same lock, so it is the one whose scopes were copied last.
+        lock (ctx.ParseLock fileName) (fun () ->
+            let parseErrors, parseTree, anyErrors =
+                ParseAndCheckFile.parseFile (
+                    sourceText,
+                    fileName,
+                    parsingOptions,
+                    userOpName,
+                    suggestNamesForErrors,
+                    state.tcConfig.flatErrors,
+                    captureIdentifiersWhenParsing,
+                    CancellationToken.None
+                )
 
-                let options = parsingOptions.DiagnosticOptions
-                parsed, lock options (fun () -> { options with WarnScopeData = options.WarnScopeData }))
-
-        let parse = FSharpParseFileResults(parseErrors, parseTree, anyErrors, [||])
-        DeclarationCheck.sources.AddOrUpdate(parse, sourceText)
-        DeclarationCheck.warnOptions.AddOrUpdate(parse, warnOptions)
-        parse
+            let options = parsingOptions.DiagnosticOptions
+            let warnOptions = lock options (fun () -> { options with WarnScopeData = options.WarnScopeData })
+            let parse = FSharpParseFileResults(parseErrors, parseTree, anyErrors, [||])
+            DeclarationCheck.sources.AddOrUpdate(parse, sourceText)
+            DeclarationCheck.warnOptions.AddOrUpdate(parse, warnOptions)
+            ctx.SetLatestParse parse
+            parse)
 
     static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] =
         match parse.ParseTree with
@@ -1377,7 +1482,9 @@ type DeclarationChecker =
         match parse.ParseTree with
         | ParsedInput.ImplFile _ -> invalidArg (nameof parse) "Expected a signature file."
         | ParsedInput.SigFile _ ->
-            let tcState, moduleNamesDict = DeclarationCheck.stateBefore state before
+            let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
+            let tcState, chainModuleNames = DeclarationCheck.stateBefore state before
+            let moduleNamesDict = defaultArg moduleNamesBefore chainModuleNames
             let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
             match input with
@@ -1423,8 +1530,8 @@ type DeclarationChecker =
         match parse.ParseTree with
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
         | ParsedInput.ImplFile _ ->
-            DeclarationCheck.checkBefore ctx before parse
-            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before parse
+            let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before moduleNamesBefore parse
             let _, logger = DeclarationCheck.newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
@@ -1454,12 +1561,29 @@ type DeclarationChecker =
     /// signature file also depends on its implementation file when that comes earlier: only checking the
     /// implementation adds the signature's contents to the environment later implementation files are checked in.
     ///
-    /// BeginFile and CheckFile accept the signatures of these files as `before`, in place of every earlier file,
-    /// for the parses given here.
+    /// A file also depends on every earlier file that declares an entity of the same fully qualified name, or a
+    /// namespace of a module's name (ruling R19, see DeclarationCheck.declaredNames): adding it to the checker state
+    /// reports the clash, whether or not either file uses the other.
+    ///
+    /// `parses` must be one parse of each of the project's source files, in file order. BeginFile, CheckFile and
+    /// CheckSignatureFile accept the signatures of these files as `before`, in place of every earlier file, for these
+    /// parses, while each earlier one is still the latest parse of its file.
     static member FileDependencies(ctx: ProjectContext, parses: FSharpParseFileResults[]) : int[][] =
-        let inputs, _ =
+        let sourceFiles = ctx.SourceFiles
+
+        if
+            parses.Length <> sourceFiles.Length
+            || Array.exists2 (fun (parse: FSharpParseFileResults) file -> not (String.Equals(parse.FileName, file, StringComparison.OrdinalIgnoreCase))) parses sourceFiles
+        then
+            raise (ArgumentException("Expected one parse of each of the project's source files, in file order.", nameof parses))
+
+        let inputsAndModuleNames, _ =
             (Map.empty, parses)
-            ||> Array.mapFold (fun moduleNamesDict parse -> DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree)
+            ||> Array.mapFold (fun moduleNamesDict parse ->
+                let input, after = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+                (input, moduleNamesDict), after)
+
+        let inputs, moduleNamesBefore = Array.unzip inputsAndModuleNames
 
         let files =
             inputs
@@ -1467,11 +1591,45 @@ type DeclarationChecker =
 
         let filePairs = FilePairMap files
         let graph, _ = DependencyResolution.mkGraph filePairs files
+
+        // By name, the files declaring an entity of that name, and those with a namespace of that name
+        let entityFiles = Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
+        let namespaceFiles = Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
+
+        let filesOf (table: Dictionary<string, ResizeArray<int>>) name =
+            match table.TryGetValue name with
+            | true, files -> files :> seq<int>
+            | _ -> Seq.empty
+
+        let record (table: Dictionary<string, ResizeArray<int>>) idx name =
+            match table.TryGetValue name with
+            | true, files -> files.Add idx
+            | _ -> table[name] <- ResizeArray [ idx ]
+
+        let names = inputs |> Array.map DeclarationCheck.declaredNames
+
+        names
+        |> Array.iteri (fun idx (entities, namespaces) ->
+            for name in entities do
+                record entityFiles idx name
+
+            for name in namespaces do
+                record namespaceFiles idx name)
+
         let closed = Array.zeroCreate<int[]> files.Length
 
         for idx in 0 .. files.Length - 1 do
             let dependencies = HashSet<int>()
             let pending = Stack<int>(graph[idx])
+            let entities, namespaces = names[idx]
+
+            for name in entities do
+                for other in Seq.append (filesOf entityFiles name) (filesOf namespaceFiles name) do
+                    pending.Push other
+
+            for name in namespaces do
+                for other in filesOf entityFiles name do
+                    pending.Push other
 
             while pending.Count > 0 do
                 let dependency = pending.Pop()
@@ -1484,7 +1642,12 @@ type DeclarationChecker =
                         pending.Push(filePairs.GetImplementationIndex dependency)
 
             closed[idx] <- dependencies |> Seq.sort |> Array.ofSeq
-            ctx.SetDependencies(parses[idx], closed[idx] |> Array.map (fun dependency -> parses[dependency].FileName))
+
+        ctx.Dependencies <-
+            Some
+                { Parses = Array.copy parses
+                  Dependencies = closed |> Array.map Array.copy
+                  ModuleNamesBefore = moduleNamesBefore }
 
         closed
 
@@ -1499,9 +1662,9 @@ type DeclarationChecker =
         match parse.ParseTree with
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Expected an implementation file."
         | ParsedInput.ImplFile _ ->
-            DeclarationCheck.checkBefore ctx before parse
+            let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
             let options = DeclarationCheck.warnOptionsOf parse
-            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before moduleNamesBefore parse
             let capturing, logger = DeclarationCheck.newLoggersWith options
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
