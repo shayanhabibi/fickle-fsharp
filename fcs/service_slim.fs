@@ -126,12 +126,12 @@ module internal SignatureFingerprint =
 
     /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
     /// from 0 in the order they first appear. A member's implemented slots and whether it is implemented come from
-    /// `slotsOf`.
+    /// `slotsOf`; None makes the module type not describable.
     let private describe
         (mty: ModuleOrNamespaceType)
         (topAttrs: TopAttribs)
         (inlineBodies: (Val * Expr) list)
-        (slotsOf: Val -> ValMemberInfo -> SlotSig list * bool)
+        (slotsOf: Val -> ValMemberInfo -> (SlotSig list * bool) option)
         : string option =
         let sb = Text.StringBuilder()
         let add (s: string) = sb.Append(s).Append('|') |> ignore
@@ -366,7 +366,10 @@ module internal SignatureFingerprint =
 
             match v.MemberInfo with
             | Some memberInfo ->
-                let slotSigs, isImplemented = slotsOf v memberInfo
+                let slotSigs, isImplemented =
+                    match slotsOf v memberInfo with
+                    | Some slots -> slots
+                    | None -> raise NotDescribable
                 add (fullDisplayTextOfTyconRef memberInfo.ApparentEnclosingEntity)
                 add (sprintf "%A %b" memberInfo.MemberFlags isImplemented)
                 add (string slotSigs.Length)
@@ -865,7 +868,7 @@ module internal SignatureFingerprint =
         with NotDescribable ->
             None
 
-    let private currentSlots (_: Val) (memberInfo: ValMemberInfo) = memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented
+    let private currentSlots (_: Val) (memberInfo: ValMemberInfo) = Some(memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented)
 
     let compute (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) : string option = describe mty topAttrs [] currentSlots
 
@@ -876,7 +879,7 @@ module internal SignatureFingerprint =
     let computeDeclaration
         (contribution: ModuleOrNamespaceType)
         (inlineBodies: (Val * Expr) list)
-        (slotsOf: Val -> ValMemberInfo -> SlotSig list * bool)
+        (slotsOf: Val -> ValMemberInfo -> (SlotSig list * bool) option)
         : string option =
         describe contribution EmptyTopAttrs inlineBodies slotsOf
 

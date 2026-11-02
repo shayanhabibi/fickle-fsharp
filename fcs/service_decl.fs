@@ -298,7 +298,7 @@ type DeclarationResult
     member _.Diagnostics = diagnostics
 
     /// Whether the environment after the declaration holds inference variables nothing has solved yet
-    /// (ComputeUngeneralizableTypars of it is not empty), as `let r = ref []` leaves. A later declaration's check can
+    /// (ComputeUngeneralizableTypars of it holds one that is not rigid), as `let r = ref []` leaves. A later declaration's check can
     /// solve them in place, and nothing undoes that, so the result depends on every later declaration of its file:
     /// see DependsOnLaterDeclarations.
     member _.LeavesFreeTypars = leavesFreeTypars
@@ -815,25 +815,32 @@ module internal DeclarationCheck =
         slots :> IReadOnlyDictionary<_, _>
 
     let fingerprintOf (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) (slots: IReadOnlyDictionary<Val, SlotSig list * bool>) =
-        let slotsOf (v: Val) (memberInfo: ValMemberInfo) =
+        // Every member the fingerprint describes was captured; reading one that was not would describe the finish's slots
+        let slotsOf (v: Val) (_: ValMemberInfo) =
             match slots.TryGetValue v with
-            | true, atCheck -> atCheck
-            | _ -> memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented
+            | true, atCheck -> Some atCheck
+            | _ -> None
 
         match SignatureFingerprint.computeDeclaration contribution (List.collect inlineBodies contents) slotsOf with
         | Some fingerprint -> fingerprint
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
 
+    /// Whether any of the type parameters can still be solved. A rigid one, such as the declared 'T of
+    /// `type Box<'T>(v: 'T)` that the environment after the type keeps, cannot: unifying it with another type, or
+    /// constraining it further, is an error, not a solution.
+    let anySolvable (typars: Zset<Typar>) =
+        typars |> Zset.exists (fun tp -> tp.Rigidity <> TyparRigidity.Rigid)
+
     /// Whether what a declaration publishes, or the body of one of its inline values, holds an inference variable
     /// nothing has solved. Such a variable is not always in the environment after it, as a value's is: a member's
     /// (`member _.M() = 1L + 1`) is solved in place by a later `let t: int64 = T().M()`, and one only in an inline body
     /// is solved by the finish's defaults, which the fingerprint describes.
     let leavesOpenTypes (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
-        not (freeInModuleTy contribution).FreeTypars.IsEmpty
+        anySolvable (freeInModuleTy contribution).FreeTypars
         || contents
            |> List.collect inlineBodies
-           |> List.exists (fun (_, body) -> not (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars.IsEmpty)
+           |> List.exists (fun (_, body) -> anySolvable (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars)
 
     /// The stamps of every entity and value in a module type, including those inside its modules.
     let rec stampsOf (mty: ModuleOrNamespaceType) =
@@ -1442,7 +1449,7 @@ type DeclarationChecker =
                 checkedDecl, DeclEnv(envAfter, envBefore.Parent, envBefore.TypeNames, frames, envBefore.Definitions), envAtEnd, delta, InModules decl.Depth
 
         let leavesFreeTypars =
-            not (Zset.isEmpty (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env))
+            DeclarationCheck.anySolvable (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env)
 
         let self = { File = start.Parse.FileName; Key = Some decl.Key }
         let definitions = DeclarationCheck.addDefinitions envBefore.Definitions self delta

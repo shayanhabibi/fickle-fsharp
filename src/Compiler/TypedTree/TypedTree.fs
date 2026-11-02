@@ -1583,7 +1583,14 @@ type TyconAugmentation =
 
     member tcaug.SetHashAndEqualsWith x = tcaug.tcaug_hash_and_equals_withc <- Some x
 
-    member tcaug.SetHasObjectGetHashCode b = tcaug.tcaug_hasObjectGetHashCode <- b
+    member tcaug.SetHasObjectGetHashCode b =
+        match MutationLog.Current with
+        | null -> ()
+        | log ->
+            let prev = tcaug.tcaug_hasObjectGetHashCode
+            log.Add(fun () -> tcaug.tcaug_hasObjectGetHashCode <- prev)
+
+        tcaug.tcaug_hasObjectGetHashCode <- b
 
     static member Create() =
         { tcaug_compare=None
