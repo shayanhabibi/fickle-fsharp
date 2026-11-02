@@ -40,7 +40,7 @@ type Stamp = int64
 
 type StampMap<'T> = Map<Stamp, 'T>
 
-/// Records how to undo mutations of inference state (type variables, augmentation closing) made on this thread
+/// Records how to undo mutations of inference state (type variables, augmentation closing, implemented slots) made on this thread
 /// while a log is active, so a pass that mutates shared typed trees can be undone and run again.
 [<Sealed; AbstractClass>]
 type MutationLog =
@@ -3670,6 +3670,26 @@ type ValMemberInfo =
 
       MemberFlags: SynMemberFlags
     }
+
+    /// Sets ImplementedSlotSigs, recording how to restore it in the active mutation log
+    member x.SetImplementedSlotSigs(slotsigs: SlotSig list) =
+        match MutationLog.Current with
+        | null -> ()
+        | log ->
+            let prev = x.ImplementedSlotSigs
+            log.Add(fun () -> x.ImplementedSlotSigs <- prev)
+
+        x.ImplementedSlotSigs <- slotsigs
+
+    /// Sets IsImplemented, recording how to restore it in the active mutation log
+    member x.SetIsImplemented(isImplemented: bool) =
+        match MutationLog.Current with
+        | null -> ()
+        | log ->
+            let prev = x.IsImplemented
+            log.Add(fun () -> x.IsImplemented <- prev)
+
+        x.IsImplemented <- isImplemented
 
     [<DebuggerBrowsable(DebuggerBrowsableState.Never)>]
     member x.DebugText = x.ToString()

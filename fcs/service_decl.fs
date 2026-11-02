@@ -271,6 +271,8 @@ type DeclarationResult
         diagnostics: FSharpDiagnostic[],
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
+        dependsOnLater: bool,
+        slotsAtCheck: IReadOnlyDictionary<Val, SlotSig list * bool>,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
         checkedDecl: CheckedDeclaration,
@@ -286,7 +288,8 @@ type DeclarationResult
 
     member _.Key = declaration.Key
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
-    /// later declarations solving its inference variables: FileResult.Fingerprints has the final one.
+    /// later declarations solving its inference variables, and only then: FileResult.Fingerprints has the final one,
+    /// which differs from this one only when DependsOnLaterDeclarations.
     member _.Fingerprint = fingerprint
     /// Provisional: the declaration's diagnostics filtered with the project's live options when it was checked,
     /// whose #nowarn scopes are those of whichever version of the file was parsed last. FileResult.Diagnostics is
@@ -302,10 +305,13 @@ type DeclarationResult
 
     /// Whether later checks change this result in place, so that (ruling R12) it depends on every later declaration
     /// of its file: when one changes, is added or is removed, discard this result and re-check the declaration from
-    /// its environment before it, and everything after it. That is when it LeavesFreeTypars. Checks also mark the
-    /// values they use referenced, which the unused-value warning (FS1182) reads; FinishFile recomputes those marks
-    /// from the current results (ruling R15), so they need no dependency.
-    member _.DependsOnLaterDeclarations = leavesFreeTypars
+    /// its environment before it, and everything after it. That is when it LeavesFreeTypars, or when what it publishes
+    /// or an inline body of it holds an inference variable nothing has solved: a member's can be solved by a later use
+    /// of the member, and one only in an inline body by the finish's defaults (this over-approximates that case: no
+    /// later declaration reaches such a variable, but the finish changes the fingerprint). Checks also mark the values
+    /// they use referenced, which the unused-value warning (FS1182) reads; FinishFile recomputes those marks from the
+    /// current results (ruling R15), so they need no dependency.
+    member _.DependsOnLaterDeclarations = dependsOnLater
 
     member _.EnvAfter = envAfter
 
@@ -341,6 +347,8 @@ type DeclarationResult
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
     member internal _.Nesting = nesting
+    /// See DeclarationCheck.slotsAtCheck
+    member internal _.SlotsAtCheck = slotsAtCheck
 
     /// Whether the two results contribute the same Val and Entity objects, by reference and in the same order.
     /// For tests.
@@ -779,11 +787,53 @@ module internal DeclarationCheck =
         | TMDefOpens _
         | TMDefDo _ -> []
 
-    let fingerprintOf (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
-        match SignatureFingerprint.computeDeclaration contribution (List.collect inlineBodies contents) with
+    /// The slots each member of a contribution implements, and whether it is implemented, as its check left them.
+    ///
+    /// Closing the inference scope completes them (FinalTypeDefinitionChecksAtEndOfInferenceScope): a slot the check
+    /// recorded by name and declaring type only gets its parameters and return type, and those of a generated
+    /// comparison member are taken from the interface's own metadata; a slot no member was matched to at the check is
+    /// recorded; an abstract member with a default is marked implemented. The declarations after this one are checked
+    /// before that, so they see these. A fingerprint taken at the finish describes these too: the finish computes the
+    /// completed slots from the member (its name, type, flags, which the fingerprint describes), the interfaces and base
+    /// type of its type (described with it) and the slots those declare, which come from referenced assemblies, earlier
+    /// files (whose signatures are compared whole) or declarations whose own fingerprints describe them. An augmentation
+    /// of the type later in the file can add members and interfaces, and it leads a segment with the type.
+    let slotsAtCheck (contribution: ModuleOrNamespaceType) : IReadOnlyDictionary<Val, SlotSig list * bool> =
+        let slots = Dictionary<Val, SlotSig list * bool>(HashIdentity.Reference)
+
+        let rec visit (mty: ModuleOrNamespaceType) =
+            for v in mty.AllValsAndMembers do
+                match v.MemberInfo with
+                | Some memberInfo -> slots[v] <- (memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented)
+                | None -> ()
+
+            for entity in mty.AllEntities do
+                if entity.IsModuleOrNamespace then
+                    visit entity.ModuleOrNamespaceType
+
+        visit contribution
+        slots :> IReadOnlyDictionary<_, _>
+
+    let fingerprintOf (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) (slots: IReadOnlyDictionary<Val, SlotSig list * bool>) =
+        let slotsOf (v: Val) (memberInfo: ValMemberInfo) =
+            match slots.TryGetValue v with
+            | true, atCheck -> atCheck
+            | _ -> memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented
+
+        match SignatureFingerprint.computeDeclaration contribution (List.collect inlineBodies contents) slotsOf with
         | Some fingerprint -> fingerprint
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
+
+    /// Whether what a declaration publishes, or the body of one of its inline values, holds an inference variable
+    /// nothing has solved. Such a variable is not always in the environment after it, as a value's is: a member's
+    /// (`member _.M() = 1L + 1`) is solved in place by a later `let t: int64 = T().M()`, and one only in an inline body
+    /// is solved by the finish's defaults, which the fingerprint describes.
+    let leavesOpenTypes (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
+        not (freeInModuleTy contribution).FreeTypars.IsEmpty
+        || contents
+           |> List.collect inlineBodies
+           |> List.exists (fun (_, body) -> not (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars.IsEmpty)
 
     /// The stamps of every entity and value in a module type, including those inside its modules.
     let rec stampsOf (mty: ModuleOrNamespaceType) =
@@ -1409,13 +1459,17 @@ type DeclarationChecker =
             |> Seq.distinct
             |> Array.ofSeq
 
+        let slots = DeclarationCheck.slotsAtCheck delta
+
         DeclarationResult(
             start,
             decl,
-            DeclarationCheck.fingerprintOf delta checkedDecl,
+            DeclarationCheck.fingerprintOf delta checkedDecl slots,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
             leavesFreeTypars,
+            leavesFreeTypars || DeclarationCheck.leavesOpenTypes delta checkedDecl,
+            slots,
             envAfter,
             envAtEnd,
             checkedDecl,
@@ -1513,7 +1567,8 @@ type DeclarationChecker =
     /// finish's module contents. The same holds for a nested module's entity, which its header's result holds.
     ///
     /// Closing the inference scope changes the declarations' typed trees in place: defaults and other solutions of
-    /// their inference variables, trait solutions, closed augmentations. These are recorded and undone before the
+    /// their inference variables, trait solutions, closed augmentations, the slots members implement (whose check-time
+    /// form the fingerprints keep, see DeclarationCheck.slotsAtCheck). These are recorded and undone before the
     /// next finish or declaration check on this FileStart, so a finish over the same or other results gives what a
     /// full check would. Finishes on one FileStart are serialized, by its lock; a finish must not overlap a
     /// declaration check on the same FileStart.
@@ -1649,7 +1704,7 @@ type DeclarationChecker =
             Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
         for result in results do
-            fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked
+            fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck
 
         let resolutions, symbolUses, openDeclarations =
             DeclarationCheck.mergeSinks

@@ -125,8 +125,14 @@ module internal SignatureFingerprint =
     exception private NotDescribable
 
     /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
-    /// from 0 in the order they first appear.
-    let private describe (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) (inlineBodies: (Val * Expr) list) : string option =
+    /// from 0 in the order they first appear. A member's implemented slots and whether it is implemented come from
+    /// `slotsOf`.
+    let private describe
+        (mty: ModuleOrNamespaceType)
+        (topAttrs: TopAttribs)
+        (inlineBodies: (Val * Expr) list)
+        (slotsOf: Val -> ValMemberInfo -> SlotSig list * bool)
+        : string option =
         let sb = Text.StringBuilder()
         let add (s: string) = sb.Append(s).Append('|') |> ignore
         let typarNumbers = Collections.Generic.Dictionary<Typar, int>(HashIdentity.Reference)
@@ -360,10 +366,11 @@ module internal SignatureFingerprint =
 
             match v.MemberInfo with
             | Some memberInfo ->
+                let slotSigs, isImplemented = slotsOf v memberInfo
                 add (fullDisplayTextOfTyconRef memberInfo.ApparentEnclosingEntity)
-                add (sprintf "%A %b" memberInfo.MemberFlags memberInfo.IsImplemented)
-                add (string memberInfo.ImplementedSlotSigs.Length)
-                List.iter slotSig memberInfo.ImplementedSlotSigs
+                add (sprintf "%A %b" memberInfo.MemberFlags isImplemented)
+                add (string slotSigs.Length)
+                List.iter slotSig slotSigs
             | None -> add "-"
 
         and field (f: RecdField) =
@@ -858,13 +865,20 @@ module internal SignatureFingerprint =
         with NotDescribable ->
             None
 
-    let compute (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) : string option = describe mty topAttrs []
+    let private currentSlots (_: Val) (memberInfo: ValMemberInfo) = memberInfo.ImplementedSlotSigs, memberInfo.IsImplemented
+
+    let compute (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) : string option = describe mty topAttrs [] currentSlots
 
     /// What the code after a declaration sees of it: its contribution to the module or namespace it is in, and the
     /// bodies of its inline values. Numbering starts again for each declaration, so a fingerprint depends neither on
-    /// other declarations nor on the order they were checked in.
-    let computeDeclaration (contribution: ModuleOrNamespaceType) (inlineBodies: (Val * Expr) list) : string option =
-        describe contribution EmptyTopAttrs inlineBodies
+    /// other declarations nor on the order they were checked in. A member's implemented slots come from `slotsOf`:
+    /// closing the inference scope completes them (see DeclarationCheck.slotsAtCheck).
+    let computeDeclaration
+        (contribution: ModuleOrNamespaceType)
+        (inlineBodies: (Val * Expr) list)
+        (slotsOf: Val -> ValMemberInfo -> SlotSig list * bool)
+        : string option =
+        describe contribution EmptyTopAttrs inlineBodies slotsOf
 
 [<AutoOpen>]
 module internal ParseAndCheck =

@@ -2440,6 +2440,12 @@ type ValMemberInfo =
         MemberFlags: SynMemberFlags
     }
 
+    /// Sets ImplementedSlotSigs, recording how to restore it in the active mutation log
+    member SetImplementedSlotSigs: slotsigs: SlotSig list -> unit
+
+    /// Sets IsImplemented, recording how to restore it in the active mutation log
+    member SetIsImplemented: isImplemented: bool -> unit
+
     override ToString: unit -> string
 
     [<DebuggerBrowsable(DebuggerBrowsableState.Never)>]
