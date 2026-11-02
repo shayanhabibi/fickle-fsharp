@@ -570,10 +570,16 @@ module internal DeclarationCheck =
 
         let add (path: string list) (name: string) = entities.Add(String.concat "." (path @ [ name ]))
 
+        // A module may compile as XModule: next to a type X, or under [<CompilationRepresentation(ModuleSuffix)>]
+        let addModule (path: string list) (name: string) =
+            add path name
+            add path (name + "Module")
+
         let addTop (path: string list) (isModule: bool) (inNamespace: string list -> unit) =
             if isModule then
                 addNamespaces (List.truncate (max 0 (path.Length - 1)) path)
                 entities.Add(String.concat "." path)
+                entities.Add(String.concat "." path + "Module")
             else
                 addNamespaces path
                 inNamespace path
@@ -589,7 +595,7 @@ module internal DeclarationCheck =
                 addTop (pathOf ids) kind.IsModule (fun path ->
                     for decl in decls do
                         match decl with
-                        | SynModuleDecl.NestedModule(moduleInfo = moduleInfo) -> add path (longIdentText moduleInfo.LongIdent)
+                        | SynModuleDecl.NestedModule(moduleInfo = moduleInfo) -> addModule path (longIdentText moduleInfo.LongIdent)
                         | SynModuleDecl.Types(typeDefns, _) ->
                             for SynTypeDefn(typeInfo = typeInfo) as typeDefn in typeDefns do
                                 if not (isAugmentation typeDefn) then
@@ -604,7 +610,7 @@ module internal DeclarationCheck =
                 addTop (pathOf ids) kind.IsModule (fun path ->
                     for decl in decls do
                         match decl with
-                        | SynModuleSigDecl.NestedModule(moduleInfo = moduleInfo) -> add path (longIdentText moduleInfo.LongIdent)
+                        | SynModuleSigDecl.NestedModule(moduleInfo = moduleInfo) -> addModule path (longIdentText moduleInfo.LongIdent)
                         | SynModuleSigDecl.Types(typeDefns, _) ->
                             for SynTypeDefnSig(typeInfo = typeInfo; typeRepr = repr) in typeDefns do
                                 match repr with
