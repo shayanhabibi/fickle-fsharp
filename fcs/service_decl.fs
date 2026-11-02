@@ -136,15 +136,48 @@ type ParsedDeclaration
 [<Sealed>]
 type ProjectContext internal (state: CompilerState) =
     let parseLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+    // Exactly as ErrorsByFile matches a diagnostic's file against the project's files
+    let sourceFiles = HashSet<string>(state.projectOptions.SourceFiles, StringComparer.Ordinal)
+
+    let fileIndexes =
+        let indexes = Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+        indexes
+
+    let dependencies = ConditionalWeakTable<FSharpParseFileResults, string[]>()
     member internal _.State = state
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
     member internal _.ParseLock(fileName: string) = parseLocks.GetOrAdd(fileName, fun _ -> obj ())
+    member internal _.IsSourceFile(fileName: string) = sourceFiles.Contains fileName
+
+    member internal _.IndexOf(fileName: string) =
+        match fileIndexes.TryGetValue fileName with
+        | true, idx -> Some idx
+        | _ -> None
+
+    /// The files the latest FileDependencies given this parse found its file depends on.
+    member internal _.DependenciesOf(parse: FSharpParseFileResults) =
+        match dependencies.TryGetValue parse with
+        | true, files -> Some files
+        | _ -> None
+
+    member internal _.SetDependencies(parse: FSharpParseFileResults, files: string[]) = dependencies.AddOrUpdate(parse, files)
 
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
 type FileSignature
-    internal (fileName: string, apply: TcState -> TcState, moduleNamesDict: ModuleNamesDict, definitions: Map<Stamp, DeclarationRef>) =
+    internal
+    (
+        fileName: string,
+        apply: TcState -> TcState,
+        moduleNamesDict: ModuleNamesDict,
+        definitions: Map<Stamp, DeclarationRef>,
+        fingerprint: string
+    ) =
+    /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
+    /// implementation file with a signature file, the signature file's. Unequal for anything not describable.
+    member _.Fingerprint = fingerprint
     member internal _.FileName = fileName
     member internal _.Apply tcState = apply tcState
     /// The module-name dictionary DeduplicateParsedInputModuleName gave for this file: every earlier file's entries
@@ -479,6 +512,12 @@ module internal DeclarationCheck =
     let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnosticLogger) =
         diagnosticsWith state state.tcConfig.diagnosticsOptions fileName capturing
 
+    /// The diagnostics in the project's source files, as a full check's ErrorsByFile keeps them (ruling R18). Rendering
+    /// keeps a diagnostic by the file of its range as reported, then applies #line directives to it: one in generated
+    /// code mapped to its source, such as pars.fs to pars.fsy, would otherwise be reported in that other file.
+    let projectDiagnostics (ctx: ProjectContext) (diagnostics: FSharpDiagnostic[]) =
+        diagnostics |> Array.filter (fun diagnostic -> ctx.IsSourceFile diagnostic.FileName)
+
     /// Diagnostics as reported, filtered by these options (a parse's copy, with its #nowarn scopes), not yet
     /// rendered: their text shows the types as they are when diagnosticsWith renders them.
     let refiltered diagnosticsOptions (raw: PhasedDiagnostic[]) =
@@ -492,6 +531,59 @@ module internal DeclarationCheck =
     /// Each parse's copy of the project's diagnostic options, holding the #nowarn scopes that parse recorded.
     let warnOptions = ConditionalWeakTable<FSharpParseFileResults, FSharpDiagnosticOptions>()
 
+    let warnOptionsOf (parse: FSharpParseFileResults) =
+        match warnOptions.TryGetValue parse with
+        | true, options -> options
+        | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be checked: its #nowarn scopes are the ones it recorded."
+
+    /// Raises unless `before` is a sound setup for the file: earlier files of the project in file order, either every
+    /// one of them or at least those the latest FileDependencies given this parse found it depends on.
+    let checkBefore (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpParseFileResults) =
+        match ctx.IndexOf parse.FileName with
+        | None -> ()
+        | Some idx ->
+            let mutable last = -1
+
+            for signature in before do
+                match ctx.IndexOf signature.FileName with
+                | Some position when position > last && position < idx -> last <- position
+                | _ ->
+                    raise (
+                        ArgumentException(
+                            $"The files before %s{parse.FileName} must be earlier files of the project, in file order: %s{signature.FileName} is not.",
+                            nameof before
+                        )
+                    )
+
+            if before.Length < idx then
+                let present = HashSet<string>(before |> Seq.map _.FileName, StringComparer.OrdinalIgnoreCase)
+
+                match ctx.DependenciesOf parse with
+                | Some dependencies ->
+                    match dependencies |> Array.tryFind (present.Contains >> not) with
+                    | Some missing ->
+                        raise (ArgumentException($"%s{parse.FileName} depends on %s{missing}, which the files before it miss.", nameof before))
+                    | None -> ()
+                | None ->
+                    raise (
+                        ArgumentException(
+                            $"The files before %s{parse.FileName} are not every earlier file, and FileDependencies has not been given this parse, so its dependencies are unknown.",
+                            nameof before
+                        )
+                    )
+
+    /// The file-level fingerprint of what later files see of a file.
+    let signatureFingerprint (mty: ModuleOrNamespaceType) (topAttrs: TopAttribs) =
+        match SignatureFingerprint.compute mty topAttrs with
+        | Some fingerprint -> fingerprint
+        | None -> "?" + Guid.NewGuid().ToString("N")
+
+    /// An implementation file's: its signature file's when it has one, as CheckSignatureFile gives it.
+    let implFingerprint (rootSigOpt: ModuleOrNamespaceType option) (implFileSig: ModuleOrNamespaceType) (topAttrs: TopAttribs) =
+        match rootSigOpt with
+        | Some sigFileType -> signatureFingerprint sigFileType EmptyTopAttrs
+        | None -> signatureFingerprint implFileSig topAttrs
+
     let stateBefore (state: CompilerState) (before: FileSignature list) =
         let tcState = (state.tcInitialState, before) ||> List.fold (fun tcState signature -> signature.Apply tcState)
 
@@ -504,6 +596,27 @@ module internal DeclarationCheck =
                     acc |> Map.add qualifiedName (Map.foldBack Map.add files known)))
 
         tcState, moduleNamesDict
+
+    /// The checker state after `before` and the implementation file to check in it, as BeginFile and CheckFile set
+    /// them up.
+    let implFileState (state: CompilerState) (before: FileSignature list) (parse: FSharpParseFileResults) =
+        let tcState, moduleNamesDict = stateBefore state before
+        let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+
+        match input with
+        | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Expected an implementation file."
+        | ParsedInput.ImplFile file -> tcState, moduleNamesDict, input, file
+
+    /// What CheckOneInput does before checking an implementation file, reporting to the ambient logger: the file's
+    /// signature, if any.
+    let enterImplFile (state: CompilerState) (tcState: TcState) (input: ParsedInput) (file: ParsedImplFileInput) =
+        ResetGeneratedNames(input, state)
+        let qualNameOfFile = file.QualifiedName
+
+        if tcState.HasRootImpl qualNameOfFile then
+            errorR (Error(FSComp.SR.buildImplementationAlreadyGiven (RichText.mkModule qualNameOfFile.Text), input.Range))
+
+        tcState.TryFindRootSig qualNameOfFile
 
     let conditionalDefines (state: CompilerState) =
         if state.tcConfig.noConditionalErasure then
@@ -1077,7 +1190,16 @@ module internal DeclarationCheck =
         refs.Remove self |> ignore
         refs |> Array.ofSeq |> Array.sort
 
-    let implFileSignature (state: CompilerState) fileName qualNameOfFile (implFileSig: ModuleOrNamespaceType) createsGeneratedProvidedTypes moduleNamesDict definitions =
+    let implFileSignature
+        (state: CompilerState)
+        fileName
+        qualNameOfFile
+        (implFileSig: ModuleOrNamespaceType)
+        createsGeneratedProvidedTypes
+        moduleNamesDict
+        definitions
+        fingerprint
+        =
         let amap = state.tcImports.GetImportMap()
 
         let apply (tcState: TcState) =
@@ -1090,7 +1212,11 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions)
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint)
+
+    /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
+    let failedFileSignature fileName moduleNamesDict =
+        FileSignature(fileName, id, moduleNamesDict, Map.empty, "?" + Guid.NewGuid().ToString("N"))
 
 [<AbstractClass; Sealed>]
 type DeclarationChecker =
@@ -1283,7 +1409,13 @@ type DeclarationChecker =
                 let apply =
                     AddSignatureFileToTcState (state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
 
-                FileSignature(parse.FileName, apply, moduleNamesDict, DeclarationCheck.signatureDefinitions parse.FileName sigFileType)
+                FileSignature(
+                    parse.FileName,
+                    apply,
+                    moduleNamesDict,
+                    DeclarationCheck.signatureDefinitions parse.FileName sigFileType,
+                    DeclarationCheck.signatureFingerprint sigFileType EmptyTopAttrs
+                )
 
     static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclEnv =
         let state = ctx.State
@@ -1291,42 +1423,182 @@ type DeclarationChecker =
         match parse.ParseTree with
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
         | ParsedInput.ImplFile _ ->
-            let tcState, moduleNamesDict = DeclarationCheck.stateBefore state before
-            let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+            DeclarationCheck.checkBefore ctx before parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before parse
+            let _, logger = DeclarationCheck.newLoggers state
+            use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+            use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+            let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
+            let sink = TcResultsSinkImpl(state.tcGlobals)
+            let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
+            let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
+            let start =
+                FileStart(
+                    ctx,
+                    parse,
+                    file,
+                    moduleNamesDict,
+                    tcState,
+                    rootSigOpt,
+                    scope,
+                    scope.Env.eModuleOrNamespaceTypeAccumulator.Value,
+                    sink,
+                    DeclarationCheck.leftoversOf cenv,
+                    logger.Diagnostics
+                )
 
-            match input with
-            | ParsedInput.SigFile _ -> invalidOp "unreachable"
-            | ParsedInput.ImplFile file ->
-                let _, logger = DeclarationCheck.newLoggers state
-                use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
-                use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-                ResetGeneratedNames(input, state)
+            start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [], DeclarationCheck.definitionsBefore before)
 
-                let qualNameOfFile = file.QualifiedName
-                let rootSigOpt = tcState.TryFindRootSig qualNameOfFile
+    /// For each of the project's files, given in file order, the ascending indices of the earlier files checking it
+    /// reads: the file dependency graph graph-mode checking builds, transitively closed. A file that depends on a
+    /// signature file also depends on its implementation file when that comes earlier: only checking the
+    /// implementation adds the signature's contents to the environment later implementation files are checked in.
+    ///
+    /// BeginFile and CheckFile accept the signatures of these files as `before`, in place of every earlier file,
+    /// for the parses given here.
+    static member FileDependencies(ctx: ProjectContext, parses: FSharpParseFileResults[]) : int[][] =
+        let inputs, _ =
+            (Map.empty, parses)
+            ||> Array.mapFold (fun moduleNamesDict parse -> DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree)
 
-                if tcState.HasRootImpl qualNameOfFile then
-                    errorR (Error(FSComp.SR.buildImplementationAlreadyGiven (RichText.mkModule qualNameOfFile.Text), input.Range))
+        let files =
+            inputs
+            |> Array.mapi (fun idx input -> { Idx = idx; FileName = input.FileName; ParsedInput = input })
 
-                let sink = TcResultsSinkImpl(state.tcGlobals)
-                let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
-                let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
-                let start =
-                    FileStart(
-                        ctx,
-                        parse,
-                        file,
-                        moduleNamesDict,
-                        tcState,
+        let filePairs = FilePairMap files
+        let graph, _ = DependencyResolution.mkGraph filePairs files
+        let closed = Array.zeroCreate<int[]> files.Length
+
+        for idx in 0 .. files.Length - 1 do
+            let dependencies = HashSet<int>()
+            let pending = Stack<int>(graph[idx])
+
+            while pending.Count > 0 do
+                let dependency = pending.Pop()
+
+                if dependency < idx && dependencies.Add dependency then
+                    for transitive in closed[dependency] do
+                        pending.Push transitive
+
+                    if filePairs.IsSignature dependency then
+                        pending.Push(filePairs.GetImplementationIndex dependency)
+
+            closed[idx] <- dependencies |> Seq.sort |> Array.ofSeq
+            ctx.SetDependencies(parses[idx], closed[idx] |> Array.map (fun dependency -> parses[dependency].FileName))
+
+        closed
+
+    /// Checks an implementation file whole, as a full check does, after the files before it: every earlier file, or
+    /// those FileDependencies gives for this parse. It keeps no per-declaration state: the result has no
+    /// fingerprints, and its check results come from one sink.
+    ///
+    /// The diagnostics come from `parse`, filtered with its #nowarn scopes, as FinishFile's do.
+    static member CheckFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileResult =
+        let state = ctx.State
+
+        match parse.ParseTree with
+        | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Expected an implementation file."
+        | ParsedInput.ImplFile _ ->
+            DeclarationCheck.checkBefore ctx before parse
+            let options = DeclarationCheck.warnOptionsOf parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before parse
+            let capturing, logger = DeclarationCheck.newLoggersWith options
+            use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+            use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+            let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
+            let sink = TcResultsSinkImpl(state.tcGlobals)
+            let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
+            let amap = state.tcImports.GetImportMap()
+            let tailStart = System.Diagnostics.Stopwatch.GetTimestamp()
+
+            // Recovered from as CheckOneInput recovers
+            let checkedFile =
+                try
+                    CheckOneImplFile(
+                        state.tcGlobals,
+                        amap,
+                        tcState.Ccu,
+                        tcState.ImplicitOpenDeclarations,
+                        checkForErrors,
+                        DeclarationCheck.conditionalDefines state,
+                        TcResultsSink.WithSink sink,
+                        state.tcConfig.internalTestSpanStackReferring,
+                        tcState.TcEnvFromImpls,
                         rootSigOpt,
-                        scope,
-                        scope.Env.eModuleOrNamespaceTypeAccumulator.Value,
-                        sink,
-                        DeclarationCheck.leftoversOf cenv,
-                        logger.Diagnostics
+                        file,
+                        state.tcConfig.diagnosticsOptions
                     )
+                    |> Cancellable.runWithoutCancellation
+                    |> Some
+                with RecoverableException exn ->
+                    errorRecovery exn range0
+                    None
 
-                start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [], DeclarationCheck.definitionsBefore before)
+            let phaseTicks = Dictionary<string, int64>()
+            phaseTicks["tail"] <- System.Diagnostics.Stopwatch.GetTimestamp() - tailStart
+            let qualNameOfFile = file.QualifiedName
+
+            let signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
+                match checkedFile with
+                | Some(topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
+                    // No declaration stands for what later files see of it, so the file does, as a signature file
+                    let definitions =
+                        match rootSigOpt with
+                        | Some _ -> Map.empty
+                        | None -> DeclarationCheck.signatureDefinitions parse.FileName implFile.Signature
+
+                    let signature =
+                        DeclarationCheck.implFileSignature
+                            state
+                            parse.FileName
+                            qualNameOfFile
+                            implFile.Signature
+                            createsGeneratedProvidedTypes
+                            moduleNamesDict
+                            definitions
+                            (DeclarationCheck.implFingerprint rootSigOpt implFile.Signature topAttrs)
+
+                    let ccuSigForFile, _ =
+                        AddCheckResultsToTcState
+                            (state.tcGlobals, amap, rootSigOpt.IsSome, None, TcResultsSink.NoSink, tcState.TcEnvFromImpls, qualNameOfFile, implFile.Signature)
+                            tcState
+
+                    signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, Some implFile
+                | None ->
+                    DeclarationCheck.failedFileSignature parse.FileName moduleNamesDict,
+                    tcState.CcuSig,
+                    Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
+                    tcState.TcEnvFromSignatures,
+                    None
+
+            let diagnostics =
+                Array.append parse.Diagnostics (DeclarationCheck.diagnosticsWith state options parse.FileName capturing)
+                |> DeclarationCheck.projectDiagnostics ctx
+
+            let scope =
+                TypeCheckInfo(
+                    state.tcConfig,
+                    state.tcGlobals,
+                    ccuSigForFile,
+                    ownSigForFile,
+                    tcState.Ccu,
+                    state.tcImports,
+                    tcEnvAtEnd.AccessRights,
+                    state.projectOptions.ProjectFileName,
+                    parse.FileName,
+                    Some state.projectOptions,
+                    sink.GetResolutions(),
+                    sink.GetSymbolUses(),
+                    tcEnvAtEnd.NameEnv,
+                    None,
+                    implFileOpt,
+                    sink.GetOpenDeclarations()
+                )
+
+            let checkResults =
+                FSharpCheckFileResults(parse.FileName, diagnostics, Some scope, parse.DependencyFiles, None, true)
+
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time, without publishing into
@@ -1619,10 +1891,7 @@ type DeclarationChecker =
             phaseTicks[name] <- now - phaseStart
             phaseStart <- now
 
-        let options =
-            match DeclarationCheck.warnOptions.TryGetValue parse with
-            | true, options -> options
-            | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can finish a file: its #nowarn scopes are the ones it recorded."
+        let options = DeclarationCheck.warnOptionsOf parse
 
         // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration.
         // Rendered after the tail, as a full check renders them, so their types show what the defaults solved.
@@ -1678,7 +1947,7 @@ type DeclarationChecker =
 
         let signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
             match tail with
-            | Some(_topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
+            | Some(topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
                 // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
                 let definitions =
                     match start.RootSigOpt with
@@ -1696,6 +1965,7 @@ type DeclarationChecker =
                         createsGeneratedProvidedTypes
                         start.ModuleNamesDict
                         definitions
+                        (DeclarationCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs)
 
                 let ccuSigForFile, _ =
                     AddCheckResultsToTcState
@@ -1711,8 +1981,7 @@ type DeclarationChecker =
 
                 signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, Some implFile
             | None ->
-                // What CheckOneInput's PartialResultOnError gives: the checker state as it was before the file
-                FileSignature(parse.FileName, id, start.ModuleNamesDict, Map.empty),
+                DeclarationCheck.failedFileSignature parse.FileName start.ModuleNamesDict,
                 tcState.CcuSig,
                 Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
                 tcState.TcEnvFromSignatures,
@@ -1727,6 +1996,7 @@ type DeclarationChecker =
                   for earlier in earlierDiagnostics do
                       yield DeclarationCheck.diagnosticsWith state options parse.FileName earlier
                   yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
+            |> DeclarationCheck.projectDiagnostics start.Context
 
         endPhase "render"
 
