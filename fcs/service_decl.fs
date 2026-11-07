@@ -1419,6 +1419,118 @@ module internal DeclarationCheck =
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
 
+    /// The signature file's module or namespace at the compilation path, if it has one there.
+    let signatureAt (rootSig: ModuleOrNamespaceType) (compPath: CompilationPath) =
+        (Some rootSig, compPath.AccessPath)
+        ||> List.fold (fun sigTy (name, _) ->
+            sigTy |> Option.bind (fun (t: ModuleOrNamespaceType) ->
+                t.AllEntitiesByCompiledAndLogicalMangledNames.TryFind name |> Option.map _.ModuleOrNamespaceType))
+
+    /// The part of a signature that an implementation's items correspond to: the types and modules of the same names
+    /// (a module's contents in turn only those of the implementation's module) and the values of the same names and
+    /// enclosing types. What is left out is what a conformance check of the implementation alone would report as
+    /// missing and stop at.
+    let rec correspondingSignature (impl: ModuleOrNamespaceType) (sigTy: ModuleOrNamespaceType) =
+        let entities =
+            [ for e in impl.AllEntities do
+                  match sigTy.AllEntitiesByCompiledAndLogicalMangledNames.TryFind e.LogicalName with
+                  | Some s when s.IsModuleOrNamespace && e.IsModuleOrNamespace ->
+                      { s with entity_modul_type = MaybeLazy.Strict(correspondingSignature e.ModuleOrNamespaceType s.ModuleOrNamespaceType) }
+                  | Some s -> s
+                  | None -> () ]
+
+        let nameOf (v: Val) =
+            v.LogicalName, (if v.IsMember then Some v.MemberApparentEntity.LogicalName else None)
+
+        let names = HashSet<string * string option>(impl.AllValsAndMembers |> Seq.map nameOf, HashIdentity.Structural)
+        let vals = sigTy.AllValsAndMembers |> Seq.filter (nameOf >> names.Contains) |> List.ofSeq
+        Construct.NewModuleOrNamespaceType sigTy.ModuleOrNamespaceKind entities vals
+
+    /// Checks the declaration's contribution against the signature file's corresponding part, as FinishFile's
+    /// conformance check of the whole file does. Its diagnostics are FinishFile's to report.
+    let conformToSignature (g: TcGlobals) (cenv: TcFileState) (rootSig: ModuleOrNamespaceType) (envBefore: DeclEnv) (env: TcEnv) (contribution: ModuleOrNamespaceType) =
+        match signatureAt rootSig env.eCompPath with
+        | None -> ()
+        | Some sigTy ->
+            // Types the contribution's items mention from its own level and from each enclosing module's
+            let levels =
+                (env.eModuleOrNamespaceTypeAccumulator.Value, env.eCompPath)
+                :: [ for frame in envBefore.Frames -> frame.OuterEnv.eModuleOrNamespaceTypeAccumulator.Value, frame.OuterEnv.eCompPath ]
+
+            let remapInfo =
+                (SignatureRepackageInfo.Empty, levels)
+                ||> List.fold (fun acc (implTy, compPath) ->
+                    match signatureAt rootSig compPath with
+                    | Some levelSig ->
+                        let info, _ = ComputeRemappingFromInferredSignatureToExplicitSignature g implTy levelSig
+
+                        { RepackagedVals = info.RepackagedVals @ acc.RepackagedVals
+                          RepackagedEntities = info.RepackagedEntities @ acc.RepackagedEntities }
+                    | None -> acc)
+
+            let aenv = { TypeEquivEnv.EmptyWithNullChecks g with EquivTycons = TyconRefMap.OfList remapInfo.RepackagedEntities }
+            let impl = wrapModuleOrNamespaceType (ident ("conformance", range0)) env.eCompPath contribution
+
+            SignatureConformance.Checker(g, cenv.amap, env.DisplayEnv, remapInfo, true)
+                .CheckSignature aenv cenv.infoReader (mkLocalModuleRef impl) (correspondingSignature contribution sigTy)
+            |> ignore
+
+    /// Runs `f` while the declaration holds what FinishFile changes in it that no other declaration takes part in, then
+    /// undoes that, so the declarations after it are checked as checking the whole file checks them, and a fingerprint
+    /// taken in `f` is the one FinishFile takes:
+    /// - with `defaults` (its contents and attributes, for a declaration that left inference variables unsolved but
+    ///   depends on no later declaration), the file-end defaults solving them: no other declaration reaches them, as in
+    ///   the arguments of an attribute (`typedefof<Proxy<_>>`);
+    /// - for a file with a signature file, the conformance check, which gives a value the arity, argument names and
+    ///   attributes of its signature, and a type, union case, field or module the attributes of its signature.
+    /// FinishFile changes the same when its defaults and its conformance check succeed. The diagnostics are discarded:
+    /// FinishFile reports them.
+    let whileFinished
+        (g: TcGlobals)
+        (cenv: TcFileState)
+        (scratch: unit -> TcFileState)
+        (rootSigOpt: ModuleOrNamespaceType option)
+        (defaults: (ModuleOrNamespaceContents * Attribs) option)
+        (envBefore: DeclEnv)
+        (env: TcEnv)
+        (contribution: ModuleOrNamespaceType)
+        (f: unit -> 'T)
+        : 'T =
+        if rootSigOpt.IsNone && defaults.IsNone then
+            f ()
+        else
+            let log = ResizeArray()
+            let outerLog = MutationLog.Current
+            let outerRecording = SignatureConformance.UndoableConformance.Recording
+            let outerKeep = SignatureConformance.SignatureRanges.Keep
+            MutationLog.Current <- log
+            SignatureConformance.UndoableConformance.Recording <- true
+            // The signature's items are shared with every file checked after it
+            SignatureConformance.SignatureRanges.Keep <- true
+
+            try
+                (try
+                    use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+
+                    match defaults with
+                    | Some(contents, attribs) ->
+                        // A checker state of its own: what solving defers is not this check's to run
+                        let scratch = scratch ()
+                        ApplyDefaults scratch g env.DisplayEnv range0 contents attribs
+                        SolveInternalUnknowns g scratch env.DisplayEnv contents attribs
+                    | None -> ()
+
+                    rootSigOpt |> Option.iter (fun rootSig -> conformToSignature g cenv rootSig envBefore env contribution)
+                 with RecoverableException _ ->
+                    ())
+
+                f ()
+            finally
+                MutationLog.Undo log
+                MutationLog.Current <- outerLog
+                SignatureConformance.UndoableConformance.Recording <- outerRecording
+                SignatureConformance.SignatureRanges.Keep <- outerKeep
+
     /// Whether any of the type parameters can still be solved. A rigid one, such as the declared 'T of
     /// `type Box<'T>(v: 'T)` that the environment after the type keeps, cannot: unifying it with another type, or
     /// constraining it further, is an error, not a solution.
@@ -2405,16 +2517,34 @@ type DeclarationChecker =
             |> Array.ofSeq
 
         let slots = DeclarationCheck.slotsAtCheck delta
+        let dependsOnLater = leavesFreeTypars || DeclarationCheck.leavesOpenTypes delta checkedDecl
+        // Before the fingerprint: collecting the unsolved variables normalizes the solutions of unit-of-measure
+        // variables in place (FindUnsolved), as the finish's defaults then find them
+        let leavesUnsolved = leavesFreeTypars || DeclarationCheck.leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl
+
+        let fingerprint =
+            if decl.IsModuleHeader || not checks then
+                DeclarationCheck.fingerprintOf delta checkedDecl slots
+            else
+                let _, _, attribs = checkedDecl
+                let defaults = if leavesUnsolved && not dependsOnLater then Some(TMDefs contents, List.map snd attribs) else None
+
+                let scratch () =
+                    let scratch, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+                    scratch
+
+                DeclarationCheck.whileFinished state.tcGlobals cenv scratch start.RootSigOpt defaults envBefore env delta (fun () ->
+                    DeclarationCheck.fingerprintOf delta checkedDecl slots)
 
         DeclarationResult(
             start,
             decl,
-            DeclarationCheck.fingerprintOf delta checkedDecl slots,
+            fingerprint,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
             leavesFreeTypars,
-            leavesFreeTypars || DeclarationCheck.leavesOpenTypes delta checkedDecl,
-            leavesFreeTypars || DeclarationCheck.leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl,
+            dependsOnLater,
+            leavesUnsolved,
             slots,
             envAfter,
             envAtEnd,

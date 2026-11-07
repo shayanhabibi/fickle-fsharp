@@ -58,6 +58,12 @@ exception ArgumentsInSigAndImplMismatch of sigArg: Ident * implArg: Ident
 type SignatureRanges =
     static member Keep: bool with get, set
 
+/// Whether conformance checks on this thread record, in MutationLog.Current, how to undo what they change in the
+/// implementation's items, so a check can see what conformance would leave and then have it undone.
+[<Sealed; AbstractClass>]
+type UndoableConformance =
+    static member Recording: bool with get, set
+
 exception DefinitionsInSigAndImplNotCompatibleAbbreviationsDiffer of
     denv: DisplayEnv *
     implTycon: Tycon *

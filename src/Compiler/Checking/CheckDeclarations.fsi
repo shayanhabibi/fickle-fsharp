@@ -95,6 +95,25 @@ val CheckImplFileTail:
     ModuleOrNamespaceContents * (AttributeTargets * Attrib) list * TcEnv ->
         TopAttribs * CheckedImplFile * TcEnv * bool * ModuleOrNamespaceType
 
+/// The defaults CheckImplFileTail applies to the inference variables left unsolved in the contents and attributes.
+val ApplyDefaults:
+    cenv: TcFileState ->
+    g: TcGlobals ->
+    denvAtEnd: FSharp.Compiler.TypedTreeOps.MemberRepresentation.DisplayEnv ->
+    m: range ->
+    moduleContents: ModuleOrNamespaceContents ->
+    extraAttribs: Attribs ->
+        unit
+
+/// What CheckImplFileTail solves, after its defaults, of the inference variables left in the contents and attributes.
+val SolveInternalUnknowns:
+    g: TcGlobals ->
+    cenv: TcFileState ->
+    denvAtEnd: FSharp.Compiler.TypedTreeOps.MemberRepresentation.DisplayEnv ->
+    moduleContents: ModuleOrNamespaceContents ->
+    extraAttribs: Attribs ->
+        unit
+
 [<Sealed; NoEquality; NoComparison>]
 type ImplFileScopeKind
 
