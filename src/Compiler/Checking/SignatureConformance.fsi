@@ -64,6 +64,12 @@ type SignatureRanges =
 type UndoableConformance =
     static member Recording: bool with get, set
 
+    /// When set, Isolate records in it, and only in it, how to undo what the conformance check it runs changes.
+    static member Log: ResizeArray<unit -> unit> | null with get, set
+
+    /// Runs a conformance check, recording in Log how to undo what it changes when Log is set.
+    static member Isolate: check: (unit -> 'T) -> 'T
+
 exception DefinitionsInSigAndImplNotCompatibleAbbreviationsDiffer of
     denv: DisplayEnv *
     implTycon: Tycon *

@@ -355,6 +355,11 @@ type internal Nesting =
         | InModules depth
         | ModuleHeader(depth, _) -> depth
 
+/// How to undo what the latest finish of a file changed in its declarations' typed trees, or null once undone.
+[<Sealed>]
+type internal FinishUndo() =
+    member val Log: ResizeArray<unit -> unit> | null = null with get, set
+
 /// An implementation file set up for checking its declarations one at a time.
 [<Sealed>]
 type FileStart
@@ -373,7 +378,7 @@ type FileStart
         rawDiagnostics: PhasedDiagnostic[]
     ) =
     let sync = obj ()
-    let mutable lastFinish: ResizeArray<unit -> unit> | null = null
+    let finishUndo = FinishUndo()
     let mutable lastShares: obj | null = null
 
     member internal _.Context = ctx
@@ -396,15 +401,18 @@ type FileStart
     /// Undoes what the latest finish changed in the declarations' typed trees, once.
     member internal _.UndoLastFinish() =
         lock sync (fun () ->
-            match lastFinish with
+            match finishUndo.Log with
             | null -> ()
             | log ->
                 // Cleared only after every action ran: they restore saved values, so after an exception part-way the
                 // next call can run them all again.
                 MutationLog.Undo log
-                lastFinish <- null)
+                finishUndo.Log <- null)
 
-    member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
+    member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = finishUndo.Log <- log
+
+    /// Under Sync.
+    member internal _.FinishUndo = finishUndo
 
 
     /// What the latest finish computed that the next one may reuse (a FinishShares), or null. Under Sync.
@@ -419,6 +427,7 @@ type DeclarationResult
         start: FileStart,
         declaration: ParsedDeclaration,
         fingerprint: string,
+        atCheck: string voption,
         diagnostics: FSharpDiagnostic[],
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
@@ -443,6 +452,10 @@ type DeclarationResult
     /// later declarations solving its inference variables, and only then: FileResult.Fingerprints has the final one,
     /// which differs from this one only when DependsOnLaterDeclarations.
     member _.Fingerprint = fingerprint
+    /// When FinishFile changes more of the declaration than the declarations after it see (see
+    /// DeclarationCheck.whileFinished), the fingerprint of what they see, as the check left it: Fingerprint and the final
+    /// fingerprint are this and the description of what the finish leaves.
+    member internal _.AtCheck = atCheck
     /// Provisional: the declaration's diagnostics filtered with the project's live options when it was checked,
     /// whose #nowarn scopes are those of whichever version of the file was parsed last. FileResult.Diagnostics is
     /// authoritative: FinishFile filters what the check reported with the scopes of the parse it is given, and
@@ -1419,117 +1432,85 @@ module internal DeclarationCheck =
         // Not describable: never equal to another fingerprint, so it always counts as changed.
         | None -> "?" + Guid.NewGuid().ToString("N")
 
-    /// The signature file's module or namespace at the compilation path, if it has one there.
-    let signatureAt (rootSig: ModuleOrNamespaceType) (compPath: CompilationPath) =
-        (Some rootSig, compPath.AccessPath)
-        ||> List.fold (fun sigTy (name, _) ->
-            sigTy |> Option.bind (fun (t: ModuleOrNamespaceType) ->
-                t.AllEntitiesByCompiledAndLogicalMangledNames.TryFind name |> Option.map _.ModuleOrNamespaceType))
+    /// Checks the file's implementation against its signature file as FinishFile's conformance check does, recording
+    /// how to undo what it writes into the implementation's items in a new log, which it returns. The diagnostics are
+    /// discarded: FinishFile reported them. For the readers of a finish that need the implementation as conformed:
+    /// FinishFile undoes its own conformance check before it takes the final fingerprints.
+    let conformFile (state: CompilerState) (ccu: CcuThunk) (qualNameOfFile: QualifiedNameOfFile) (rootSig: ModuleOrNamespaceType) (implTy: ModuleOrNamespaceType) =
+        let g = state.tcGlobals
+        let amap = state.tcImports.GetImportMap()
+        let infoReader = FSharp.Compiler.InfoReader.InfoReader(g, amap)
+        let denv = DisplayEnv.Empty g
+        let log = ResizeArray()
+        let outerLog = MutationLog.Current
+        let outerRecording = SignatureConformance.UndoableConformance.Recording
+        let outerKeep = SignatureConformance.SignatureRanges.Keep
+        MutationLog.Current <- log
+        SignatureConformance.UndoableConformance.Recording <- true
+        SignatureConformance.SignatureRanges.Keep <- true
 
-    /// The part of a signature that an implementation's items correspond to: the types and modules of the same names
-    /// (a module's contents in turn only those of the implementation's module) and the values of the same names and
-    /// enclosing types. What is left out is what a conformance check of the implementation alone would report as
-    /// missing and stop at.
-    let rec correspondingSignature (impl: ModuleOrNamespaceType) (sigTy: ModuleOrNamespaceType) =
-        let entities =
-            [ for e in impl.AllEntities do
-                  match sigTy.AllEntitiesByCompiledAndLogicalMangledNames.TryFind e.LogicalName with
-                  | Some s when s.IsModuleOrNamespace && e.IsModuleOrNamespace ->
-                      { s with entity_modul_type = MaybeLazy.Strict(correspondingSignature e.ModuleOrNamespaceType s.ModuleOrNamespaceType) }
-                  | Some s -> s
-                  | None -> () ]
+        try
+            try
+                use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+                let implSpec = wrapModuleOrNamespaceType qualNameOfFile.Id (compPathOfCcu ccu) implTy
 
-        let nameOf (v: Val) =
-            v.LogicalName, (if v.IsMember then Some v.MemberApparentEntity.LogicalName else None)
+                if SignatureConformance.CheckNamesOfModuleOrNamespace denv infoReader (mkLocalTyconRef implSpec) rootSig then
+                    let remapInfo, _ = ComputeRemappingFromInferredSignatureToExplicitSignature g implTy rootSig
+                    let aenv = { TypeEquivEnv.EmptyWithNullChecks g with EquivTycons = TyconRefMap.OfList remapInfo.RepackagedEntities }
 
-        let names = HashSet<string * string option>(impl.AllValsAndMembers |> Seq.map nameOf, HashIdentity.Structural)
-        let vals = sigTy.AllValsAndMembers |> Seq.filter (nameOf >> names.Contains) |> List.ofSeq
-        Construct.NewModuleOrNamespaceType sigTy.ModuleOrNamespaceKind entities vals
+                    SignatureConformance.Checker(g, amap, denv, remapInfo, true).CheckSignature aenv infoReader (mkLocalModuleRef implSpec) rootSig
+                    |> ignore
+            with RecoverableException _ ->
+                ()
 
-    /// Checks the declaration's contribution against the signature file's corresponding part, as FinishFile's
-    /// conformance check of the whole file does. Its diagnostics are FinishFile's to report.
-    let conformToSignature (g: TcGlobals) (cenv: TcFileState) (rootSig: ModuleOrNamespaceType) (envBefore: DeclEnv) (env: TcEnv) (contribution: ModuleOrNamespaceType) =
-        match signatureAt rootSig env.eCompPath with
-        | None -> ()
-        | Some sigTy ->
-            // Types the contribution's items mention from its own level and from each enclosing module's
-            let levels =
-                (env.eModuleOrNamespaceTypeAccumulator.Value, env.eCompPath)
-                :: [ for frame in envBefore.Frames -> frame.OuterEnv.eModuleOrNamespaceTypeAccumulator.Value, frame.OuterEnv.eCompPath ]
+            log
+        finally
+            MutationLog.Current <- outerLog
+            SignatureConformance.UndoableConformance.Recording <- outerRecording
+            SignatureConformance.SignatureRanges.Keep <- outerKeep
 
-            let remapInfo =
-                (SignatureRepackageInfo.Empty, levels)
-                ||> List.fold (fun acc (implTy, compPath) ->
-                    match signatureAt rootSig compPath with
-                    | Some levelSig ->
-                        let info, _ = ComputeRemappingFromInferredSignatureToExplicitSignature g implTy levelSig
+    /// The fingerprint of a declaration, from the fingerprint of what the declarations after it see and that of what
+    /// FinishFile leaves (see whileFinished): it changes when either does. One that is not describable stands for both.
+    let finishedFingerprint (atCheck: string voption) (finished: string) =
+        match atCheck with
+        | ValueNone -> finished
+        | ValueSome seen when seen.StartsWith "?" -> seen
+        | ValueSome _ when finished.StartsWith "?" -> finished
+        | ValueSome seen -> seen + "|finished|" + finished
 
-                        { RepackagedVals = info.RepackagedVals @ acc.RepackagedVals
-                          RepackagedEntities = info.RepackagedEntities @ acc.RepackagedEntities }
-                    | None -> acc)
-
-            let aenv = { TypeEquivEnv.EmptyWithNullChecks g with EquivTycons = TyconRefMap.OfList remapInfo.RepackagedEntities }
-            let impl = wrapModuleOrNamespaceType (ident ("conformance", range0)) env.eCompPath contribution
-
-            SignatureConformance.Checker(g, cenv.amap, env.DisplayEnv, remapInfo, true)
-                .CheckSignature aenv cenv.infoReader (mkLocalModuleRef impl) (correspondingSignature contribution sigTy)
-            |> ignore
-
-    /// Runs `f` while the declaration holds what FinishFile changes in it that no other declaration takes part in, then
-    /// undoes that, so the declarations after it are checked as checking the whole file checks them, and a fingerprint
-    /// taken in `f` is the one FinishFile takes:
-    /// - with `defaults` (its contents and attributes, for a declaration that left inference variables unsolved but
-    ///   depends on no later declaration), the file-end defaults solving them: no other declaration reaches them, as in
-    ///   the arguments of an attribute (`typedefof<Proxy<_>>`);
-    /// - for a file with a signature file, the conformance check, which gives a value the arity, argument names and
-    ///   attributes of its signature, and a type, union case, field or module the attributes of its signature.
-    /// FinishFile changes the same when its defaults and its conformance check succeed. The diagnostics are discarded:
-    /// FinishFile reports them.
+    /// Runs `f` while the declaration holds what FinishFile's defaults change in it, then undoes that, so the
+    /// declarations after it are checked as checking the whole file checks them: `defaults` (its contents and
+    /// attributes, for a declaration that left inference variables unsolved but depends on no later declaration) with
+    /// the file-end defaults solving them. No other declaration reaches them, as in the arguments of an attribute
+    /// (`typedefof<Proxy<_>>`), and FinishFile solves them the same way when its earlier defaults succeed. A fingerprint
+    /// taken in `f` describes what FinishFile leaves; the declarations after it see the variables unsolved, so the
+    /// cutoff for them also has a fingerprint taken outside `f` (finishedFingerprint keeps both). The diagnostics are
+    /// discarded: FinishFile reports them.
     let whileFinished
         (g: TcGlobals)
-        (cenv: TcFileState)
         (scratch: unit -> TcFileState)
-        (rootSigOpt: ModuleOrNamespaceType option)
-        (defaults: (ModuleOrNamespaceContents * Attribs) option)
-        (envBefore: DeclEnv)
+        (contents: ModuleOrNamespaceContents, attribs: Attribs)
         (env: TcEnv)
-        (contribution: ModuleOrNamespaceType)
         (f: unit -> 'T)
         : 'T =
-        if rootSigOpt.IsNone && defaults.IsNone then
+        let log = ResizeArray()
+        let outerLog = MutationLog.Current
+        MutationLog.Current <- log
+
+        try
+            (try
+                use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+                // A checker state of its own: what solving defers is not this check's to run
+                let scratch = scratch ()
+                ApplyDefaults scratch g env.DisplayEnv range0 contents attribs
+                SolveInternalUnknowns g scratch env.DisplayEnv contents attribs
+             with RecoverableException _ ->
+                ())
+
             f ()
-        else
-            let log = ResizeArray()
-            let outerLog = MutationLog.Current
-            let outerRecording = SignatureConformance.UndoableConformance.Recording
-            let outerKeep = SignatureConformance.SignatureRanges.Keep
-            MutationLog.Current <- log
-            SignatureConformance.UndoableConformance.Recording <- true
-            // The signature's items are shared with every file checked after it
-            SignatureConformance.SignatureRanges.Keep <- true
-
-            try
-                (try
-                    use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
-
-                    match defaults with
-                    | Some(contents, attribs) ->
-                        // A checker state of its own: what solving defers is not this check's to run
-                        let scratch = scratch ()
-                        ApplyDefaults scratch g env.DisplayEnv range0 contents attribs
-                        SolveInternalUnknowns g scratch env.DisplayEnv contents attribs
-                    | None -> ()
-
-                    rootSigOpt |> Option.iter (fun rootSig -> conformToSignature g cenv rootSig envBefore env contribution)
-                 with RecoverableException _ ->
-                    ())
-
-                f ()
-            finally
-                MutationLog.Undo log
-                MutationLog.Current <- outerLog
-                SignatureConformance.UndoableConformance.Recording <- outerRecording
-                SignatureConformance.SignatureRanges.Keep <- outerKeep
+        finally
+            MutationLog.Undo log
+            MutationLog.Current <- outerLog
 
     /// Whether any of the type parameters can still be solved. A rigid one, such as the declared 'T of
     /// `type Box<'T>(v: 'T)` that the environment after the type keeps, cannot: unifying it with another type, or
@@ -2522,24 +2503,34 @@ type DeclarationChecker =
         // variables in place (FindUnsolved), as the finish's defaults then find them
         let leavesUnsolved = leavesFreeTypars || DeclarationCheck.leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl
 
-        let fingerprint =
-            if decl.IsModuleHeader || not checks then
-                DeclarationCheck.fingerprintOf delta checkedDecl slots
-            else
-                let _, _, attribs = checkedDecl
-                let defaults = if leavesUnsolved && not dependsOnLater then Some(TMDefs contents, List.map snd attribs) else None
+        let fingerprint, atCheck =
+            let _, _, attribs = checkedDecl
+            let defaults = if leavesUnsolved && not dependsOnLater then Some(TMDefs contents, List.map snd attribs) else None
+
+            match defaults with
+            | Some defaults when not decl.IsModuleHeader && checks ->
+                // What the declarations after it see: the cutoff for them
+                let seen = DeclarationCheck.fingerprintOf delta checkedDecl slots
 
                 let scratch () =
                     let scratch, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
                     scratch
 
-                DeclarationCheck.whileFinished state.tcGlobals cenv scratch start.RootSigOpt defaults envBefore env delta (fun () ->
-                    DeclarationCheck.fingerprintOf delta checkedDecl slots)
+                let finished =
+                    DeclarationCheck.whileFinished state.tcGlobals scratch defaults env (fun () ->
+                        DeclarationCheck.fingerprintOf delta checkedDecl slots)
+
+                if String.Equals(seen, finished, StringComparison.Ordinal) then
+                    finished, ValueNone
+                else
+                    DeclarationCheck.finishedFingerprint (ValueSome seen) finished, ValueSome seen
+            | _ -> DeclarationCheck.fingerprintOf delta checkedDecl slots, ValueNone
 
         DeclarationResult(
             start,
             decl,
             fingerprint,
+            atCheck,
             DeclarationCheck.diagnosticsOf state start.Parse.FileName capturing,
             logger.Diagnostics,
             leavesFreeTypars,
@@ -2777,9 +2768,17 @@ type DeclarationChecker =
         DeclarationCheck.replayReferences start.Parse.FileName results
         endPhase "replay"
 
+        // The conformance check records what it writes into the implementation's items in a log of its own, undone
+        // once the diagnostics are rendered: no declaration of the file is checked against the conformed items, as
+        // none is in a full check, so the final fingerprints and every later check of the file see them unconformed
+        let conformance = ResizeArray()
+        let outerConformance = SignatureConformance.UndoableConformance.Log
+        SignatureConformance.UndoableConformance.Log <- conformance
+
         // Recovered from as CheckOneInput recovers in a full check, such as a default that fails where the tail does
         // not catch it (SolveInternalUnknowns): the file then adds nothing to the files after it.
         let tail =
+          try
             DeclarationCheck.leavingSignatureRanges start.Context.Checks parse start.RootSigOpt (fun () ->
                 try
                     let fileContents =
@@ -2789,6 +2788,8 @@ type DeclarationChecker =
                 with RecoverableException exn ->
                     errorRecovery exn range0
                     None)
+          finally
+            SignatureConformance.UndoableConformance.Log <- outerConformance
 
         endPhase "tail"
         let qualNameOfFile = file.QualifiedName
@@ -2801,6 +2802,26 @@ type DeclarationChecker =
 
         endPhase "typedUses"
 
+        let rendered =
+            Array.init results.Length (fun i ->
+                match shares[i], refilteredResults[i] with
+                | ValueSome share, _ -> share.Diagnostics
+                | _, ValueSome capturing -> DeclarationCheck.diagnosticsWith state options parse.FileName capturing
+                | ValueNone, ValueNone -> [||])
+
+        let diagnostics =
+            Array.concat
+                [ yield parse.Diagnostics
+                  yield DeclarationCheck.diagnosticsWith state options parse.FileName startDiagnostics
+                  yield! rendered
+                  yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
+            |> DeclarationCheck.projectDiagnostics start.Context
+
+        endPhase "render"
+
+        // What the render needed of the conformed items is taken
+        MutationLog.Undo conformance
+
         // While the finish's solutions are in effect: the next finish or declaration check undoes them
         let finalPrints =
             Array.init results.Length (fun i ->
@@ -2808,7 +2829,7 @@ type DeclarationChecker =
                 | ValueSome share -> share.Fingerprint
                 | ValueNone ->
                     let result = results[i]
-                    DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck)
+                    DeclarationCheck.finishedFingerprint result.AtCheck (DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck))
 
         let fingerprints = Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
@@ -2867,22 +2888,6 @@ type DeclarationChecker =
 
         endPhase "signature"
 
-        let rendered =
-            Array.init results.Length (fun i ->
-                match shares[i], refilteredResults[i] with
-                | ValueSome share, _ -> share.Diagnostics
-                | _, ValueSome capturing -> DeclarationCheck.diagnosticsWith state options parse.FileName capturing
-                | ValueNone, ValueNone -> [||])
-
-        let diagnostics =
-            Array.concat
-                [ yield parse.Diagnostics
-                  yield DeclarationCheck.diagnosticsWith state options parse.FileName startDiagnostics
-                  yield! rendered
-                  yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
-            |> DeclarationCheck.projectDiagnostics start.Context
-
-        endPhase "render"
 
         // The checker state the file's check results show it in, taken while the finish's solutions are in effect: the
         // signature it adds shares the declarations' inference variables
@@ -2908,6 +2913,17 @@ type DeclarationChecker =
         // Not the FileStart itself: a demoted file keeps only its FileResult
         let sync = start.Sync
         let checks = start.Context.Checks
+        let finishUndo = start.FinishUndo
+
+        // The results show the implementation as conformed to its signature file (argument names, attributes, xml
+        // docs from the signature), which the finish undid: it is applied again under the locks when they are built,
+        // and the next check of the file undoes it with the rest of the latest finish.
+        let reconform =
+            match start.RootSigOpt, tail with
+            | Some rootSig, Some(_, _, _, _, implTy) ->
+                let ccu = tcState.Ccu
+                Some(fun () -> DeclarationCheck.conformFile state ccu qualNameOfFile rootSig implTy)
+            | _ -> None
         let fileName = parse.FileName
         let dependencyFiles = parse.DependencyFiles
 
@@ -2922,6 +2938,15 @@ type DeclarationChecker =
                 (fun () ->
                     lock sync (fun () ->
                      lock (checks.FileLock fileName) (fun () ->
+                        match reconform with
+                        | Some conform ->
+                            let log = conform ()
+
+                            match finishUndo.Log with
+                            | null -> finishUndo.Log <- log
+                            | later -> later.AddRange log
+                        | _ -> ()
+
                         let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
                         DeclarationCheck.compiledNamesOf state resolutions implFileOpt
 

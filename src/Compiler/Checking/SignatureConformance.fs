@@ -64,6 +64,30 @@ type UndoableConformance =
         with get () = UndoableConformance.recording
         and set (value: bool) = UndoableConformance.recording <- value
 
+    [<System.ThreadStatic; DefaultValue>]
+    static val mutable private log: ResizeArray<unit -> unit> | null
+
+    /// When set, Isolate records in it, and only in it, how to undo what the conformance check it runs changes.
+    static member Log
+        with get () = UndoableConformance.log
+        and set (value: ResizeArray<unit -> unit> | null) = UndoableConformance.log <- value
+
+    /// Runs a conformance check, recording in Log how to undo what it changes when Log is set.
+    static member Isolate(check: unit -> 'T) : 'T =
+        match UndoableConformance.log with
+        | null -> check ()
+        | log ->
+            let outerLog = MutationLog.Current
+            let outerRecording = UndoableConformance.recording
+            MutationLog.Current <- log
+            UndoableConformance.recording <- true
+
+            try
+                check ()
+            finally
+                MutationLog.Current <- outerLog
+                UndoableConformance.recording <- outerRecording
+
 /// Records how to restore what conformance may change in an implementation item, while UndoableConformance.Recording.
 /// The optional data records are mutated in place, so copies are kept.
 module private ConformanceUndo =

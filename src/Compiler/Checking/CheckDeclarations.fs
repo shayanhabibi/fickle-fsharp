@@ -6306,7 +6306,8 @@ let CheckImplFileTail (cenv: cenv) checkForErrors (env: TcEnv) (rootSigOpt: Modu
         // Check the module matches the signature
         let implFileTy, implFileContents =
           conditionallySuppressErrorReporting (checkForErrors()) (fun () ->
-            CheckModuleSignature g cenv m denvAtEnd rootSigOpt implFileTypePriorToSig implFileSpecPriorToSig moduleContents fileName qualNameOfFile.Text)
+            SignatureConformance.UndoableConformance.Isolate (fun () ->
+                CheckModuleSignature g cenv m denvAtEnd rootSigOpt implFileTypePriorToSig implFileSpecPriorToSig moduleContents fileName qualNameOfFile.Text))
 
         do
           conditionallySuppressErrorReporting (checkForErrors()) (fun () ->
