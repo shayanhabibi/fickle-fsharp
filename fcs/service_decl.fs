@@ -401,6 +401,7 @@ type FileStart
 
     member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
 
+
     /// What the latest finish computed that the next one may reuse (a FinishShares), or null. Under Sync.
     member internal _.LastShares
         with get () = lastShares
@@ -417,6 +418,7 @@ type DeclarationResult
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
         dependsOnLater: bool,
+        leavesUnsolved: bool,
         slotsAtCheck: IReadOnlyDictionary<Val, SlotSig list * bool>,
         envAfter: DeclEnv,
         envAtEnd: TcEnv,
@@ -457,6 +459,11 @@ type DeclarationResult
     /// they use referenced, which the unused-value warning (FS1182) reads; FinishFile recomputes those marks from the
     /// current results (ruling R15), so they need no dependency.
     member _.DependsOnLaterDeclarations = dependsOnLater
+
+    /// Whether the check left an inference variable nothing has solved anywhere in what it checked, bodies included.
+    /// The finish's defaults solve such a variable, or not when an earlier default in the file fails, so what the
+    /// finish renders and takes for this result depends on the other declarations of the file.
+    member internal _.LeavesUnsolved = leavesUnsolved
 
     member _.EnvAfter = envAfter
 
@@ -525,7 +532,10 @@ type FileResult
     /// Built on first read, holding the file's check lock. CheckFile's are built by checking the file again with a
     /// sink in the setup it was checked in; that build raises InvalidOperationException, then and on every later
     /// read, when the file's line directives are no longer those of the parse it checked: a newer parse of another
-    /// text of the file replaced them. FinishFile's are built from what the finish captured.
+    /// text of the file replaced them. FinishFile's are built from what the finish captured, with the checker state
+    /// the finish gave; never while a later finish or declaration check on the same FileStart undoes the finish. Their
+    /// queries read the declarations' typed trees as they are when asked: after such a later finish or check, as it
+    /// left them, as for every result checked by declaration.
     member _.CheckResults = checkResults.Value
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
     /// refilter, leftovers, assemble, replay, tail, typedUses, fingerprints, signature, render, sinks. CheckFile's:
@@ -965,11 +975,18 @@ module internal DeclarationCheck =
             finally
                 SignatureConformance.SignatureRanges.Keep <- outer
 
-    /// Gives every value the resolutions name its compiled name now, under the file's check lock: a compiled name
-    /// some values get is generated on first read, from the file's counters, which a check of the file resets.
-    let compiledNamesOf (state: CompilerState) (resolutions: TcResolutions) =
+    /// Gives every value the resolutions name, and every value the checked file binds, its compiled name now, under the
+    /// file's check lock: a compiled name some values get is generated on first read, from the file's counters, which
+    /// a check of the file resets. Queries on the results, the implementation file's included, then read given names.
+    let compiledNamesOf (state: CompilerState) (resolutions: TcResolutions) (implFileOpt: CheckedImplFile option) =
         let globalState = state.tcGlobals.CompilerGlobalState
         let read (vref: ValRef) = if vref.IsLocalRef then vref.Deref.CompiledName globalState |> ignore
+
+        match implFileOpt with
+        | Some implFile ->
+            let folder = { ExprFolder0 with valBindingSiteIntercept = fun () (_, v: Val) -> v.CompiledName globalState |> ignore }
+            FoldImplFile folder () implFile
+        | None -> ()
 
         for resolution in resolutions.CapturedNameResolutions do
             match resolution.Item with
@@ -1029,7 +1046,7 @@ module internal DeclarationCheck =
                     leavingSignatureRanges checks parse rootSigOpt (fun () ->
                         checkImplFile state tcState rootSigOpt file parse logger (TcResultsSink.WithSink sink))
 
-                compiledNamesOf state (sink.GetResolutions())
+                compiledNamesOf state (sink.GetResolutions()) (checkedFile |> Option.map (fun (_, implFile, _, _, _) -> implFile))
                 rootSigOpt, checkedFile)
 
         refuseUnlessCurrentDirectives parse
@@ -1412,6 +1429,12 @@ module internal DeclarationCheck =
         || contents
            |> List.collect inlineBodies
            |> List.exists (fun (_, body) -> anySolvable (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars)
+
+    /// Whether what a declaration publishes, or anything it checked (every body, not only inline ones), holds an
+    /// inference variable nothing has solved.
+    let leavesUnsolved (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
+        anySolvable (freeInModuleTy contribution).FreeTypars
+        || contents |> List.exists (fun c -> anySolvable (freeInModuleOrNamespace CollectTyparsNoCaching c).FreeTyvars.FreeTypars)
 
     /// The stamps of every entity and value in a module type, including those inside its modules.
     let rec stampsOf (mty: ModuleOrNamespaceType) =
@@ -2378,6 +2401,7 @@ type DeclarationChecker =
             logger.Diagnostics,
             leavesFreeTypars,
             leavesFreeTypars || DeclarationCheck.leavesOpenTypes delta checkedDecl,
+            leavesFreeTypars || DeclarationCheck.leavesUnsolved delta checkedDecl,
             slots,
             envAfter,
             envAtEnd,
@@ -2492,10 +2516,12 @@ type DeclarationChecker =
     ///
     /// A result given to the previous finish on the same FileStart, rendered then with the same warning options and
     /// line directives, keeps what that finish computed for it: its final fingerprint, its finish TypedUses and its
-    /// rendered diagnostics (FileResult.Reused counts them). A result that DependsOnLaterDeclarations is computed
-    /// again every time: the defaults and the later declarations can change its types and messages. The other
-    /// results' types do not change after their check: nothing later solves anything in them. So is one whose final
-    /// fingerprint is not describable, which counts as changed every time.
+    /// rendered diagnostics (FileResult.Reused counts them). Computed again every time are a result that
+    /// DependsOnLaterDeclarations (later declarations solve its types in place), one whose check left an unsolved
+    /// inference variable anywhere in what it checked (LeavesUnsolved: the file-end defaults solve it, or stop at an
+    /// earlier failing default and leave it, so its messages depend on the rest of the file), and one whose final
+    /// fingerprint is not describable (it counts as changed every time). Every other result holds no variable any
+    /// whole-file pass of the finish can solve or rename, so what it computed for that result stays what it is.
     ///
     /// When every final fingerprint and the file's own fingerprint (for a file with a signature file, the signature
     /// file's) equal the previous finish's, for the same declarations, the result's Signature is the previous
@@ -2560,7 +2586,7 @@ type DeclarationChecker =
             results
             |> Array.map (fun result ->
                 match known with
-                | Some known when not result.DependsOnLaterDeclarations ->
+                | Some known when not result.DependsOnLaterDeclarations && not result.LeavesUnsolved ->
                     match known.TryGetValue result with
                     | true, share -> ValueSome share
                     | _ -> ValueNone
@@ -2715,12 +2741,32 @@ type DeclarationChecker =
 
         endPhase "render"
 
-        // Built on first read from what the finish leaves: the sinks, the environment at the file's end and its typed
-        // tree. Under the file's check lock, as CheckFile's are.
+        // The checker state the file's check results show it in, taken while the finish's solutions are in effect: the
+        // signature it adds shares the declarations' inference variables
+        let ccuSigForFile =
+            match implFileOpt with
+            | Some implFile ->
+                AddCheckResultsToTcState
+                    (state.tcGlobals,
+                     state.tcImports.GetImportMap(),
+                     start.RootSigOpt.IsSome,
+                     None,
+                     TcResultsSink.NoSink,
+                     tcState.TcEnvFromImpls,
+                     qualNameOfFile,
+                     implFile.Signature)
+                    tcState
+                |> fst
+            | None -> tcState.CcuSig
+
+        // The rest is built on first read from what the finish leaves: the sinks, the environment at the file's end and
+        // its typed tree, none of which a later finish or check replaces. Under the FileStart's lock, then the file's
+        // check lock, as the finish itself, so it never overlaps a later finish's undoing of this one.
+        // Not the FileStart itself: a demoted file keeps only its FileResult
+        let sync = start.Sync
         let checks = start.Context.Checks
         let fileName = parse.FileName
         let dependencyFiles = parse.DependencyFiles
-        let hasSig = start.RootSigOpt.IsSome
 
         let sinks =
             [ yield start.Sink
@@ -2731,25 +2777,10 @@ type DeclarationChecker =
         let checkResults =
             Lazy<FSharpCheckFileResults>(
                 (fun () ->
-                    lock (checks.FileLock fileName) (fun () ->
-                        let ccuSigForFile =
-                            match implFileOpt with
-                            | Some implFile ->
-                                AddCheckResultsToTcState
-                                    (state.tcGlobals,
-                                     state.tcImports.GetImportMap(),
-                                     hasSig,
-                                     None,
-                                     TcResultsSink.NoSink,
-                                     tcState.TcEnvFromImpls,
-                                     qualNameOfFile,
-                                     implFile.Signature)
-                                    tcState
-                                |> fst
-                            | None -> tcState.CcuSig
-
+                    lock sync (fun () ->
+                     lock (checks.FileLock fileName) (fun () ->
                         let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
-                        DeclarationCheck.compiledNamesOf state resolutions
+                        DeclarationCheck.compiledNamesOf state resolutions implFileOpt
 
                         let scope =
                             TypeCheckInfo(
@@ -2771,7 +2802,7 @@ type DeclarationChecker =
                                 openDeclarations
                             )
 
-                        FSharpCheckFileResults(fileName, diagnostics, Some scope, dependencyFiles, None, true))),
+                        FSharpCheckFileResults(fileName, diagnostics, Some scope, dependencyFiles, None, true)))),
                 LazyThreadSafetyMode.ExecutionAndPublication
             )
 
@@ -2779,7 +2810,7 @@ type DeclarationChecker =
 
         // A fingerprint that is not describable counts as changed every time, so it is taken again
         for i in 0 .. results.Length - 1 do
-            if not results[i].DependsOnLaterDeclarations && not (finalPrints[i].StartsWith "?") then
+            if not results[i].DependsOnLaterDeclarations && not results[i].LeavesUnsolved && not (finalPrints[i].StartsWith "?") then
                 kept[results[i]] <-
                     { Fingerprint = finalPrints[i]
                       Diagnostics = rendered[i]
