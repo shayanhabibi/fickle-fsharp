@@ -551,12 +551,16 @@ type FileResult
     /// sink in the setup it was checked in; that build raises InvalidOperationException, then and on every later
     /// read, when the file's line directives are no longer those of the parse it checked: a newer parse of another
     /// text of the file replaced them. FinishFile's are built from what the finish captured, with the checker state
-    /// the finish gave; never while a later finish or declaration check on the same FileStart undoes the finish. Their
-    /// queries read the declarations' typed trees as they are when asked: after such a later finish or check, as it
-    /// left them, as for every result checked by declaration.
+    /// the finish gave; never while a later finish or declaration check on the same FileStart undoes the finish. For a
+    /// file with a signature file, building them applies the conformance check to the implementation again (FinishFile
+    /// undid it), under the FileStart's lock and then the file's check lock, as a declaration check takes them. Their
+    /// queries read the declarations' typed trees as they are when asked: after a later finish or declaration check on
+    /// the same FileStart, as it left them, as for every result checked by declaration, so a superseded FileResult's
+    /// queries show the implementation unconformed (without the signature's argument names and xml docs) until the
+    /// next finish's results are built. Query the latest FileResult.
     member _.CheckResults = checkResults.Value
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
-    /// refilter, leftovers, assemble, replay, tail, typedUses, fingerprints, signature, render, sinks. CheckFile's:
+    /// refilter, leftovers, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
     /// setup, tail (the check), definitions, fingerprint, render.
     member _.PhaseTicks = phaseTicks
     /// The bytes the checking thread allocated in each part, as PhaseTicks names them.
@@ -2363,18 +2367,27 @@ type DeclarationChecker =
     /// those declarations are checked in the environment it leads to. So when a header is checked again, the module's
     /// declarations must be checked again after it. The first declaration after a module gives the module its
     /// contents so far as its type, as FinishFile does: the module's entity is shared, and the last of them wins.
+    /// Runs with the file's path in CheckDeclaration, after it undid the latest finish and before it takes the file's
+    /// check lock. For tests.
+    static member val AfterUndoHook: string -> unit = ignore with get, set
+
     static member CheckDeclaration(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         if decl.Depth > envBefore.Frames.Length then
             invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
-        start.UndoLastFinish()
+        // The undo and the check under the FileStart's lock, then the file's check lock, as FinishFile and the lazy
+        // check results take them: nothing that applies a finish's changes again (building the results applies the
+        // conformance check) runs between the undo and the check
+        lock start.Sync (fun () ->
+            start.UndoLastFinish()
+            DeclarationChecker.AfterUndoHook start.Parse.FileName
 
-        // The check gives the file's compiler-generated names, from the counters BeginFile reset, and so does its
-        // fingerprint (compiled names are given on first read): no other check of the file may run meanwhile. A check
-        // cancelled while it waited here does not run.
-        lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
-            ct.ThrowIfCancellationRequested()
-            DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct))
+            // The check gives the file's compiler-generated names, from the counters BeginFile reset, and so does its
+            // fingerprint (compiled names are given on first read): no other check of the file may run meanwhile. A
+            // check cancelled while it waited here does not run.
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                ct.ThrowIfCancellationRequested()
+                DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct)))
 
     static member private CheckDeclarationLocked(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         let state = start.Context.State
@@ -2562,6 +2575,11 @@ type DeclarationChecker =
         if decl.Depth > envBefore.Frames.Length then
             invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
+        // As CheckDeclaration: nothing applies a finish's changes again while it reads the declaration's items
+        lock result.Start.Sync (fun () -> DeclarationChecker.ExtendEnvLocked(envBefore, result))
+
+    static member private ExtendEnvLocked(envBefore: DeclEnv, result: DeclarationResult) : DeclEnv =
+        let decl = result.Declaration
         let start = result.Start
         start.UndoLastFinish()
         let state = start.Context.State
