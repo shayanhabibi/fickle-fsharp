@@ -1587,6 +1587,26 @@ type DeclarationChecker =
             ctx.SetLatestParse parse
             parse)
 
+    /// How many declarations Split gives for the parse, counted from the syntax tree alone: nothing is copied or keyed.
+    static member CountDeclarations(parse: FSharpParseFileResults) : int =
+        match parse.ParseTree with
+        | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
+        | ParsedInput.ImplFile file ->
+            // As Split: a named module that is not recursive is its header and its declarations, anything else one
+            let rec count (decls: SynModuleDecl list) =
+                decls
+                |> List.sumBy (fun decl ->
+                    match decl with
+                    | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(synType = Some _); isRecursive = false; decls = moduleDecls) ->
+                        1 + count moduleDecls
+                    | _ -> 1)
+
+            if DeclarationCheck.splitsFragment file then
+                let (SynModuleOrNamespace(decls = decls)) = List.exactlyOne file.Contents
+                count decls
+            else
+                file.Contents.Length
+
     static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] =
         match parse.ParseTree with
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
