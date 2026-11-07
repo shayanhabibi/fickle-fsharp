@@ -1869,10 +1869,10 @@ type DeclarationChecker =
             |> Array.mapi (fun idx input -> { Idx = idx; FileName = input.FileName; ParsedInput = input })
 
         let filePairs = FilePairMap files
-        let graph, _ = DependencyResolution.mkGraph filePairs files
 
         // The checker gives an implementation file its signature by qualified name, FilePairMap pairs them by file name
         let matched = HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        let unmatchedImplementations = HashSet<int>()
 
         for idx in 0 .. files.Length - 1 do
             if filePairs.IsSignature idx then
@@ -1880,6 +1880,25 @@ type DeclarationChecker =
 
                 if inputs[idx].QualifiedName.Text = inputs[impl].QualifiedName.Text then
                     matched.Add parses[idx].FileName |> ignore
+                else
+                    unmatchedImplementations.Add impl |> ignore
+
+        // The graph leaves an implementation file with a signature file out of the trie: no later file reads it. An
+        // unmatched one is checked as a file without a signature, and the files after it read its contents, so the
+        // graph is given the pairs without it. Its own edge to the signature file is added back below.
+        let graphPairs =
+            if unmatchedImplementations.Count = 0 then
+                filePairs
+            else
+                files
+                |> Array.map (fun file ->
+                    if unmatchedImplementations.Contains file.Idx then
+                        { file with FileName = file.FileName + "|unmatched" }
+                    else
+                        file)
+                |> FilePairMap
+
+        let graph, _ = DependencyResolution.mkGraph graphPairs files
 
         // By name, the files declaring an entity of that name, and those with a namespace of that name
         let entityFiles = Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
@@ -1911,6 +1930,9 @@ type DeclarationChecker =
             let dependencies = HashSet<int>()
             let pending = Stack<int>(graph[idx])
             let entities, namespaces = names[idx]
+
+            if unmatchedImplementations.Contains idx then
+                pending.Push(filePairs.GetSignatureIndex idx)
 
             for name in entities do
                 for other in Seq.append (filesOf entityFiles name) (filesOf namespaceFiles name) do
@@ -2022,8 +2044,9 @@ type DeclarationChecker =
             FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
-    /// state and accumulator, so calls may come in any order, again, or at the same time, without publishing into
-    /// the file setup or another result's module contents. It first undoes what the latest FinishFile on the same
+    /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
+    /// lock in turn, as every check of the file does), without publishing into the file setup or another result's
+    /// module contents. It first undoes what the latest FinishFile on the same
     /// FileStart changed in the earlier declarations, so it sees them as their checks left them.
     ///
     /// A check still changes earlier results in place, and nothing undoes that: it can solve the inference variables
@@ -2043,6 +2066,15 @@ type DeclarationChecker =
             invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
         start.UndoLastFinish()
+
+        // The check gives the file's compiler-generated names, from the counters BeginFile reset, and so does its
+        // fingerprint (compiled names are given on first read): no other check of the file may run meanwhile. A check
+        // cancelled while it waited here does not run.
+        lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+            ct.ThrowIfCancellationRequested()
+            DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct))
+
+    static member private CheckDeclarationLocked(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
@@ -2295,7 +2327,9 @@ type DeclarationChecker =
             MutationLog.Current <- log
 
             try
-                DeclarationChecker.Finish(start, results, parse)
+                // As CheckDeclaration: the finish and its fingerprints give the file's compiler-generated names. Taken
+                // inside the FileStart's lock, never the other way round (CheckDeclaration takes it after undoing).
+                lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () -> DeclarationChecker.Finish(start, results, parse))
             finally
                 MutationLog.Current <- outer
                 start.SetLastFinish log)
