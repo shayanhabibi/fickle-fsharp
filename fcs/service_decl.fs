@@ -1437,9 +1437,14 @@ module internal DeclarationCheck =
 
     /// Whether what a declaration publishes, or anything it checked (every body, not only inline ones), holds an
     /// inference variable nothing has solved.
-    let leavesUnsolved (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
+    ///
+    /// The variables are taken as the finish's defaults and SolveInternalUnknowns take theirs, with
+    /// FindUnsolved.UnsolvedTyparsOfModuleDef over the declaration's contents and attributes: every lambda parameter
+    /// and local value included. So whatever those passes could solve in this declaration makes it LeavesUnsolved.
+    let leavesUnsolved (state: CompilerState) (denv: DisplayEnv) (contribution: ModuleOrNamespaceType) ((contents, _, attribs): CheckedDeclaration) =
         anySolvable (freeInModuleTy contribution).FreeTypars
-        || contents |> List.exists (fun c -> anySolvable (freeInModuleOrNamespace CollectTyparsNoCaching c).FreeTyvars.FreeTypars)
+        || FindUnsolved.UnsolvedTyparsOfModuleDef state.tcGlobals (state.tcImports.GetImportMap()) denv (TMDefs contents) (List.map snd attribs)
+           |> List.exists (fun tp -> tp.Rigidity <> TyparRigidity.Rigid && not tp.IsSolved)
 
     /// The stamps of every entity and value in a module type, including those inside its modules.
     let rec stampsOf (mty: ModuleOrNamespaceType) =
@@ -2409,7 +2414,7 @@ type DeclarationChecker =
             logger.Diagnostics,
             leavesFreeTypars,
             leavesFreeTypars || DeclarationCheck.leavesOpenTypes delta checkedDecl,
-            leavesFreeTypars || DeclarationCheck.leavesUnsolved delta checkedDecl,
+            leavesFreeTypars || DeclarationCheck.leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl,
             slots,
             envAfter,
             envAtEnd,
