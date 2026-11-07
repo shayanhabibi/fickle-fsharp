@@ -141,6 +141,24 @@ type internal DependencySnapshot =
       /// whole project gives them
       ModuleNamesBefore: ModuleNamesDict[] }
 
+/// What the checks of a project share that does not reach its parses, so a lazily built result can hold it: the
+/// compiler state, a lock per file, and the test counter.
+[<Sealed>]
+type internal ProjectChecks(state: CompilerState) =
+    let fileLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+    let mutable checkResultsBuilt = 0
+    member _.State = state
+
+    /// Held from resetting a file's compiler-generated-name counters through the check that generates its names:
+    /// the counters are the project's, by file, so two checks of one file must not interleave there. Checks of
+    /// different files do not wait for each other.
+    member _.FileLock(fileName: string) = fileLocks.GetOrAdd(fileName, fun _ -> obj ())
+
+    member _.CheckResultsBuilt = Volatile.Read &checkResultsBuilt
+
+    member _.CountCheckResultsBuilt() =
+        Interlocked.Increment &checkResultsBuilt |> ignore
+
 /// A project's options, references and initial checking state.
 [<Sealed>]
 type ProjectContext internal (state: CompilerState) =
@@ -155,14 +173,12 @@ type ProjectContext internal (state: CompilerState) =
 
     let latestParses = System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
     let mutable dependencies: DependencySnapshot option = None
-    let mutable checkResultsBuilt = 0
+    let checks = ProjectChecks state
     member internal _.State = state
+    member internal _.Checks = checks
 
     /// For tests: how many times CheckFile's results on this context built a name-resolution sink and check results.
-    member _.CheckResultsBuilt = Volatile.Read &checkResultsBuilt
-
-    member internal _.CountCheckResultsBuilt() =
-        Interlocked.Increment &checkResultsBuilt |> ignore
+    member _.CheckResultsBuilt = checks.CheckResultsBuilt
 
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
@@ -198,7 +214,8 @@ type FileSignature
         apply: TcState -> TcState,
         moduleNamesDict: ModuleNamesDict,
         definitions: Map<Stamp, DeclarationRef>,
-        fingerprint: string
+        fingerprint: string,
+        moduleType: ModuleOrNamespaceType
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
     /// implementation file with a signature file, the signature file's. Unequal for anything not describable.
@@ -210,6 +227,8 @@ type FileSignature
     member internal _.ModuleNamesDict = moduleNamesDict
     /// The declaration defining each entity and value later files see of this file, by stamp
     member internal _.Definitions = definitions
+    /// The module type the file adds to the checker state, for tests
+    member internal _.ModuleType = moduleType
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
@@ -760,6 +779,14 @@ module internal DeclarationCheck =
         | true, directives -> directives
         | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be checked."
 
+    /// Raises InvalidOperationException unless the process's #line directives of the file are still the parse's. A
+    /// check reads them, and rendering a diagnostic applies them: a newer parse of another text of the file replaces
+    /// them, and that parse's are wrong for this one.
+    let refuseUnlessCurrentDirectives (parse: FSharpParseFileResults) =
+        if currentLineDirectives parse.FileName <> lineDirectivesOf parse then
+            invalidOp
+                $"%s{parse.FileName} cannot be checked: a newer parse of the file replaced the line directives of the text that was parsed."
+
     /// CheckOneImplFile on an implementation file set up by implFileState and enterImplFile, recovering from an error as
     /// CheckOneInput does, under the ambient logger.
     let checkImplFile (state: CompilerState) (tcState: TcState) rootSigOpt file (parse: FSharpParseFileResults) (logger: DiagnosticsLogger) sink =
@@ -787,28 +814,24 @@ module internal DeclarationCheck =
             None
 
     /// The check results of a file CheckFile checked without a sink: it is checked again, with one, in the same
-    /// setup. A check reads the process's #line directives of the file, so the build refuses unless they are still
-    /// the parse's, before and after the check. Its diagnostics are those of the first check, already rendered;
-    /// this check's are dropped.
-    let buildCheckResults (ctx: ProjectContext) before moduleNamesBefore (parse: FSharpParseFileResults) diagnostics =
-        let state = ctx.State
-        let directives = lineDirectivesOf parse
-
-        let refuseUnlessCurrent () =
-            if currentLineDirectives parse.FileName <> directives then
-                invalidOp
-                    $"The check results of %s{parse.FileName} cannot be built: a newer parse of the file replaced the line directives of the text that was checked."
-
-        refuseUnlessCurrent ()
+    /// setup. Like CheckFile, the build refuses (refuseUnlessCurrentDirectives) before and after the check. Its
+    /// diagnostics are those of the first check, already rendered; this check's are dropped.
+    let buildCheckResults (checks: ProjectChecks) before moduleNamesBefore (parse: FSharpParseFileResults) diagnostics =
+        let state = checks.State
+        refuseUnlessCurrentDirectives parse
         let tcState, _, input, file = implFileState state before moduleNamesBefore parse
         let _, logger = newLoggersWith (warnOptionsOf parse)
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-        let rootSigOpt = enterImplFile state tcState input file
         let sink = TcResultsSinkImpl(state.tcGlobals)
-        ctx.CountCheckResultsBuilt()
-        let checkedFile = checkImplFile state tcState rootSigOpt file parse logger (TcResultsSink.WithSink sink)
-        refuseUnlessCurrent ()
+        checks.CountCheckResultsBuilt()
+
+        let rootSigOpt, checkedFile =
+            lock (checks.FileLock parse.FileName) (fun () ->
+                let rootSigOpt = enterImplFile state tcState input file
+                rootSigOpt, checkImplFile state tcState rootSigOpt file parse logger (TcResultsSink.WithSink sink))
+
+        refuseUnlessCurrentDirectives parse
 
         let ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
             match checkedFile with
@@ -1442,11 +1465,18 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint)
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig)
 
     /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
     let failedFileSignature fileName moduleNamesDict =
-        FileSignature(fileName, id, moduleNamesDict, Map.empty, "?" + Guid.NewGuid().ToString("N"))
+        FileSignature(
+            fileName,
+            id,
+            moduleNamesDict,
+            Map.empty,
+            "?" + Guid.NewGuid().ToString("N"),
+            Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true)
+        )
 
 [<AbstractClass; Sealed>]
 type DeclarationChecker =
@@ -1619,23 +1649,29 @@ type DeclarationChecker =
             | ParsedInput.SigFile file ->
                 let _, logger = DeclarationCheck.newLoggers state
                 use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
-                ResetGeneratedNames(input, state)
                 let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
                 let amap = state.tcImports.GetImportMap()
 
-                let _, sigFileType, createsGeneratedProvidedTypes =
-                    CheckOneSigFile
-                        (state.tcGlobals,
-                         amap,
-                         tcState.Ccu,
-                         checkForErrors,
-                         DeclarationCheck.conditionalDefines state,
-                         TcResultsSink.NoSink,
-                         state.tcConfig.internalTestSpanStackReferring,
-                         state.tcConfig.diagnosticsOptions)
-                        tcState.TcEnvFromSignatures
-                        file
-                    |> Cancellable.runWithoutCancellation
+                // The fingerprint reads the compiled names of the file's values, which are given on first read
+                let sigFileType, createsGeneratedProvidedTypes, fingerprint =
+                    lock (ctx.Checks.FileLock parse.FileName) (fun () ->
+                        ResetGeneratedNames(input, state)
+
+                        let _, sigFileType, createsGeneratedProvidedTypes =
+                            CheckOneSigFile
+                                (state.tcGlobals,
+                                 amap,
+                                 tcState.Ccu,
+                                 checkForErrors,
+                                 DeclarationCheck.conditionalDefines state,
+                                 TcResultsSink.NoSink,
+                                 state.tcConfig.internalTestSpanStackReferring,
+                                 state.tcConfig.diagnosticsOptions)
+                                tcState.TcEnvFromSignatures
+                                file
+                            |> Cancellable.runWithoutCancellation
+
+                        sigFileType, createsGeneratedProvidedTypes, DeclarationCheck.signatureFingerprint sigFileType EmptyTopAttrs)
 
                 let qualNameOfFile = file.QualifiedName
                 let m = input.Range
@@ -1648,8 +1684,38 @@ type DeclarationChecker =
                     apply,
                     moduleNamesDict,
                     DeclarationCheck.signatureDefinitions parse.FileName sigFileType,
-                    DeclarationCheck.signatureFingerprint sigFileType EmptyTopAttrs
+                    fingerprint,
+                    sigFileType
                 )
+
+    /// For tests: each access path of the entities, values, fields and union cases in the signature's module type, as
+    /// the fingerprint writes it and as sprintf "%A" gives it.
+    static member AccessPathTexts(signature: FileSignature) : (string * string)[] =
+        let paths = ResizeArray<(string * ModuleOrNamespaceKind) list>()
+
+        let addAccess (TAccess compPaths) =
+            for compPath in compPaths do
+                paths.Add compPath.AccessPath
+
+        let rec walk (mty: ModuleOrNamespaceType) =
+            for v in mty.AllValsAndMembers do
+                addAccess v.Accessibility
+
+            for e in mty.AllEntities do
+                addAccess e.Accessibility
+                addAccess e.TypeReprAccessibility
+
+                for f in e.AllFieldsArray do
+                    addAccess f.Accessibility
+
+                for uc in e.UnionCasesArray do
+                    addAccess uc.Accessibility
+
+                if e.IsModuleOrNamespace then
+                    walk e.ModuleOrNamespaceType
+
+        walk signature.ModuleType
+        [| for path in paths -> SignatureFingerprint.accessPathText path, sprintf "%A" path |]
 
     static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclEnv =
         let state = ctx.State
@@ -1662,10 +1728,14 @@ type DeclarationChecker =
             let _, logger = DeclarationCheck.newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-            let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
             let sink = TcResultsSinkImpl(state.tcGlobals)
-            let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
-            let scope = EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file)
+
+            let rootSigOpt, cenv, scope =
+                lock (ctx.Checks.FileLock parse.FileName) (fun () ->
+                    let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
+                    let cenv, envFile, _ = DeclarationCheck.newCheckerState state tcState rootSigOpt file sink
+                    rootSigOpt, cenv, EnterImplFileDeclarations cenv envFile file (DeclarationCheck.splitsFragment file))
+
             let start =
                 FileStart(
                     ctx,
@@ -1799,50 +1869,59 @@ type DeclarationChecker =
                 phaseStart <- now
 
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
+            DeclarationCheck.refuseUnlessCurrentDirectives parse
             let options = DeclarationCheck.warnOptionsOf parse
             let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before moduleNamesBefore parse
             let capturing, logger = DeclarationCheck.newLoggersWith options
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-            let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
-            endPhase "setup"
-            let checkedFile = DeclarationCheck.checkImplFile state tcState rootSigOpt file parse logger TcResultsSink.NoSink
-            endPhase "tail"
 
+            // The fingerprint reads the compiled names of the file's values, which are given on first read
             let signature =
-                match checkedFile with
-                | Some(topAttrs, implFile, _, createsGeneratedProvidedTypes, _) ->
-                    // No declaration stands for what later files see of it, so the file does, as a signature file
-                    let definitions =
-                        match rootSigOpt with
-                        | Some _ -> Map.empty
-                        | None -> DeclarationCheck.signatureDefinitions parse.FileName implFile.Signature
+                lock (ctx.Checks.FileLock parse.FileName) (fun () ->
+                    let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
+                    endPhase "setup"
+                    let checkedFile = DeclarationCheck.checkImplFile state tcState rootSigOpt file parse logger TcResultsSink.NoSink
+                    endPhase "tail"
 
-                    endPhase "definitions"
-                    let fingerprint = DeclarationCheck.implFingerprint rootSigOpt implFile.Signature topAttrs
-                    endPhase "fingerprint"
+                    match checkedFile with
+                    | Some(topAttrs, implFile, _, createsGeneratedProvidedTypes, _) ->
+                        // No declaration stands for what later files see of it, so the file does, as a signature file
+                        let definitions =
+                            match rootSigOpt with
+                            | Some _ -> Map.empty
+                            | None -> DeclarationCheck.signatureDefinitions parse.FileName implFile.Signature
 
-                    DeclarationCheck.implFileSignature
-                        state
-                        parse.FileName
-                        file.QualifiedName
-                        implFile.Signature
-                        createsGeneratedProvidedTypes
-                        moduleNamesDict
-                        definitions
-                        fingerprint
-                | None -> DeclarationCheck.failedFileSignature parse.FileName moduleNamesDict
+                        endPhase "definitions"
+                        let fingerprint = DeclarationCheck.implFingerprint rootSigOpt implFile.Signature topAttrs
+                        endPhase "fingerprint"
+
+                        DeclarationCheck.implFileSignature
+                            state
+                            parse.FileName
+                            file.QualifiedName
+                            implFile.Signature
+                            createsGeneratedProvidedTypes
+                            moduleNamesDict
+                            definitions
+                            fingerprint
+                    | None -> DeclarationCheck.failedFileSignature parse.FileName moduleNamesDict)
 
             let diagnostics =
                 Array.append parse.Diagnostics (DeclarationCheck.diagnosticsWith state options parse.FileName capturing)
                 |> DeclarationCheck.projectDiagnostics ctx
 
             endPhase "render"
+            // The check and the rendering read the directives: neither may have seen a newer parse's
+            DeclarationCheck.refuseUnlessCurrentDirectives parse
 
-            // Holds the setup's inputs, not the setup it built from them, so the check state is not kept alive
+            // Holds the setup's inputs, not the setup it built from them, so the check state is not kept alive, and not
+            // the context, which reaches every parse of the project
+            let checks = ctx.Checks
+
             let checkResults =
                 Lazy<FSharpCheckFileResults>(
-                    (fun () -> DeclarationCheck.buildCheckResults ctx before moduleNamesBefore parse diagnostics),
+                    (fun () -> DeclarationCheck.buildCheckResults checks before moduleNamesBefore parse diagnostics),
                     LazyThreadSafetyMode.ExecutionAndPublication
                 )
 

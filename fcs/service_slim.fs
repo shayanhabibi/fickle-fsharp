@@ -125,8 +125,9 @@ module internal SignatureFingerprint =
     exception private NotDescribable
 
     /// What sprintf "%A" gave for each key, kept: the few flag and kind values a signature has are formatted over and
-    /// over, and formatting them was most of the cost of describing it. A struct tuple holds the key, as some values,
-    /// such as a union case represented by null, are null.
+    /// over, and formatting them was most of the cost of describing it. Only types with few values are kept, so the
+    /// tables stay small for the life of the process. A struct tuple holds the key, as some values, such as a union
+    /// case represented by null, are null.
     type private Shown<'K when 'K: equality>() =
         static member val Texts = Collections.Concurrent.ConcurrentDictionary<struct ('K * unit), string>(HashIdentity.Structural)
 
@@ -138,7 +139,8 @@ module internal SignatureFingerprint =
 
     let private shown (value: 'T) = shownBy value value
 
-    let private kindText (kind: ModuleOrNamespaceKind) =
+    /// sprintf "%A" of a module or namespace kind.
+    let kindText (kind: ModuleOrNamespaceKind) =
         match kind with
         | ModuleOrNamespaceKind.FSharpModuleWithSuffix -> "FSharpModuleWithSuffix"
         | ModuleOrNamespaceKind.ModuleOrType -> "ModuleOrType"
@@ -150,6 +152,24 @@ module internal SignatureFingerprint =
 
     /// sprintf "%b" of the value.
     let private flag (value: bool) = if value then "true" else "false"
+
+    /// sprintf "%A" of an access path, written out rather than kept: a project has a path for every module, and a
+    /// table of them would grow with every name ever typed. A path %A could break over lines, or whose names it
+    /// could escape, goes to sprintf.
+    let accessPathText (path: (string * ModuleOrNamespaceKind) list) =
+        let plain (name: string) =
+            name |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '_' || c = '.' || c = '\'' || c = '`')
+
+        if path |> List.forall (fst >> plain) then
+            let text =
+                "["
+                + (path |> List.map (fun (name, kind) -> "(\"" + name + "\", " + kindText kind + ")") |> String.concat "; ")
+                + "]"
+
+            // Well inside the width at which %A starts breaking a list
+            if text.Length <= 60 then text else sprintf "%A" path
+        else
+            sprintf "%A" path
 
     /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
     /// from 0 in the order they first appear. A member's implemented slots and whether it is implemented come from
@@ -287,7 +307,7 @@ module internal SignatureFingerprint =
 
         and access (TAccess paths) =
             add (string paths.Length)
-            for path in paths do add (shownBy (path.AccessPath |> List.map (fun (name, kind) -> name, kindText kind)) path.AccessPath)
+            for path in paths do add (accessPathText path.AccessPath)
 
         and attribs (l: Attribs) =
             add (string l.Length)
