@@ -124,6 +124,33 @@ module internal SignatureFingerprint =
 
     exception private NotDescribable
 
+    /// What sprintf "%A" gave for each key, kept: the few flag and kind values a signature has are formatted over and
+    /// over, and formatting them was most of the cost of describing it. A struct tuple holds the key, as some values,
+    /// such as a union case represented by null, are null.
+    type private Shown<'K when 'K: equality>() =
+        static member val Texts = Collections.Concurrent.ConcurrentDictionary<struct ('K * unit), string>(HashIdentity.Structural)
+
+    /// sprintf "%A" of the value, kept by a key that is equal only for values that print the same: the value itself
+    /// where its type's equality is structural, or else every part of it that printing shows (ModuleOrNamespaceKind
+    /// and SynMemberFlags have custom equality that ignores some of them).
+    let private shownBy (key: 'K) (value: 'T) =
+        Shown<'K>.Texts.GetOrAdd(struct (key, ()), fun _ -> sprintf "%A" value)
+
+    let private shown (value: 'T) = shownBy value value
+
+    let private kindText (kind: ModuleOrNamespaceKind) =
+        match kind with
+        | ModuleOrNamespaceKind.FSharpModuleWithSuffix -> "FSharpModuleWithSuffix"
+        | ModuleOrNamespaceKind.ModuleOrType -> "ModuleOrType"
+        | ModuleOrNamespaceKind.Namespace isExplicit -> if isExplicit then "Namespace true" else "Namespace false"
+
+    let private memberFlagsKey (flags: SynMemberFlags) =
+        flags.IsInstance, flags.IsDispatchSlot, flags.IsOverrideOrExplicitImpl, flags.IsFinal,
+        flags.GetterOrSetterIsCompilerGenerated, flags.MemberKind
+
+    /// sprintf "%b" of the value.
+    let private flag (value: bool) = if value then "true" else "false"
+
     /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
     /// from 0 in the order they first appear. A member's implemented slots and whether it is implemented come from
     /// `slotsOf`; None makes the module type not describable.
@@ -182,7 +209,7 @@ module internal SignatureFingerprint =
             add (string (evalAnonInfoIsStruct info))
             for name in info.SortedNames do add name
 
-        and nullnessOf (nullness: Nullness) = add (string (nullness.Evaluate()))
+        and nullnessOf (nullness: Nullness) = add (shown (nullness.Evaluate()))
 
         and measure (m: Measure) =
             match stripUnitEqns m with
@@ -209,7 +236,7 @@ module internal SignatureFingerprint =
                 let n = typarNumbers.Count
                 typarNumbers[tp] <- n
                 add ("'" + string n + " new")
-                add (sprintf "%A %A" tp.StaticReq tp.Kind)
+                add (shown tp.StaticReq + " " + shown tp.Kind)
                 add (string tp.Constraints.Length)
                 List.iter constr tp.Constraints
 
@@ -260,13 +287,13 @@ module internal SignatureFingerprint =
 
         and access (TAccess paths) =
             add (string paths.Length)
-            for path in paths do add (sprintf "%A" path.AccessPath)
+            for path in paths do add (shownBy (path.AccessPath |> List.map (fun (name, kind) -> name, kindText kind)) path.AccessPath)
 
         and attribs (l: Attribs) =
             add (string l.Length)
             for Attrib (tcref, _, args, namedArgs, appliedToAccessor, targets, _) in l do
                 add (fullDisplayTextOfTyconRef tcref)
-                add (sprintf "%b %A" appliedToAccessor targets)
+                add (flag appliedToAccessor + " " + shown targets)
                 add (string args.Length)
                 for AttribExpr (_, e) in args do attribExpr e
                 add (string namedArgs.Length)
@@ -352,7 +379,7 @@ module internal SignatureFingerprint =
             ty v.Type
             attribs v.Attribs
             optConstant v.LiteralValue
-            add (sprintf "%A %b %b %b" v.InlineInfo v.IsMutable v.IsCompilerGenerated v.IsExtensionMember)
+            add (shown v.InlineInfo + " " + flag v.IsMutable + " " + flag v.IsCompilerGenerated + " " + flag v.IsExtensionMember)
 
             match v.ValReprInfo with
             | Some (ValReprInfo (typarInfos, argGroups, result)) ->
@@ -371,7 +398,7 @@ module internal SignatureFingerprint =
                     | Some slots -> slots
                     | None -> raise NotDescribable
                 add (fullDisplayTextOfTyconRef memberInfo.ApparentEnclosingEntity)
-                add (sprintf "%A %b" memberInfo.MemberFlags isImplemented)
+                add (shownBy (memberFlagsKey memberInfo.MemberFlags) memberInfo.MemberFlags + " " + flag isImplemented)
                 add (string slotSigs.Length)
                 List.iter slotSig slotSigs
             | None -> add "-"
@@ -379,7 +406,7 @@ module internal SignatureFingerprint =
         and field (f: RecdField) =
             add f.LogicalName
             ty f.FormalType
-            add (sprintf "%b %b %b" f.IsMutable f.IsStatic f.IsVolatile)
+            add (flag f.IsMutable + " " + flag f.IsStatic + " " + flag f.IsVolatile)
             optConstant f.LiteralValue
             access f.Accessibility
             attribs f.PropertyAttribs
@@ -395,7 +422,7 @@ module internal SignatureFingerprint =
             typars e.Typars
 
             if e.IsModuleOrNamespace then
-                add (sprintf "%A" e.ModuleOrNamespaceType.ModuleOrNamespaceKind)
+                add (kindText e.ModuleOrNamespaceType.ModuleOrNamespaceKind)
                 moduleOrNamespace e.ModuleOrNamespaceType
             else
                 optTy e.TypeAbbrev
