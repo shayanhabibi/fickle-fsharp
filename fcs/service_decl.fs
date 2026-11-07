@@ -268,7 +268,8 @@ type FileSignature
         definitions: Map<Stamp, DeclarationRef>,
         fingerprint: Lazy<string>,
         moduleType: ModuleOrNamespaceType,
-        asImplementation: (TcState -> TcState) option
+        asImplementation: (TcState -> TcState) option,
+        failed: bool
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
     /// implementation file with a signature file, the signature file's. Unequal for anything not describable. A check
@@ -289,6 +290,10 @@ type FileSignature
     /// to the environment implementation files are checked in. A file set up from a signature file without the
     /// implementation file behind it sees the signature there, as in graph mode.
     member internal _.AsImplementation = asImplementation
+    /// Whether the implementation file's check failed with an error it recovered from (as CheckOneInput's
+    /// PartialResultOnError): the file then adds nothing to the files after it, its signature file's contents
+    /// included, so a file set up from that signature file sees it only once the implementation file is in its setup.
+    member _.Failed = failed
     /// Stands for the AsImplementation step among a setup's steps, as the FileSignature itself stands for Apply
     member val internal ArtificialKey = obj ()
 
@@ -1689,7 +1694,7 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None)
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None, false)
 
     /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
     let failedFileSignature fileName moduleNamesDict =
@@ -1698,9 +1703,11 @@ module internal DeclarationCheck =
             id,
             moduleNamesDict,
             Map.empty,
-            Lazy<string>.CreateFromValue("?" + Guid.NewGuid().ToString("N")),
+            // Every failed check of the file adds nothing, the same to every later file
+            Lazy<string>.CreateFromValue("!failed"),
             Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
-            None
+            None,
+            true
         )
 
 [<AbstractClass; Sealed>]
@@ -1941,7 +1948,8 @@ type DeclarationChecker =
                     DeclarationCheck.signatureDefinitions parse.FileName sigFileType,
                     Lazy<string>.CreateFromValue fingerprint,
                     sigFileType,
-                    Some asImplementation
+                    Some asImplementation,
+                    false
                 )
 
     /// For tests: each access path of the entities, values, fields and union cases in the signature's module type, as
