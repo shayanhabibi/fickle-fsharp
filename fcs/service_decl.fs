@@ -134,6 +134,17 @@ type ParsedDeclaration
 
 /// What FileDependencies computed from one parse of every file of the project.
 [<NoEquality; NoComparison>]
+/// A scoped `before` was refused because the dependency snapshot it would be checked against is not current for the
+/// file: FileDependencies has not been given this parse with the latest parse of every earlier file. Checking again
+/// with current dependencies, or every earlier file, is accepted.
+type StaleDependenciesException(message: string) =
+    inherit ArgumentException(message, "before")
+
+/// A check was refused because the process's #line directives of the file are not its parse's: a newer parse of
+/// another text of the file replaced them. The check is right once they are its parse's again.
+type SupersededLineDirectivesException(message: string) =
+    inherit InvalidOperationException(message)
+
 type internal DependencySnapshot =
     { Parses: FSharpParseFileResults[]
       Dependencies: int[][]
@@ -147,7 +158,19 @@ type internal DependencySnapshot =
 type internal ProjectChecks(state: CompilerState) =
     let fileLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
     let mutable checkResultsBuilt = 0
+
+    let fileIndexes =
+        let indexes = Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+        indexes
+
     member _.State = state
+
+    /// Whether `fileName` is a project file that comes before `other`.
+    member _.IsBefore(fileName: string, other: string) =
+        match fileIndexes.TryGetValue fileName, fileIndexes.TryGetValue other with
+        | (true, a), (true, b) -> a < b
+        | _ -> false
 
     /// Held from resetting a file's compiler-generated-name counters through the check that generates its names:
     /// the counters are the project's, by file, so two checks of one file must not interleave there. Checks of
@@ -215,7 +238,8 @@ type FileSignature
         moduleNamesDict: ModuleNamesDict,
         definitions: Map<Stamp, DeclarationRef>,
         fingerprint: string,
-        moduleType: ModuleOrNamespaceType
+        moduleType: ModuleOrNamespaceType,
+        asImplementation: (TcState -> TcState) option
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
     /// implementation file with a signature file, the signature file's. Unequal for anything not describable.
@@ -229,6 +253,10 @@ type FileSignature
     member internal _.Definitions = definitions
     /// The module type the file adds to the checker state, for tests
     member internal _.ModuleType = moduleType
+    /// For a signature file: what graph-mode checking's ArtificialImplFile node does, adding the signature's contents
+    /// to the environment implementation files are checked in. A file set up from a signature file without the
+    /// implementation file behind it sees the signature there, as in graph mode.
+    member internal _.AsImplementation = asImplementation
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
@@ -707,10 +735,8 @@ module internal DeclarationCheck =
                     | None -> Some snapshot.ModuleNamesBefore[idx]
                 | _ ->
                     raise (
-                        ArgumentException(
-                            $"The files before %s{parse.FileName} are not every earlier file, and FileDependencies has not been given this parse with the latest parse of every earlier file, so its dependencies are unknown.",
-                            nameof before
-                        )
+                        StaleDependenciesException
+                            $"The files before %s{parse.FileName} are not every earlier file, and FileDependencies has not been given this parse with the latest parse of every earlier file, so its dependencies are unknown."
                     )
 
     /// The file-level fingerprint of what later files see of a file.
@@ -725,8 +751,32 @@ module internal DeclarationCheck =
         | Some sigFileType -> signatureFingerprint sigFileType EmptyTopAttrs
         | None -> signatureFingerprint implFileSig topAttrs
 
-    let stateBefore (state: CompilerState) (before: FileSignature list) =
+    /// The checker state after `before`, for checking `fileName`. A signature file in `before` whose implementation
+    /// file comes before `fileName` but is not in `before` is also added to the implementation environment, as graph
+    /// mode's ArtificialImplFile node adds it, after every file in `before` (graph mode orders those nodes after the
+    /// physical files, in file order). So a file depending on a signature file need not wait for the implementation
+    /// file's check, and it still sees what a check of every earlier file would. A signature file whose
+    /// implementation comes later is not added: such a check would not see it.
+    let stateBefore (checks: ProjectChecks) (before: FileSignature list) (fileName: string) =
+        let state = checks.State
         let tcState = (state.tcInitialState, before) ||> List.fold (fun tcState signature -> signature.Apply tcState)
+
+        let present =
+            HashSet<string>(before |> Seq.map (fun signature -> signature.FileName), StringComparer.OrdinalIgnoreCase)
+
+        let implementationOf (signatureFile: string) = signatureFile.Substring(0, signatureFile.Length - 1)
+
+        let tcState =
+            (tcState, before)
+            ||> List.fold (fun tcState signature ->
+                match signature.AsImplementation with
+                | Some asImplementation when
+                    signature.FileName.EndsWith(".fsi", StringComparison.OrdinalIgnoreCase)
+                    && not (present.Contains(implementationOf signature.FileName))
+                    && checks.IsBefore(implementationOf signature.FileName, fileName)
+                    ->
+                    asImplementation tcState
+                | _ -> tcState)
 
         let moduleNamesDict =
             (Map.empty, before)
@@ -740,8 +790,8 @@ module internal DeclarationCheck =
 
     /// The checker state after `before` and the implementation file to check in it, as BeginFile and CheckFile set
     /// them up.
-    let implFileState (state: CompilerState) (before: FileSignature list) (moduleNamesBefore: ModuleNamesDict option) (parse: FSharpParseFileResults) =
-        let tcState, chainModuleNames = stateBefore state before
+    let implFileState (checks: ProjectChecks) (before: FileSignature list) (moduleNamesBefore: ModuleNamesDict option) (parse: FSharpParseFileResults) =
+        let tcState, chainModuleNames = stateBefore checks before parse.FileName
         let moduleNamesDict = defaultArg moduleNamesBefore chainModuleNames
         let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
@@ -779,13 +829,15 @@ module internal DeclarationCheck =
         | true, directives -> directives
         | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be checked."
 
-    /// Raises InvalidOperationException unless the process's #line directives of the file are still the parse's. A
+    /// Raises SupersededLineDirectivesException unless the process's #line directives of the file are still the parse's. A
     /// check reads them, and rendering a diagnostic applies them: a newer parse of another text of the file replaces
     /// them, and that parse's are wrong for this one.
     let refuseUnlessCurrentDirectives (parse: FSharpParseFileResults) =
         if currentLineDirectives parse.FileName <> lineDirectivesOf parse then
-            invalidOp
-                $"%s{parse.FileName} cannot be checked: a newer parse of the file replaced the line directives of the text that was parsed."
+            raise (
+                SupersededLineDirectivesException
+                    $"%s{parse.FileName} cannot be checked: a newer parse of the file replaced the line directives of the text that was parsed."
+            )
 
     /// CheckOneImplFile on an implementation file set up by implFileState and enterImplFile, recovering from an error as
     /// CheckOneInput does, under the ambient logger.
@@ -819,7 +871,7 @@ module internal DeclarationCheck =
     let buildCheckResults (checks: ProjectChecks) before moduleNamesBefore (parse: FSharpParseFileResults) diagnostics =
         let state = checks.State
         refuseUnlessCurrentDirectives parse
-        let tcState, _, input, file = implFileState state before moduleNamesBefore parse
+        let tcState, _, input, file = implFileState checks before moduleNamesBefore parse
         let _, logger = newLoggersWith (warnOptionsOf parse)
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
@@ -1465,7 +1517,7 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig)
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None)
 
     /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
     let failedFileSignature fileName moduleNamesDict =
@@ -1475,7 +1527,8 @@ module internal DeclarationCheck =
             moduleNamesDict,
             Map.empty,
             "?" + Guid.NewGuid().ToString("N"),
-            Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true)
+            Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
+            None
         )
 
 [<AbstractClass; Sealed>]
@@ -1640,7 +1693,7 @@ type DeclarationChecker =
         | ParsedInput.ImplFile _ -> invalidArg (nameof parse) "Expected a signature file."
         | ParsedInput.SigFile _ ->
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
-            let tcState, chainModuleNames = DeclarationCheck.stateBefore state before
+            let tcState, chainModuleNames = DeclarationCheck.stateBefore ctx.Checks before parse.FileName
             let moduleNamesDict = defaultArg moduleNamesBefore chainModuleNames
             let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
@@ -1679,23 +1732,34 @@ type DeclarationChecker =
                 let apply =
                     AddSignatureFileToTcState (state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
 
+                // As AddSignatureResultToTcImplEnv, which graph mode runs for an ArtificialImplFile node
+                let asImplementation (tcState: TcState) =
+                    match tcState.TryFindRootSig qualNameOfFile with
+                    | Some rootSig ->
+                        AddCheckResultsToTcState
+                            (state.tcGlobals, amap, true, None, TcResultsSink.NoSink, tcState.TcEnvFromImpls, qualNameOfFile, rootSig)
+                            tcState
+                        |> snd
+                    | None -> tcState
+
                 FileSignature(
                     parse.FileName,
                     apply,
                     moduleNamesDict,
                     DeclarationCheck.signatureDefinitions parse.FileName sigFileType,
                     fingerprint,
-                    sigFileType
+                    sigFileType,
+                    Some asImplementation
                 )
 
     /// For tests: each access path of the entities, values, fields and union cases in the signature's module type, as
     /// the fingerprint writes it and as sprintf "%A" gives it.
     static member AccessPathTexts(signature: FileSignature) : (string * string)[] =
-        let paths = ResizeArray<(string * ModuleOrNamespaceKind) list>()
+        let paths = ResizeArray<CompilationPath>()
 
         let addAccess (TAccess compPaths) =
             for compPath in compPaths do
-                paths.Add compPath.AccessPath
+                paths.Add compPath
 
         let rec walk (mty: ModuleOrNamespaceType) =
             for v in mty.AllValsAndMembers do
@@ -1715,7 +1779,7 @@ type DeclarationChecker =
                     walk e.ModuleOrNamespaceType
 
         walk signature.ModuleType
-        [| for path in paths -> SignatureFingerprint.accessPathText path, sprintf "%A" path |]
+        [| for path in paths -> SignatureFingerprint.accessPathText path, sprintf "%A" path.AccessPath |]
 
     static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclEnv =
         let state = ctx.State
@@ -1724,7 +1788,7 @@ type DeclarationChecker =
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
         | ParsedInput.ImplFile _ ->
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
-            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before moduleNamesBefore parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState ctx.Checks before moduleNamesBefore parse
             let _, logger = DeclarationCheck.newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
@@ -1755,8 +1819,8 @@ type DeclarationChecker =
 
     /// For each of the project's files, given in file order, the ascending indices of the earlier files checking it
     /// reads: the file dependency graph graph-mode checking builds, transitively closed. A file that depends on a
-    /// signature file also depends on its implementation file when that comes earlier: only checking the
-    /// implementation adds the signature's contents to the environment later implementation files are checked in.
+    /// signature file does not depend on its implementation file: the setup adds the signature's contents to the
+    /// implementation environment instead, as graph mode's ArtificialImplFile node does (see stateBefore).
     ///
     /// A file also depends on every earlier file that declares an entity of the same fully qualified name, or a
     /// namespace of a module's name (ruling R19, see DeclarationCheck.declaredNames): adding it to the checker state
@@ -1835,9 +1899,6 @@ type DeclarationChecker =
                     for transitive in closed[dependency] do
                         pending.Push transitive
 
-                    if filePairs.IsSignature dependency then
-                        pending.Push(filePairs.GetImplementationIndex dependency)
-
             closed[idx] <- dependencies |> Seq.sort |> Array.ofSeq
 
         ctx.Dependencies <-
@@ -1871,7 +1932,7 @@ type DeclarationChecker =
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
             DeclarationCheck.refuseUnlessCurrentDirectives parse
             let options = DeclarationCheck.warnOptionsOf parse
-            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState state before moduleNamesBefore parse
+            let tcState, moduleNamesDict, input, file = DeclarationCheck.implFileState ctx.Checks before moduleNamesBefore parse
             let capturing, logger = DeclarationCheck.newLoggersWith options
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
