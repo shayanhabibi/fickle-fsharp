@@ -52,6 +52,12 @@ exception InterfaceNotRevealed of DisplayEnv * TType * range
 
 exception ArgumentsInSigAndImplMismatch of sigArg: Ident * implArg: Ident
 
+/// Whether conformance checks on this thread leave the other ranges of the signature's items as they are, writing
+/// only the implementation's: the signature's items are shared with every file checked after the signature.
+[<Sealed; AbstractClass>]
+type SignatureRanges =
+    static member Keep: bool with get, set
+
 exception DefinitionsInSigAndImplNotCompatibleAbbreviationsDiffer of
     denv: DisplayEnv *
     implTycon: Tycon *

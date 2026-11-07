@@ -42,6 +42,17 @@ exception InterfaceNotRevealed of DisplayEnv * TType * range
 
 exception ArgumentsInSigAndImplMismatch of sigArg: Ident * implArg: Ident
 
+/// Whether conformance checks on this thread leave the other ranges of the signature's items as they are, writing
+/// only the implementation's: the signature's items are shared with every file checked after the signature.
+[<Sealed; AbstractClass>]
+type SignatureRanges =
+    [<System.ThreadStatic; DefaultValue>]
+    static val mutable private keep: bool
+
+    static member Keep
+        with get () = SignatureRanges.keep
+        and set (value: bool) = SignatureRanges.keep <- value
+
 type private V = WellKnownValAttributes
 type private E = WellKnownEntityAttributes
 
@@ -307,7 +318,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
             implTycon.SetOtherXmlDoc(sigTycon.XmlDoc)
 
             // Propagate defn location information from implementation to signature .
-            sigTycon.SetOtherRange (implTycon.Range, true)
+            if not SignatureRanges.Keep then sigTycon.SetOtherRange (implTycon.Range, true)
             implTycon.SetOtherRange (sigTycon.Range, false)
 
             checkEnforcedEntityAttribs implTycon sigTycon m
@@ -477,7 +488,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
                               requireImplAttribute WellKnownValAttributes.OptimizeClosureIfNotInlinedAttribute FSComp.SR.implMissingOptimizeClosureIfNotInlined
 
                               implArgInfo.OtherRange <- sigArgInfo.Name |> Option.map (fun ident -> ident.idRange)
-                              sigArgInfo.OtherRange <- implArgInfo.Name |> Option.map (fun ident -> ident.idRange)
+                              if not SignatureRanges.Keep then sigArgInfo.OtherRange <- implArgInfo.Name |> Option.map (fun ident -> ident.idRange)
 
                               implArgInfo.Name <- implArgInfo.Name |> Option.orElse sigArgInfo.Name
                               implArgInfo.Attribs <- WellKnownValAttribs.Create(attribs)))) &&
@@ -492,7 +503,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
         and checkVal implModRef (aenv: TypeEquivEnv) (infoReader: InfoReader) (implVal: Val) (sigVal: Val) =
 
             // Propagate defn location information from implementation to signature .
-            sigVal.SetOtherRange (implVal.Range, true)
+            if not SignatureRanges.Keep then sigVal.SetOtherRange (implVal.Range, true)
             implVal.SetOtherRange (sigVal.Range, false)
             implVal.SetOtherXmlDoc(sigVal.XmlDoc)
 
@@ -551,7 +562,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
             implUnionCase.SetOtherXmlDoc(sigUnionCase.XmlDoc)
 
             let err f = errorR(UnionCaseNotContained(denv, infoReader, enclosingImplTycon, implUnionCase, sigUnionCase, f));false
-            sigUnionCase.OtherRangeOpt <- Some (implUnionCase.Range, true)
+            if not SignatureRanges.Keep then sigUnionCase.OtherRangeOpt <- Some (implUnionCase.Range, true)
             implUnionCase.OtherRangeOpt <- Some (sigUnionCase.Range, false)
             if implUnionCase.Id.idText <> sigUnionCase.Id.idText then  err FSComp.SR.ModuleContainsConstructorButNamesDiffer
             elif implUnionCase.RecdFieldsArray.Length <> sigUnionCase.RecdFieldsArray.Length then err FSComp.SR.ModuleContainsConstructorButDataFieldsDiffer
@@ -577,7 +588,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
                     not strictTyEquals
 
 
-            sigField.rfield_other_range <- Some (implField.Range, true)
+            if not SignatureRanges.Keep then sigField.rfield_other_range <- Some (implField.Range, true)
             implField.rfield_other_range <- Some (sigField.Range, false)
             if implField.rfield_id.idText <> sigField.rfield_id.idText then err FSComp.SR.FieldNotContainedNamesDiffer
             elif isLessAccessible implField.Accessibility sigField.Accessibility then err FSComp.SR.FieldNotContainedAccessibilitiesDiffer
@@ -894,7 +905,7 @@ type Checker(g, amap, denv, remapInfo: SignatureRepackageInfo, checkingSig) =
         and checkModuleOrNamespace aenv (infoReader: InfoReader) implModRef sigModRef =
             implModRef.SetOtherXmlDoc(sigModRef.XmlDoc)
             // Propagate defn location information from implementation to signature .
-            sigModRef.SetOtherRange (implModRef.Range, true)
+            if not SignatureRanges.Keep then sigModRef.SetOtherRange (implModRef.Range, true)
             implModRef.Deref.SetOtherRange (sigModRef.Range, false)
             checkEnforcedEntityAttribs implModRef.Deref sigModRef implModRef.Range
             checkModuleOrNamespaceContents implModRef.Range aenv infoReader implModRef sigModRef.ModuleOrNamespaceType &&

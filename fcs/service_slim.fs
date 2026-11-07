@@ -176,6 +176,21 @@ module internal SignatureFingerprint =
         else
             longAccessPaths.GetValue(compPath, fun compPath -> sprintf "%A" compPath.AccessPath)
 
+    /// A compiler-generated name (basic@line, then -n for the n-th earlier name of that basic name) without its count:
+    /// a check numbers the names over what it checks, so a file checked whole and the same file checked one
+    /// declaration at a time number them differently. Nothing outside the file can name such a value or field.
+    let private generatedName (name: string) =
+        let at = name.LastIndexOf '@'
+        let dash = if at < 0 then -1 else name.IndexOf('-', at)
+
+        let digits (first: int) (last: int) =
+            first <= last && Seq.forall Char.IsDigit (name.Substring(first, last - first + 1))
+
+        if dash > at && digits (at + 1) (dash - 1) && digits (dash + 1) (name.Length - 1) then
+            name.Substring(0, dash)
+        else
+            name
+
     /// Describes a module type, then the given inline values' bodies, with type parameters and local values numbered
     /// from 0 in the order they first appear. A member's implemented slots and whether it is implemented come from
     /// `slotsOf`; None makes the module type not describable.
@@ -398,7 +413,7 @@ module internal SignatureFingerprint =
 
         and value (v: Val) =
             add "val"
-            add v.LogicalName
+            add (if v.IsCompilerGenerated then generatedName v.LogicalName else v.LogicalName)
             add (defaultArg v.ValCompiledName "-")
             access v.Accessibility
             ty v.Type
@@ -429,7 +444,7 @@ module internal SignatureFingerprint =
             | None -> add "-"
 
         and field (f: RecdField) =
-            add f.LogicalName
+            add (if f.IsCompilerGenerated then generatedName f.LogicalName else f.LogicalName)
             ty f.FormalType
             add (flag f.IsMutable + " " + flag f.IsStatic + " " + flag f.IsVolatile)
             optConstant f.LiteralValue

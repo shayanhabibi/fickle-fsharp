@@ -155,11 +155,24 @@ type internal DependencySnapshot =
       /// implementation file gives it that signature, so a setup can stand the signature in for it
       MatchedSignatures: HashSet<string> }
 
+/// A checker state some setup reached: the initial state, with the steps on the path to it applied in order. The state
+/// after one more step is kept while the step's key (the FileSignature it applies) is alive.
+[<Sealed>]
+type internal SetupNode(state: TcState) =
+    let after = ConditionalWeakTable<obj, SetupNode>()
+
+    member _.State = state
+
+    member _.After(key: obj, step: TcState -> TcState) : SetupNode =
+        after.GetValue(key, ConditionalWeakTable<obj, SetupNode>.CreateValueCallback(fun _ -> SetupNode(step state)))
+
 /// What the checks of a project share that does not reach its parses, so a lazily built result can hold it: the
-/// compiler state, a lock per file, and the test counter.
+/// compiler state, a lock per file, the setups reached, and the test counter.
 [<Sealed>]
 type internal ProjectChecks(state: CompilerState) =
     let fileLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+    let latestParses = System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
+    let setupRoot = SetupNode state.tcInitialState
     let mutable checkResultsBuilt = 0
 
     let fileIndexes =
@@ -168,6 +181,9 @@ type internal ProjectChecks(state: CompilerState) =
         indexes
 
     member _.State = state
+
+    /// The initial checker state, from which each setup's steps, in file order, lead to the states setups reached
+    member _.SetupRoot = setupRoot
 
     /// The project file's index, or -1.
     member _.IndexOf(fileName: string) =
@@ -186,6 +202,14 @@ type internal ProjectChecks(state: CompilerState) =
     /// different files do not wait for each other.
     member _.FileLock(fileName: string) = fileLocks.GetOrAdd(fileName, fun _ -> obj ())
 
+    /// The latest parse Parse made of each file, set while the file's parse lock is held.
+    member _.SetLatestParse(parse: FSharpParseFileResults) = latestParses[parse.FileName] <- parse
+
+    member _.LatestParse(fileName: string) =
+        match latestParses.TryGetValue fileName with
+        | true, parse -> Some parse
+        | _ -> None
+
     member _.CheckResultsBuilt = Volatile.Read &checkResultsBuilt
 
     member _.CountCheckResultsBuilt() =
@@ -203,7 +227,6 @@ type ProjectContext internal (state: CompilerState) =
         state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
         indexes
 
-    let latestParses = System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
     let mutable dependencies: DependencySnapshot option = None
     let checks = ProjectChecks state
     member internal _.State = state
@@ -225,12 +248,9 @@ type ProjectContext internal (state: CompilerState) =
     member internal _.SourceFiles = state.projectOptions.SourceFiles
 
     /// The latest parse Parse made of each file, set while the file's parse lock is held.
-    member internal _.SetLatestParse(parse: FSharpParseFileResults) = latestParses[parse.FileName] <- parse
+    member internal _.SetLatestParse(parse: FSharpParseFileResults) = checks.SetLatestParse parse
 
-    member internal _.LatestParse(fileName: string) =
-        match latestParses.TryGetValue fileName with
-        | true, parse -> Some parse
-        | _ -> None
+    member internal _.LatestParse(fileName: string) = checks.LatestParse fileName
 
     /// What the latest FileDependencies computed. A reference, so reads and writes are atomic.
     member internal _.Dependencies
@@ -246,13 +266,16 @@ type FileSignature
         apply: TcState -> TcState,
         moduleNamesDict: ModuleNamesDict,
         definitions: Map<Stamp, DeclarationRef>,
-        fingerprint: string,
+        fingerprint: Lazy<string>,
         moduleType: ModuleOrNamespaceType,
         asImplementation: (TcState -> TcState) option
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
-    /// implementation file with a signature file, the signature file's. Unequal for anything not describable.
-    member _.Fingerprint = fingerprint
+    /// implementation file with a signature file, the signature file's. Unequal for anything not describable. A check
+    /// told nothing reads it takes it on first read.
+    member _.Fingerprint = fingerprint.Value
+    /// Whether the fingerprint has been taken: comparing it otherwise takes it.
+    member _.HasFingerprint = fingerprint.IsValueCreated
     member internal _.FileName = fileName
     member internal _.Apply tcState = apply tcState
     /// The module-name dictionary DeduplicateParsedInputModuleName gave for this file: every earlier file's entries
@@ -266,6 +289,8 @@ type FileSignature
     /// to the environment implementation files are checked in. A file set up from a signature file without the
     /// implementation file behind it sees the signature there, as in graph mode.
     member internal _.AsImplementation = asImplementation
+    /// Stands for the AsImplementation step among a setup's steps, as the FileSignature itself stands for Apply
+    member val internal ArtificialKey = obj ()
 
 type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
@@ -344,6 +369,7 @@ type FileStart
     ) =
     let sync = obj ()
     let mutable lastFinish: ResizeArray<unit -> unit> | null = null
+    let mutable lastShares: obj | null = null
 
     member internal _.Context = ctx
     /// The parse the file was set up from.
@@ -374,6 +400,11 @@ type FileStart
                 lastFinish <- null)
 
     member internal _.SetLastFinish(log: ResizeArray<unit -> unit>) = lastFinish <- log
+
+    /// What the latest finish computed that the next one may reuse (a FinishShares), or null. Under Sync.
+    member internal _.LastShares
+        with get () = lastShares
+        and set (shares: obj | null) = lastShares <- shares
 
 [<Sealed>]
 type DeclarationResult
@@ -481,20 +512,58 @@ type FileResult
         fingerprints: IReadOnlyDictionary<DeclarationKey, string>,
         signature: FileSignature,
         checkResults: Lazy<FSharpCheckFileResults>,
-        phaseTicks: IReadOnlyDictionary<string, int64>
+        phaseTicks: IReadOnlyDictionary<string, int64>,
+        phaseAllocated: IReadOnlyDictionary<string, int64>,
+        reused: int
     ) =
     member _.Diagnostics = diagnostics
     /// Each declaration's fingerprint after the file's inference scope is closed.
     member _.Fingerprints = fingerprints
+    /// FinishFile's is the previous finish's object, on the same FileStart, when every final fingerprint and the
+    /// file's own fingerprint are unchanged from it.
     member _.Signature = signature
-    /// CheckFile's are built on first read, by checking the file again with a sink in the setup it was checked in.
-    /// That build raises InvalidOperationException, then and on every later read, when the file's line directives
-    /// are no longer those of the parse it checked: a newer parse of another text of the file replaced them.
+    /// Built on first read, holding the file's check lock. CheckFile's are built by checking the file again with a
+    /// sink in the setup it was checked in; that build raises InvalidOperationException, then and on every later
+    /// read, when the file's line directives are no longer those of the parse it checked: a newer parse of another
+    /// text of the file replaced them. FinishFile's are built from what the finish captured.
     member _.CheckResults = checkResults.Value
-    /// Stopwatch ticks of each part of the finish, in source order: refilter, leftovers, assemble, replay, tail,
-    /// typedUses, signature, render, fingerprints, sinks. CheckFile's: setup, tail (the check), definitions,
-    /// fingerprint, render.
+    /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
+    /// refilter, leftovers, assemble, replay, tail, typedUses, fingerprints, signature, render, sinks. CheckFile's:
+    /// setup, tail (the check), definitions, fingerprint, render.
     member _.PhaseTicks = phaseTicks
+    /// The bytes the checking thread allocated in each part, as PhaseTicks names them.
+    member _.PhaseAllocated = phaseAllocated
+    /// How many results' final fingerprint, finish TypedUses and rendered diagnostics came from the previous finish
+    /// of the same FileStart. For tests; 0 for CheckFile.
+    member _.Reused = reused
+
+/// What a finish rendered and fingerprinted for one result.
+[<NoEquality; NoComparison>]
+type internal FinishShare =
+    { Fingerprint: string
+      Diagnostics: FSharpDiagnostic[]
+      ErrorCount: int }
+
+/// What the latest finish of a FileStart computed that the next finish of it may reuse: per result given to it, by
+/// reference, for the options and line directives it rendered with; and its signature, for the keys and
+/// fingerprints it had.
+[<Sealed>]
+type internal FinishShares
+    (
+        options: FSharpDiagnosticOptions,
+        directives: (int * (int * int)) list,
+        shares: Dictionary<DeclarationResult, FinishShare>,
+        keys: DeclarationKey[],
+        fingerprints: string[],
+        signature: FileSignature option
+    ) =
+    member _.Options = options
+    member _.Directives = directives
+    member _.Shares = shares
+    member _.Keys = keys
+    member _.Fingerprints = fingerprints
+    /// None when the finish's tail failed
+    member _.Signature = signature
 
 module internal DeclarationCheck =
 
@@ -768,8 +837,6 @@ module internal DeclarationCheck =
     /// lists of the others); a signature file whose implementation comes later is not added either: such a check
     /// would not see it.
     let stateBefore (checks: ProjectChecks) (before: FileSignature list) (matched: HashSet<string> option) (fileName: string) =
-        let state = checks.State
-
         let present =
             HashSet<string>(before |> Seq.map (fun signature -> signature.FileName), StringComparer.OrdinalIgnoreCase)
 
@@ -783,24 +850,30 @@ module internal DeclarationCheck =
                       && not (present.Contains(implementationOf signature.FileName))
                       && checks.IsBefore(implementationOf signature.FileName, fileName)
                       ->
-                      yield checks.IndexOf(implementationOf signature.FileName), asImplementation
+                      yield checks.IndexOf(implementationOf signature.FileName), signature.ArtificialKey, asImplementation
                   | _ -> () ]
 
         // In file order, each step where its file is: the environments layer what they hold in the order a check of
         // every earlier file adds it (AutoOpen modules and extension members shadow by it)
         let steps =
-            [ for signature in before -> checks.IndexOf signature.FileName, signature.Apply ] @ artificial
-            |> List.sortBy fst
+            [ for signature in before -> checks.IndexOf signature.FileName, box signature, (fun tcState -> signature.Apply tcState) ]
+            @ artificial
+            |> List.sortBy (fun (index, _, _) -> index)
 
-        let tcState = (state.tcInitialState, steps) ||> List.fold (fun tcState (_, step) -> step tcState)
+        // From the states the setups before reached: one setup's steps are mostly a prefix of another's
+        let tcState =
+            (checks.SetupRoot, steps)
+            ||> List.fold (fun (node: SetupNode) (_, key, step) -> node.After(key, step))
+            |> _.State
 
         let moduleNamesDict =
-            (Map.empty, before)
-            ||> List.fold (fun (acc: ModuleNamesDict) signature ->
-                (acc, signature.ModuleNamesDict)
-                ||> Map.fold (fun acc qualifiedName files ->
-                    let known = acc |> Map.tryFind qualifiedName |> Option.defaultValue Map.empty
-                    acc |> Map.add qualifiedName (Map.foldBack Map.add files known)))
+            lazy
+                ((Map.empty, before)
+                 ||> List.fold (fun (acc: ModuleNamesDict) signature ->
+                     (acc, signature.ModuleNamesDict)
+                     ||> Map.fold (fun acc qualifiedName files ->
+                         let known = acc |> Map.tryFind qualifiedName |> Option.defaultValue Map.empty
+                         acc |> Map.add qualifiedName (Map.foldBack Map.add files known))))
 
         tcState, moduleNamesDict
 
@@ -808,7 +881,7 @@ module internal DeclarationCheck =
     /// them up.
     let implFileState (checks: ProjectChecks) (before: FileSignature list) (scoped: (ModuleNamesDict * HashSet<string>) option) (parse: FSharpParseFileResults) =
         let tcState, chainModuleNames = stateBefore checks before (Option.map snd scoped) parse.FileName
-        let moduleNamesDict = scoped |> Option.map fst |> Option.defaultValue chainModuleNames
+        let moduleNamesDict = scoped |> Option.map fst |> Option.defaultWith chainModuleNames.Force
         let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
         match input with
@@ -855,6 +928,60 @@ module internal DeclarationCheck =
                     $"%s{parse.FileName} cannot be checked: a newer parse of the file replaced the line directives of the text that was parsed."
             )
 
+    /// Whether diagnostics filtered and rendered with one parse's options are those another parse's give: the same
+    /// warning options and #nowarn scopes.
+    let sameWarnOptions (a: FSharpDiagnosticOptions) (b: FSharpDiagnosticOptions) =
+        obj.ReferenceEquals(a, b)
+        || (a.WarnLevel = b.WarnLevel
+            && a.GlobalWarnAsError = b.GlobalWarnAsError
+            && a.WarnOff = b.WarnOff
+            && a.WarnOn = b.WarnOn
+            && a.WarnAsError = b.WarnAsError
+            && a.WarnAsWarn = b.WarnAsWarn
+            && (match a.WarnScopeData, b.WarnScopeData with
+                | None, None -> true
+                | Some x, Some y -> obj.ReferenceEquals(x, y) || x.Equals y
+                | _ -> false))
+
+    /// Runs a check of an implementation file whose signature conformance would write the other ranges of its
+    /// signature file's items (rootSigOpt): the implementation's range on each, which go to implementation reads in
+    /// every file set up from the signature. Only a check of the file's latest parse writes them; one of an older
+    /// text leaves them, so they are the latest text's once it has been checked, whatever other checks of the file
+    /// run and in whatever order. Run under the file's check lock.
+    let leavingSignatureRanges (checks: ProjectChecks) (parse: FSharpParseFileResults) (rootSigOpt: ModuleOrNamespaceType option) (check: unit -> 'T) : 'T =
+        let latest =
+            match checks.LatestParse parse.FileName with
+            | Some latest -> obj.ReferenceEquals(latest, parse)
+            | None -> false
+
+        if rootSigOpt.IsNone || latest then
+            check ()
+        else
+            let outer = SignatureConformance.SignatureRanges.Keep
+            SignatureConformance.SignatureRanges.Keep <- true
+
+            try
+                check ()
+            finally
+                SignatureConformance.SignatureRanges.Keep <- outer
+
+    /// Gives every value the resolutions name its compiled name now, under the file's check lock: a compiled name
+    /// some values get is generated on first read, from the file's counters, which a check of the file resets.
+    let compiledNamesOf (state: CompilerState) (resolutions: TcResolutions) =
+        let globalState = state.tcGlobals.CompilerGlobalState
+        let read (vref: ValRef) = if vref.IsLocalRef then vref.Deref.CompiledName globalState |> ignore
+
+        for resolution in resolutions.CapturedNameResolutions do
+            match resolution.Item with
+            | Item.Value vref
+            | Item.CustomBuilder(_, vref) -> read vref
+            | Item.ActivePatternCase apref -> read apref.ActivePatternVal
+            | Item.MethodGroup(methods = minfos)
+            | Item.CtorGroup(_, minfos) -> minfos |> List.iter (fun minfo -> Option.iter read minfo.ArbitraryValRef)
+            | Item.Property(info = pinfos) -> pinfos |> List.iter (fun pinfo -> Option.iter read pinfo.ArbitraryValRef)
+            | Item.Event einfo -> Option.iter read einfo.ArbitraryValRef
+            | _ -> ()
+
     /// CheckOneImplFile on an implementation file set up by implFileState and enterImplFile, recovering from an error as
     /// CheckOneInput does, under the ambient logger.
     let checkImplFile (state: CompilerState) (tcState: TcState) rootSigOpt file (parse: FSharpParseFileResults) (logger: DiagnosticsLogger) sink =
@@ -897,7 +1024,13 @@ module internal DeclarationCheck =
         let rootSigOpt, checkedFile =
             lock (checks.FileLock parse.FileName) (fun () ->
                 let rootSigOpt = enterImplFile state tcState input file
-                rootSigOpt, checkImplFile state tcState rootSigOpt file parse logger (TcResultsSink.WithSink sink))
+
+                let checkedFile =
+                    leavingSignatureRanges checks parse rootSigOpt (fun () ->
+                        checkImplFile state tcState rootSigOpt file parse logger (TcResultsSink.WithSink sink))
+
+                compiledNamesOf state (sink.GetResolutions())
+                rootSigOpt, checkedFile)
 
         refuseUnlessCurrentDirectives parse
 
@@ -1519,7 +1652,7 @@ module internal DeclarationCheck =
         createsGeneratedProvidedTypes
         moduleNamesDict
         definitions
-        fingerprint
+        (fingerprint: Lazy<string>)
         =
         let amap = state.tcImports.GetImportMap()
 
@@ -1542,7 +1675,7 @@ module internal DeclarationCheck =
             id,
             moduleNamesDict,
             Map.empty,
-            "?" + Guid.NewGuid().ToString("N"),
+            Lazy<string>.CreateFromValue("?" + Guid.NewGuid().ToString("N")),
             Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
             None
         )
@@ -1730,7 +1863,7 @@ type DeclarationChecker =
         | ParsedInput.SigFile _ ->
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
             let tcState, chainModuleNames = DeclarationCheck.stateBefore ctx.Checks before (Option.map snd moduleNamesBefore) parse.FileName
-            let moduleNamesDict = moduleNamesBefore |> Option.map fst |> Option.defaultValue chainModuleNames
+            let moduleNamesDict = moduleNamesBefore |> Option.map fst |> Option.defaultWith chainModuleNames.Force
             let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
             match input with
@@ -1783,7 +1916,7 @@ type DeclarationChecker =
                     apply,
                     moduleNamesDict,
                     DeclarationCheck.signatureDefinitions parse.FileName sigFileType,
-                    fingerprint,
+                    Lazy<string>.CreateFromValue fingerprint,
                     sigFileType,
                     Some asImplementation
                 )
@@ -1990,19 +2123,28 @@ type DeclarationChecker =
     /// built when first read (FileResult.CheckResults).
     ///
     /// The diagnostics come from `parse`, filtered with its #nowarn scopes, as FinishFile's do.
-    static member CheckFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileResult =
+    ///
+    /// With `fingerprint` false, nothing is expected to read the signature's fingerprint (no later file depends on
+    /// the file): it is taken on first read instead. It describes names and types only, nothing the file's counters
+    /// give, so that read needs no lock.
+    static member CheckFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults, ?fingerprint: bool) : FileResult =
         let state = ctx.State
 
         match parse.ParseTree with
         | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Expected an implementation file."
         | ParsedInput.ImplFile _ ->
             let phaseTicks = Dictionary<string, int64>()
+            let phaseAllocated = Dictionary<string, int64>()
             let mutable phaseStart = System.Diagnostics.Stopwatch.GetTimestamp()
+            let mutable allocatedAtStart = GC.GetAllocatedBytesForCurrentThread()
 
             let endPhase name =
                 let now = System.Diagnostics.Stopwatch.GetTimestamp()
+                let allocated = GC.GetAllocatedBytesForCurrentThread()
                 phaseTicks[name] <- now - phaseStart
+                phaseAllocated[name] <- allocated - allocatedAtStart
                 phaseStart <- now
+                allocatedAtStart <- allocated
 
             let moduleNamesBefore = DeclarationCheck.checkBefore ctx before parse
             DeclarationCheck.refuseUnlessCurrentDirectives parse
@@ -2017,7 +2159,11 @@ type DeclarationChecker =
                 lock (ctx.Checks.FileLock parse.FileName) (fun () ->
                     let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
                     endPhase "setup"
-                    let checkedFile = DeclarationCheck.checkImplFile state tcState rootSigOpt file parse logger TcResultsSink.NoSink
+
+                    let checkedFile =
+                        DeclarationCheck.leavingSignatureRanges ctx.Checks parse rootSigOpt (fun () ->
+                            DeclarationCheck.checkImplFile state tcState rootSigOpt file parse logger TcResultsSink.NoSink)
+
                     endPhase "tail"
 
                     match checkedFile with
@@ -2029,7 +2175,14 @@ type DeclarationChecker =
                             | None -> DeclarationCheck.signatureDefinitions parse.FileName implFile.Signature
 
                         endPhase "definitions"
-                        let fingerprint = DeclarationCheck.implFingerprint rootSigOpt implFile.Signature topAttrs
+                        let describe () = DeclarationCheck.implFingerprint rootSigOpt implFile.Signature topAttrs
+
+                        let fingerprint =
+                            if defaultArg fingerprint true then
+                                Lazy<string>.CreateFromValue(describe ())
+                            else
+                                Lazy<string>(describe, LazyThreadSafetyMode.ExecutionAndPublication)
+
                         endPhase "fingerprint"
 
                         DeclarationCheck.implFileSignature
@@ -2061,7 +2214,7 @@ type DeclarationChecker =
                     LazyThreadSafetyMode.ExecutionAndPublication
                 )
 
-            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks)
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
@@ -2336,9 +2489,24 @@ type DeclarationChecker =
     ///
     /// An error that escapes closing the inference scope is recovered from as a full check's CheckOneInput does:
     /// the file then adds nothing to later files' environments, and its check results have no implementation file.
+    ///
+    /// A result given to the previous finish on the same FileStart, rendered then with the same warning options and
+    /// line directives, keeps what that finish computed for it: its final fingerprint, its finish TypedUses and its
+    /// rendered diagnostics (FileResult.Reused counts them). A result that DependsOnLaterDeclarations is computed
+    /// again every time: the defaults and the later declarations can change its types and messages. The other
+    /// results' types do not change after their check: nothing later solves anything in them. So is one whose final
+    /// fingerprint is not describable, which counts as changed every time.
+    ///
+    /// When every final fingerprint and the file's own fingerprint (for a file with a signature file, the signature
+    /// file's) equal the previous finish's, for the same declarations, the result's Signature is the previous
+    /// finish's object, so the files after it see no new copy. Its check results are built on first read, from
+    /// what the finish captured.
     static member FinishFile(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FileResult =
         if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
             invalidArg (nameof parse) "The parse is of another file than the FileStart's."
+
+        let entered = System.Diagnostics.Stopwatch.GetTimestamp()
+        let allocatedAtEntry = GC.GetAllocatedBytesForCurrentThread()
 
         lock start.Sync (fun () ->
             start.UndoLastFinish()
@@ -2349,33 +2517,75 @@ type DeclarationChecker =
             try
                 // As CheckDeclaration: the finish and its fingerprints give the file's compiler-generated names. Taken
                 // inside the FileStart's lock, never the other way round (CheckDeclaration takes it after undoing).
-                lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () -> DeclarationChecker.Finish(start, results, parse))
+                lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () -> DeclarationChecker.Finish(start, results, parse, entered, allocatedAtEntry))
             finally
                 MutationLog.Current <- outer
                 start.SetLastFinish log)
 
-    static member private Finish(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FileResult =
+    static member private Finish(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults, entered: int64, allocatedAtEntry: int64) : FileResult =
         let state = start.Context.State
         let file = start.File
         let tcState = start.TcState
         let phaseTicks = Dictionary<string, int64>()
-        let mutable phaseStart = System.Diagnostics.Stopwatch.GetTimestamp()
+        let phaseAllocated = Dictionary<string, int64>()
+        let mutable phaseStart = entered
+        let mutable allocatedAtStart = allocatedAtEntry
 
         let endPhase name =
             let now = System.Diagnostics.Stopwatch.GetTimestamp()
+            let allocated = GC.GetAllocatedBytesForCurrentThread()
             phaseTicks[name] <- now - phaseStart
+            phaseAllocated[name] <- allocated - allocatedAtStart
             phaseStart <- now
+            allocatedAtStart <- allocated
 
+        endPhase "wait"
         let options = DeclarationCheck.warnOptionsOf parse
+        let directives = DeclarationCheck.lineDirectivesOf parse
+
+        // The previous finish's, taken out until this one succeeds
+        let last =
+            match start.LastShares with
+            | :? FinishShares as last -> Some last
+            | _ -> None
+
+        start.LastShares <- null
+
+        let known =
+            match last with
+            | Some last when DeclarationCheck.sameWarnOptions last.Options options && last.Directives = directives -> Some last.Shares
+            | _ -> None
+
+        let shares =
+            results
+            |> Array.map (fun result ->
+                match known with
+                | Some known when not result.DependsOnLaterDeclarations ->
+                    match known.TryGetValue result with
+                    | true, share -> ValueSome share
+                    | _ -> ValueNone
+                | _ -> ValueNone)
 
         // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration.
         // Rendered after the tail, as a full check renders them, so their types show what the defaults solved.
-        let earlierDiagnostics =
-            [| yield DeclarationCheck.refiltered options start.RawDiagnostics
-               for result in results do
-                   yield DeclarationCheck.refiltered options result.RawDiagnostics |]
+        let startDiagnostics = DeclarationCheck.refiltered options start.RawDiagnostics
 
-        let earlierErrors = earlierDiagnostics |> Array.sumBy (fun capturing -> capturing.ErrorCount)
+        let refilteredResults =
+            Array.map2
+                (fun (result: DeclarationResult) share ->
+                    match share with
+                    | ValueSome _ -> ValueNone
+                    | ValueNone -> ValueSome(DeclarationCheck.refiltered options result.RawDiagnostics))
+                results
+                shares
+
+        let errorCountOf i =
+            match shares[i], refilteredResults[i] with
+            | ValueSome share, _ -> share.ErrorCount
+            | _, ValueSome capturing -> capturing.ErrorCount
+            | ValueNone, ValueNone -> 0
+
+        let earlierErrors = startDiagnostics.ErrorCount + Array.sum (Array.init results.Length errorCountOf)
         endPhase "refilter"
 
         let capturing, logger = DeclarationCheck.newLoggersWith options
@@ -2401,118 +2611,181 @@ type DeclarationChecker =
         // Recovered from as CheckOneInput recovers in a full check, such as a default that fails where the tail does
         // not catch it (SolveInternalUnknowns): the file then adds nothing to the files after it.
         let tail =
-            try
-                let fileContents =
-                    ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
+            DeclarationCheck.leavingSignatureRanges start.Context.Checks parse start.RootSigOpt (fun () ->
+                try
+                    let fileContents =
+                        ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
 
-                Some(CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents)
-            with RecoverableException exn ->
-                errorRecovery exn range0
-                None
+                    Some(CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents)
+                with RecoverableException exn ->
+                    errorRecovery exn range0
+                    None)
 
         endPhase "tail"
         let qualNameOfFile = file.QualifiedName
 
         // The finish can solve more of each declaration's types and traits; this is the last finish's view
-        for result in results do
-            let contents, _, _ = result.Checked
-            result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
+        for result, share in Array.zip results shares do
+            if share.IsNone then
+                let contents, _, _ = result.Checked
+                result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
 
         endPhase "typedUses"
 
-        let signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, implFileOpt =
+        // While the finish's solutions are in effect: the next finish or declaration check undoes them
+        let finalPrints =
+            Array.init results.Length (fun i ->
+                match shares[i] with
+                | ValueSome share -> share.Fingerprint
+                | ValueNone ->
+                    let result = results[i]
+                    DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck)
+
+        let fingerprints = Dictionary<DeclarationKey, string>(HashIdentity.Structural)
+
+        for result, print in Array.zip results finalPrints do
+            fingerprints[result.Key] <- print
+
+        endPhase "fingerprints"
+        let keys = results |> Array.map _.Key
+
+        let signature, ownSigForFile, tcEnvAtEnd, implFileOpt =
             match tail with
             | Some(topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
-                // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
-                let definitions =
-                    match start.RootSigOpt with
-                    | Some _ -> Map.empty
-                    | None ->
-                        let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationCheck.addDefinitions acc result.Ref result.Delta)
-                        DeclarationCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
+                let fingerprint = DeclarationCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs
+                let describable (print: string) = not (print.StartsWith "?")
+
+                let unchanged =
+                    match last |> Option.bind (fun last -> last.Signature |> Option.map (fun s -> last, s)) with
+                    | Some(last, previous) when
+                        not createsGeneratedProvidedTypes
+                        && describable fingerprint
+                        && String.Equals(previous.Fingerprint, fingerprint, StringComparison.Ordinal)
+                        && last.Keys = keys
+                        && Array.forall2 (fun (a: string) b -> describable a && String.Equals(a, b, StringComparison.Ordinal)) last.Fingerprints finalPrints
+                        ->
+                        Some previous
+                    | _ -> None
 
                 let signature =
-                    DeclarationCheck.implFileSignature
-                        state
-                        parse.FileName
-                        qualNameOfFile
-                        implFile.Signature
-                        createsGeneratedProvidedTypes
-                        start.ModuleNamesDict
-                        definitions
-                        (DeclarationCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs)
+                    match unchanged with
+                    | Some previous -> previous
+                    | None ->
+                        // Later files see a copy of the file's contents, or the signature file's declarations, which it maps already
+                        let definitions =
+                            match start.RootSigOpt with
+                            | Some _ -> Map.empty
+                            | None ->
+                                let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationCheck.addDefinitions acc result.Ref result.Delta)
+                                DeclarationCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
 
-                let ccuSigForFile, _ =
-                    AddCheckResultsToTcState
-                        (state.tcGlobals,
-                         state.tcImports.GetImportMap(),
-                         start.RootSigOpt.IsSome,
-                         None,
-                         TcResultsSink.NoSink,
-                         tcState.TcEnvFromImpls,
-                         qualNameOfFile,
-                         implFile.Signature)
-                        tcState
+                        DeclarationCheck.implFileSignature
+                            state
+                            parse.FileName
+                            qualNameOfFile
+                            implFile.Signature
+                            createsGeneratedProvidedTypes
+                            start.ModuleNamesDict
+                            definitions
+                            (Lazy<string>.CreateFromValue fingerprint)
 
-                signature, ccuSigForFile, ownSigForFile, tcEnvAtEnd, Some implFile
+                signature, ownSigForFile, tcEnvAtEnd, Some implFile
             | None ->
                 DeclarationCheck.failedFileSignature parse.FileName start.ModuleNamesDict,
-                tcState.CcuSig,
                 Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
                 tcState.TcEnvFromSignatures,
                 None
 
         endPhase "signature"
 
-        // While the finish's solutions are in effect: the next finish or declaration check undoes them
+        let rendered =
+            Array.init results.Length (fun i ->
+                match shares[i], refilteredResults[i] with
+                | ValueSome share, _ -> share.Diagnostics
+                | _, ValueSome capturing -> DeclarationCheck.diagnosticsWith state options parse.FileName capturing
+                | ValueNone, ValueNone -> [||])
+
         let diagnostics =
             Array.concat
                 [ yield parse.Diagnostics
-                  for earlier in earlierDiagnostics do
-                      yield DeclarationCheck.diagnosticsWith state options parse.FileName earlier
+                  yield DeclarationCheck.diagnosticsWith state options parse.FileName startDiagnostics
+                  yield! rendered
                   yield DeclarationCheck.diagnosticsWith state options parse.FileName capturing ]
             |> DeclarationCheck.projectDiagnostics start.Context
 
         endPhase "render"
 
-        let fingerprints =
-            Dictionary<DeclarationKey, string>(HashIdentity.Structural)
+        // Built on first read from what the finish leaves: the sinks, the environment at the file's end and its typed
+        // tree. Under the file's check lock, as CheckFile's are.
+        let checks = start.Context.Checks
+        let fileName = parse.FileName
+        let dependencyFiles = parse.DependencyFiles
+        let hasSig = start.RootSigOpt.IsSome
 
-        for result in results do
-            fingerprints[result.Key] <- DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck
-
-        endPhase "fingerprints"
-
-        let resolutions, symbolUses, openDeclarations =
-            DeclarationCheck.mergeSinks
-                state.tcGlobals
-                [ yield start.Sink
-                  for result in results do
-                      yield result.Sink
-                  yield sink ]
-
-        let scope =
-            TypeCheckInfo(
-                state.tcConfig,
-                state.tcGlobals,
-                ccuSigForFile,
-                ownSigForFile,
-                tcState.Ccu,
-                state.tcImports,
-                tcEnvAtEnd.AccessRights,
-                state.projectOptions.ProjectFileName,
-                parse.FileName,
-                Some state.projectOptions,
-                resolutions,
-                symbolUses,
-                tcEnvAtEnd.NameEnv,
-                None,
-                implFileOpt,
-                openDeclarations
-            )
+        let sinks =
+            [ yield start.Sink
+              for result in results do
+                  yield result.Sink
+              yield sink ]
 
         let checkResults =
-            FSharpCheckFileResults(parse.FileName, diagnostics, Some scope, parse.DependencyFiles, None, true)
+            Lazy<FSharpCheckFileResults>(
+                (fun () ->
+                    lock (checks.FileLock fileName) (fun () ->
+                        let ccuSigForFile =
+                            match implFileOpt with
+                            | Some implFile ->
+                                AddCheckResultsToTcState
+                                    (state.tcGlobals,
+                                     state.tcImports.GetImportMap(),
+                                     hasSig,
+                                     None,
+                                     TcResultsSink.NoSink,
+                                     tcState.TcEnvFromImpls,
+                                     qualNameOfFile,
+                                     implFile.Signature)
+                                    tcState
+                                |> fst
+                            | None -> tcState.CcuSig
 
+                        let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
+                        DeclarationCheck.compiledNamesOf state resolutions
+
+                        let scope =
+                            TypeCheckInfo(
+                                state.tcConfig,
+                                state.tcGlobals,
+                                ccuSigForFile,
+                                ownSigForFile,
+                                tcState.Ccu,
+                                state.tcImports,
+                                tcEnvAtEnd.AccessRights,
+                                state.projectOptions.ProjectFileName,
+                                fileName,
+                                Some state.projectOptions,
+                                resolutions,
+                                symbolUses,
+                                tcEnvAtEnd.NameEnv,
+                                None,
+                                implFileOpt,
+                                openDeclarations
+                            )
+
+                        FSharpCheckFileResults(fileName, diagnostics, Some scope, dependencyFiles, None, true))),
+                LazyThreadSafetyMode.ExecutionAndPublication
+            )
+
+        let kept = Dictionary<DeclarationResult, FinishShare>(HashIdentity.Reference)
+
+        // A fingerprint that is not describable counts as changed every time, so it is taken again
+        for i in 0 .. results.Length - 1 do
+            if not results[i].DependsOnLaterDeclarations && not (finalPrints[i].StartsWith "?") then
+                kept[results[i]] <-
+                    { Fingerprint = finalPrints[i]
+                      Diagnostics = rendered[i]
+                      ErrorCount = errorCountOf i }
+
+        start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None))
+        let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)
         endPhase "sinks"
-        FileResult(diagnostics, fingerprints, signature, Lazy<_>.CreateFromValue checkResults, phaseTicks)
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused)
