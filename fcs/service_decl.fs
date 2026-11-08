@@ -507,6 +507,7 @@ type DeclarationResult
         shareKey: obj
     ) =
     let mutable finishTypedUses: DeclarationRef[] = [||]
+    let mutable shiftedTo: DeclarationResult | null = null
 
     member _.Key = declaration.Key
     /// What FinishFile keeps its computations for this result by: the check's, which shifting it keeps (see Shift)
@@ -562,6 +563,12 @@ type DeclarationResult
 
     member internal _.SetFinishTypedUses(uses: DeclarationRef[]) = finishTypedUses <- uses
     member internal _.FinishTypedUses = finishTypedUses
+
+    /// The result the latest Shift of this one gave, which owns the items it moved; null while it was not shifted.
+    /// Under the FileStart's lock.
+    member internal _.ShiftedTo
+        with get () = shiftedTo
+        and set (r: DeclarationResult | null) = shiftedTo <- r
     member internal _.CheckTypedUses = typedUses
     /// The module values of the project the check marked referenced: the declaration defining each, the path of the
     /// module it is in, and its name
@@ -2616,8 +2623,34 @@ type DeclarationChecker =
     ///
     /// Like CheckDeclaration, it undoes the latest FinishFile on the same FileStart first, under the FileStart's lock
     /// and then the file's check lock, so no finish's saved values (conformance's other ranges among them) are left to
-    /// be restored over what it moves. `result` must not be used after a shift that returned a result.
+    /// be restored over what it moves.
+    ///
+    /// A result that was shifted holds items another result now owns, at their moved lines. Shifting it again, as a
+    /// superseded caller may, shifts the result it was last shifted to instead (from that one's line), and gives that
+    /// result itself when `decl` starts where it does: a shift is never applied twice to the same items.
     static member Shift(result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption =
+        if not (decl.IsUnchangedFrom result.Declaration) || decl.Key <> result.Declaration.Key then
+            ValueNone
+        else
+            let start = result.Start
+
+            lock start.Sync (fun () ->
+                let mutable latest = result
+
+                while not (isNull latest.ShiftedTo) do
+                    latest <- !!latest.ShiftedTo
+
+                if latest.Declaration.Range.Start = decl.Range.Start && not (obj.ReferenceEquals(latest, result)) then
+                    ValueSome latest
+                else
+                    match DeclarationChecker.ShiftFrom(latest, decl) with
+                    | ValueSome shifted as found ->
+                        latest.ShiftedTo <- shifted
+                        found
+                    | ValueNone -> ValueNone)
+
+    /// Under the FileStart's lock.
+    static member private ShiftFrom(result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption =
         let old = result.Declaration
         let delta = decl.Range.StartLine - old.Range.StartLine
 
@@ -2636,12 +2669,10 @@ type DeclarationChecker =
             ValueNone
         else
             let start = result.Start
+            start.UndoLastFinish()
 
-            lock start.Sync (fun () ->
-                start.UndoLastFinish()
-
-                lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
-                    DeclarationChecker.ShiftLocked(result, decl, delta)))
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                DeclarationChecker.ShiftLocked(result, decl, delta))
 
     static member private ShiftLocked(result: DeclarationResult, decl: ParsedDeclaration, delta: int) : DeclarationResult voption =
         let old = result.Declaration
