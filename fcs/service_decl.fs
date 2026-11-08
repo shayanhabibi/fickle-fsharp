@@ -382,8 +382,29 @@ type internal Leftovers
         unionsWithDeferredAttributes: Set<Stamp>,
         deferredUnionNullnessChecks: (TType * range) list,
         createsGeneratedProvidedTypes: bool,
-        namedDebugPoints: KeyValuePair<NamedDebugPointKey, range>[]
+        namedDebugPoints: KeyValuePair<NamedDebugPointKey, range>[],
+        /// How far the checks' own ranges are from where the check left them: the file, the declaration's range and
+        /// the end of its scope as the check left them, and the lines moved over all shifts. The closures stay the
+        /// check's, so a result shifted many times runs each with one wrapper.
+        moved: struct (int * range * pos * int) voption
     ) =
+    /// The check run with what it reports, and what it raises, moved.
+    static member private MovedCheck(struct (fileIndex, range, scopeEnd, delta), check: unit -> unit) =
+        fun () ->
+            let s = DeclarationShift.Shifter.Create(fileIndex, range, scopeEnd, delta)
+
+            try
+                try
+                    use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+                    check ()
+                with e ->
+                    match s.Exn e with
+                    | same when obj.ReferenceEquals(same, e) -> reraise ()
+                    | movedExn -> raise movedExn
+            finally
+                if s.Refused.IsSome then
+                    DeclarationShift.CountFinishMiss()
+
     static member Of(cenv: TcFileState) =
         let css = cenv.css
 
@@ -395,12 +416,18 @@ type internal Leftovers
             css.UnionsWithDeferredAttributes,
             css.DeferredUnionNullnessChecks,
             cenv.createsGeneratedProvidedTypes,
-            Array.ofSeq cenv.namedDebugPointsForInlinedCode
+            Array.ofSeq cenv.namedDebugPointsForInlinedCode,
+            ValueNone
         )
 
     member _.Apply(into: TcFileState) =
-        into.css.PostInferenceChecksPreDefaults.AddRange preDefaults
-        into.css.PostInferenceChecksFinal.AddRange final
+        let run (check: unit -> unit) =
+            match moved with
+            | ValueSome offset -> Leftovers.MovedCheck(offset, check)
+            | ValueNone -> check
+
+        into.css.PostInferenceChecksPreDefaults.AddRange(Array.map run preDefaults)
+        into.css.PostInferenceChecksFinal.AddRange(Array.map run final)
 
         for stamp, cx in extraCxs do
             into.css.ExtraCxs.Add(stamp, cx)
@@ -425,33 +452,23 @@ type internal Leftovers
     /// all of the declaration's own syntax, so a shift moves all of them. A range elsewhere in the file would be a miss
     /// the finish can no longer refuse: it is counted (DeclarationShift.FinishMisses), which the tests require to be 0.
     member _.Shifted(s: DeclarationShift.Shifter) =
-        // What the shifter needs, copied: the closures keep no shifter, and no chain of shifters, alive
+        // Numbers and ranges only: nothing here keeps a shifter alive, and the first shift's range is the check's
         let fileIndex, oldRange, scopeEnd, delta = s.Parameters
 
-        let moved (check: unit -> unit) =
-            fun () ->
-                let s = DeclarationShift.Shifter.Create(fileIndex, oldRange, scopeEnd, delta)
-
-                try
-                    try
-                        use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
-                        check ()
-                    with e ->
-                        match s.Exn e with
-                        | same when obj.ReferenceEquals(same, e) -> reraise ()
-                        | movedExn -> raise movedExn
-                finally
-                    if s.Refused.IsSome then
-                        DeclarationShift.CountFinishMiss()
+        let moved =
+            match moved with
+            | ValueSome(struct (fileIndex, range, scopeEnd, earlier)) -> struct (fileIndex, range, scopeEnd, earlier + delta)
+            | ValueNone -> struct (fileIndex, oldRange, scopeEnd, delta)
 
         Leftovers(
-            Array.map moved preDefaults,
-            Array.map moved final,
+            preDefaults,
+            final,
             extraCxs |> List.map (fun (stamp, (info, m)) -> stamp, (info, s.Own m)),
             unionsWithDeferredAttributes,
             deferredUnionNullnessChecks,
             createsGeneratedProvidedTypes,
-            namedDebugPoints |> Array.map (fun kv -> KeyValuePair(kv.Key, s.Own kv.Value))
+            namedDebugPoints |> Array.map (fun kv -> KeyValuePair(kv.Key, s.Own kv.Value)),
+            ValueSome moved
         )
 
 /// An implementation file set up for checking its declarations one at a time.
@@ -1444,8 +1461,8 @@ module internal DeclarationCheck =
             TcResolutions(
                 all (fun r -> r.CapturedEnvs),
                 all (fun r -> r.CapturedExpressionTypings),
-                // A shifted declaration's named arguments name parameters as they are now (DeclarationShift.calleeName)
-                ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentParameter),
+                // What a shifted declaration copied from others, as it is now (DeclarationShift.currentItems)
+                ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentItems),
                 all (fun r -> r.CapturedMethodGroupResolutions),
                 all (fun r -> r.CapturedRelatedSymbolUses)
             )

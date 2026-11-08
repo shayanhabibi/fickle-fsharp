@@ -20,6 +20,7 @@ open FSharp.Compiler.Text
 open FSharp.Compiler.Text.Position
 open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
+open FSharp.Compiler.TypedTreeOps
 
 let private finishMisses = ref 0L
 
@@ -45,20 +46,22 @@ let calleeName (container: ArgumentContainer option) (name: string) =
         | None -> None
     | _ -> None
 
-/// A name resolution with a named argument's parameter at its current place (see calleeName).
-let currentParameter (r: CapturedNameResolution) =
+/// A name resolution with what it copied from another declaration's item as that item is now: a named argument's
+/// parameter (see calleeName), and an active pattern case's tags, which the value's range gives.
+let currentItems (r: CapturedNameResolution) =
+    let withItem item =
+        CapturedNameResolution(item, r.ItemWithInst.TyparInstantiation, r.ItemOccurrence, r.NameResolutionEnv, r.AccessorDomain, r.Range)
+
     match r.Item with
+    | Item.ActivePatternCase(APElemRef(info, vref, idx, kind)) when vref.IsLocalRef ->
+        match TryGetActivePatternInfo vref with
+        | Some current when not (Range.equals current.Range info.Range) ->
+            withItem (Item.ActivePatternCase(APElemRef(current, vref, idx, kind)))
+        | _ -> r
     | Item.OtherName(Some id, ty, None, container, m) when Range.equals m id.idRange ->
         match calleeName container id.idText with
         | Some current when not (Range.equals current.idRange id.idRange) ->
-            CapturedNameResolution(
-                Item.OtherName(Some current, ty, None, container, current.idRange),
-                r.ItemWithInst.TyparInstantiation,
-                r.ItemOccurrence,
-                r.NameResolutionEnv,
-                r.AccessorDomain,
-                r.Range
-            )
+            withItem (Item.OtherName(Some current, ty, None, container, current.idRange))
         | _ -> r
     | _ -> r
 
@@ -572,7 +575,9 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int, owner: 
         | Item.ActivePatternCase(APElemRef(_, vref, _, _)) ->
             x.ValIfOwn vref
             item
-        | Item.ActivePatternResult(info, ty, idx, m) ->Item.ActivePatternResult(info, ty, idx, x.Own m)
+        | Item.ActivePatternResult(PrettyNaming.APInfo(total, tags, whole), ty, idx, m) ->
+            let info = PrettyNaming.APInfo(total, tags |> List.map (fun (tag, tagRange) -> tag, x.Own tagRange), x.Own whole)
+            Item.ActivePatternResult(info, ty, idx, x.Own m)
         | Item.AnonRecdField(info, tys, idx, m) -> Item.AnonRecdField(info, tys, idx, x.Own m)
         | Item.NewDef id -> Item.NewDef(x.IdentOwn id)
         | Item.Property(name, infos, Some m) -> Item.Property(name, infos, Some(x.Own m))
