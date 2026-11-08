@@ -70,7 +70,8 @@ let currentParameter (r: CapturedNameResolution) =
 /// each. What it only refers to (another declaration's values, types and type parameters) is left: that declaration
 /// is moved by its own shift, or did not move. A range of the declaration's own syntax, or of an item it made, that
 /// is in the file but outside the declaration cannot be told apart from another declaration's, so the shift is
-/// refused (Refused): the declaration is checked again. Nothing in the file is ever left unmoved silently.
+/// refused (Refused): the declaration is checked again. A few ranges no diagnostic reads are neither moved nor refused
+/// (XML docs, measures in types, anonymous record field idents, names in captured environments).
 ///
 /// Which items a declaration made is decided by identity, not by where they are now: the first shift of a check's
 /// result records each item it moves under the check's key (`owner`, its ShareKey), and every later shift asks that
