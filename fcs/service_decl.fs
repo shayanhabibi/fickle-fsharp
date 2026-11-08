@@ -555,6 +555,7 @@ type DeclarationResult
         leftovers: Leftovers,
         nesting: Nesting,
         typedUses: DeclarationRef[],
+        heldDefinitions: (Stamp * DeclarationRef)[],
         references: (DeclarationRef * string list * string)[],
         shareKey: obj
     ) =
@@ -594,10 +595,16 @@ type DeclarationResult
     /// current results (ruling R15), so they need no dependency.
     member _.DependsOnLaterDeclarations = dependsOnLater
 
-    /// Whether the declaration publishes a type, an exception or a module, other than a type abbreviation, which type
-    /// equivalence looks through. Another check of it gives new entities, which entity references compare by object, so
-    /// a result holding the old ones is not one to check against the new ones, whatever their fingerprints say.
-    member _.DefinesEntities = delta.AllEntities |> Seq.exists (fun entity -> not entity.IsTypeAbbrev)
+    /// Whether a later result holding what the declaration publishes must hold its latest check's: another check gives new
+    /// entities, which entity references compare by object, so a result holding the old ones is not one to check against
+    /// the new ones, whatever their fingerprints say. A type abbreviation is looked through, so it counts only when its
+    /// target reaches another declaration of its file: the file's inferred signature remaps that file's entities, and an
+    /// old abbreviation would keep pointing at the unmapped one.
+    member _.DefinesEntities =
+        delta.AllEntities
+        |> Seq.exists (fun entity ->
+            not entity.IsTypeAbbrev
+            || typedUses |> Array.exists (fun r -> r.Key <> Some declaration.Key && r.File = start.Parse.FileName))
 
     /// The inference variables that made this result DependsOnLaterDeclarations, as the check left them: every one that
     /// is open is one of these, and it is empty exactly when the result does not depend on later declarations.
@@ -636,6 +643,12 @@ type DeclarationResult
         with get () = shiftedTo
         and set (r: DeclarationResult | null) = shiftedTo <- r
     member internal _.CheckTypedUses = typedUses
+
+    /// Each entity and value of the project the check's TypedUses went through, with the declaration defining it. A kept
+    /// result can hold one its declaration's newer result no longer has (a type abbreviation re-checked with the same
+    /// fingerprint keeps its users), so an environment holding this result must still know where it came from: a check
+    /// that reaches it through this result depends on that declaration.
+    member internal _.HeldDefinitions = heldDefinitions
     /// The module values of the project the check marked referenced: the declaration defining each, the path of the
     /// module it is in, and its name
     member internal _.References = references
@@ -1382,20 +1395,27 @@ module internal DeclarationCheck =
         | SynModuleDecl.Expr _
         | SynModuleDecl.HashDirective _ -> true
         // What may be a unit of measure: a type's free entities leave out the units in it, so TypedUses does not show
-        // what uses one. The attribute can go by another name, so any attribute on a definition with no body or on an
-        // abbreviation counts.
+        // what uses one. The attribute can go by another name, so any attribute counts on what a unit can be: an
+        // abbreviation, or a definition whose kind is not written with no constructor and only static members.
         | SynModuleDecl.Types(typeDefns, _) ->
+            let onlyStatic (members: SynMemberDefn list) =
+                members
+                |> List.forall (function
+                    | SynMemberDefn.Member(memberDefn = SynBinding(valData = SynValData(memberFlags = Some flags))) -> not flags.IsInstance
+                    | _ -> false)
+
             typeDefns
-            |> List.exists (fun (SynTypeDefn(typeInfo = SynComponentInfo(attributes = attributes); typeRepr = repr)) ->
+            |> List.exists (fun (SynTypeDefn(typeInfo = SynComponentInfo(attributes = attributes); typeRepr = repr; members = extra; implicitConstructor = ctor)) ->
                 not attributes.IsEmpty
                 && (match repr with
-                    | SynTypeDefnRepr.Simple((SynTypeDefnSimpleRepr.TypeAbbrev _ | SynTypeDefnSimpleRepr.None _), _) -> true
-                    | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Unspecified; members = []) -> true
+                    | SynTypeDefnRepr.Simple((SynTypeDefnSimpleRepr.TypeAbbrev _ | SynTypeDefnSimpleRepr.None _), _) -> ctor.IsNone
+                    | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Unspecified; members = members) -> ctor.IsNone && onlyStatic members && onlyStatic extra
                     | _ -> findSynAttribute "Measure" attributes))
+        // Any attribute: [<AutoOpen>] can go by another name
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes); decls = decls) ->
-            findSynAttribute "AutoOpen" attributes || List.exists inner decls
+            not attributes.IsEmpty || List.exists inner decls
         | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(attribs = attributes; decls = decls)) ->
-            findSynAttribute "AutoOpen" attributes || List.exists inner decls
+            not attributes.IsEmpty || List.exists inner decls
         | SynModuleDecl.Let _
         | SynModuleDecl.Exception _ -> false
 
@@ -1807,12 +1827,16 @@ module internal DeclarationCheck =
         (sink: TcResultsSinkImpl option)
         =
         let refs = HashSet<DeclarationRef>(HashIdentity.Structural)
+        let held = Dictionary<Stamp, DeclarationRef>()
         let seenTycons = HashSet<Stamp>()
         let madeOf = Stack<Tycon>()
 
         let addStamp stamp =
             match definitions.TryFind stamp with
-            | Some declaration -> refs.Add declaration |> ignore; true
+            | Some declaration ->
+                refs.Add declaration |> ignore
+                held[stamp] <- declaration
+                true
             | None -> false
 
         let addVal (v: Val) = addStamp v.Stamp |> ignore
@@ -1911,7 +1935,7 @@ module internal DeclarationCheck =
             addTyvars (accFreeInTypars CollectAll tycon.Typars emptyFreeTyvars)
 
         refs.Remove self |> ignore
-        refs |> Array.ofSeq |> Array.sort
+        refs |> Array.ofSeq |> Array.sort, [| for kv in held -> kv.Key, kv.Value |]
 
     let implFileSignature
         (state: CompilerState)
@@ -2106,7 +2130,7 @@ type DeclarationChecker =
         let affectsAllLater =
             match decl.Syntax with
             | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes)) when decl.IsModuleHeader ->
-                findSynAttribute "AutoOpen" attributes
+                not attributes.IsEmpty
             | syntax -> DeclarationCheck.affectsAllLater syntax
 
         let augments =
@@ -2701,6 +2725,8 @@ type DeclarationChecker =
                     DeclarationCheck.finishedFingerprint (ValueSome seen) finished, ValueSome seen
             | _ -> DeclarationCheck.fingerprintOf delta checkedDecl slots, ValueNone
 
+        let typedUses, heldDefinitions = DeclarationCheck.typedUsesOf definitions self delta contents (Some sink)
+
         DeclarationResult(
             start,
             decl,
@@ -2721,7 +2747,8 @@ type DeclarationChecker =
             sink,
             Leftovers.Of cenv,
             nesting,
-            DeclarationCheck.typedUsesOf definitions self delta contents (Some sink),
+            typedUses,
+            heldDefinitions,
             references,
             obj ()
         )
@@ -2883,6 +2910,7 @@ type DeclarationChecker =
                 leftovers,
                 nesting,
                 result.CheckTypedUses,
+                result.HeldDefinitions,
                 result.References,
                 result.ShareKey
             )
@@ -2917,7 +2945,10 @@ type DeclarationChecker =
         let envBefore = DeclarationCheck.exitModules state start envBefore decl.Depth
         // Its own checker state and sink: resolving an open or a module abbreviation again reports nothing
         let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
-        let definitions = DeclarationCheck.addDefinitions envBefore.Definitions result.Ref result.Delta
+        let definitions =
+            (DeclarationCheck.addDefinitions envBefore.Definitions result.Ref result.Delta, result.HeldDefinitions)
+            ||> Array.fold (fun acc (stamp, declaration) -> if acc.ContainsKey stamp then acc else Map.add stamp declaration acc)
+
         let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
         match result.Nesting with
@@ -3146,7 +3177,7 @@ type DeclarationChecker =
         for result, share in Array.zip results shares do
             if share.IsNone then
                 let contents, _, _ = result.Checked
-                result.SetFinishTypedUses(DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None)
+                result.SetFinishTypedUses(fst (DeclarationCheck.typedUsesOf result.EnvAfter.Definitions result.Ref result.Delta contents None))
 
         endPhase "typedUses"
 
