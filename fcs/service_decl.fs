@@ -73,7 +73,7 @@ type DeclarationContent =
       /// Something resolves to a name the syntax does not show, such as the `?` operator: the declaration depends on
       /// every earlier declaration
       HasUnresolvable: bool
-      /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a type or module abbreviation,
+      /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a unit of measure, a module abbreviation,
       /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
       /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
       /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
@@ -594,10 +594,10 @@ type DeclarationResult
     /// current results (ruling R15), so they need no dependency.
     member _.DependsOnLaterDeclarations = dependsOnLater
 
-    /// Whether the declaration publishes a type, an exception or a module. Another check of it gives new entities,
-    /// which entity references compare by object, so a result holding the old ones is not one to check against the new
-    /// ones, whatever their fingerprints say.
-    member _.DefinesEntities = not (Seq.isEmpty delta.AllEntities)
+    /// Whether the declaration publishes a type, an exception or a module, other than a type abbreviation, which type
+    /// equivalence looks through. Another check of it gives new entities, which entity references compare by object, so
+    /// a result holding the old ones is not one to check against the new ones, whatever their fingerprints say.
+    member _.DefinesEntities = delta.AllEntities |> Seq.exists (fun entity -> not entity.IsTypeAbbrev)
 
     /// The inference variables that made this result DependsOnLaterDeclarations, as the check left them: every one that
     /// is open is one of these, and it is empty exactly when the result does not depend on later declarations.
@@ -1367,11 +1367,6 @@ module internal DeclarationCheck =
                           | _, None -> ()
                   | _ -> () ]
 
-    let isTypeAbbreviation (SynTypeDefn(typeRepr = repr)) =
-        match repr with
-        | SynTypeDefnRepr.Simple(SynTypeDefnSimpleRepr.TypeAbbrev _, _) -> true
-        | _ -> false
-
     /// Whether every later declaration depends on this one. For a module or fragment checked whole, that holds when
     /// anything in it would, except an open, whose scope ends with the module.
     let rec affectsAllLater (decl: SynModuleDecl) =
@@ -1386,7 +1381,17 @@ module internal DeclarationCheck =
         | SynModuleDecl.Attributes _
         | SynModuleDecl.Expr _
         | SynModuleDecl.HashDirective _ -> true
-        | SynModuleDecl.Types(typeDefns, _) -> List.exists isTypeAbbreviation typeDefns
+        // What may be a unit of measure: a type's free entities leave out the units in it, so TypedUses does not show
+        // what uses one. The attribute can go by another name, so any attribute on a definition with no body or on an
+        // abbreviation counts.
+        | SynModuleDecl.Types(typeDefns, _) ->
+            typeDefns
+            |> List.exists (fun (SynTypeDefn(typeInfo = SynComponentInfo(attributes = attributes); typeRepr = repr)) ->
+                not attributes.IsEmpty
+                && (match repr with
+                    | SynTypeDefnRepr.Simple((SynTypeDefnSimpleRepr.TypeAbbrev _ | SynTypeDefnSimpleRepr.None _), _) -> true
+                    | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Unspecified; members = []) -> true
+                    | _ -> findSynAttribute "Measure" attributes))
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes); decls = decls) ->
             findSynAttribute "AutoOpen" attributes || List.exists inner decls
         | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(attribs = attributes; decls = decls)) ->
