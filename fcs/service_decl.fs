@@ -239,6 +239,14 @@ type ProjectContext internal (state: CompilerState) =
     /// them again.
     member val RefuseShifts = false with get, set
 
+    /// Runs with the reason each time DeclarationChecker.Shift refuses a declaration of this context whose text is
+    /// the same at another line. For tests and diagnosis.
+    member val ShiftRefusedHook: string -> unit = ignore with get, set
+
+    /// How many checks the finish ran for shifted results of any context in the process reported at a range of their
+    /// file outside their declaration (see Leftovers.Shifted). For tests, which require 0.
+    static member ShiftFinishMisses = DeclarationShift.FinishMisses()
+
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
     member internal _.ParseLock(fileName: string) = parseLocks.GetOrAdd(fileName, fun _ -> obj ())
@@ -410,24 +418,31 @@ type internal Leftovers
     /// a shift could move only one of them.
     member _.HasDeferredChecks = not deferredUnionNullnessChecks.IsEmpty
 
-    /// Whether the finish runs checks this check deferred
-    member _.HasFinishChecks = preDefaults.Length > 0 || final.Length > 0
-
-    /// The checks the finish runs (post-inference checks, such as a member constraint retried or a type's nullness)
-    /// keep the ranges they report at to themselves: each is run with what it reports, and what it raises, moved.
+    /// The checks the finish runs (post-inference checks: a member constraint retried, a type's nullness, an enum's
+    /// underlying type) keep the ranges they report at to themselves: each is run with what it reports, and what it
+    /// raises, moved. Those ranges are the ones its check's constraint solver was given (ConstraintSolver.fs: the
+    /// `csenv` and `m2` of PostponeOnFailedMemberConstraintResolution, SolveTypeIsEnum and AddCxTypeCanCarryNullnessInfo),
+    /// all of the declaration's own syntax, so a shift moves all of them. A range elsewhere in the file would be a miss
+    /// the finish can no longer refuse: it is counted (DeclarationShift.FinishMisses), which the tests require to be 0.
     member _.Shifted(s: DeclarationShift.Shifter) =
+        // What the shifter needs, copied: the closures keep no shifter, and no chain of shifters, alive
+        let fileIndex, oldRange, scopeEnd, delta = s.Parameters
+
         let moved (check: unit -> unit) =
             fun () ->
-                // Its own shifter: one that refuses has no effect at the finish, which leaves the range as it was
-                let s = s.Fresh()
-                use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+                let s = DeclarationShift.Shifter.Create(fileIndex, oldRange, scopeEnd, delta)
 
                 try
-                    check ()
-                with e ->
-                    match s.Exn e with
-                    | same when obj.ReferenceEquals(same, e) -> reraise ()
-                    | movedExn -> raise movedExn
+                    try
+                        use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+                        check ()
+                    with e ->
+                        match s.Exn e with
+                        | same when obj.ReferenceEquals(same, e) -> reraise ()
+                        | movedExn -> raise movedExn
+                finally
+                    if s.Refused.IsSome then
+                        DeclarationShift.CountFinishMiss()
 
         Leftovers(
             Array.map moved preDefaults,
@@ -605,10 +620,6 @@ type DeclarationResult
     member internal _.Delta: ModuleOrNamespaceType = delta
     /// Whether the delta is combined into the file's contents, as a namespace fragment's is, rather than added.
     member internal _.DeltaCombines = deltaCombines
-
-    /// Whether the check deferred checks to the finish (post-inference checks), which a shift moves as they run. For
-    /// tests.
-    member _.DefersChecks = leftovers.HasFinishChecks
 
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
@@ -1433,7 +1444,8 @@ module internal DeclarationCheck =
             TcResolutions(
                 all (fun r -> r.CapturedEnvs),
                 all (fun r -> r.CapturedExpressionTypings),
-                all (fun r -> r.CapturedNameResolutions),
+                // A shifted declaration's named arguments name parameters as they are now (DeclarationShift.calleeName)
+                ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentParameter),
                 all (fun r -> r.CapturedMethodGroupResolutions),
                 all (fun r -> r.CapturedRelatedSymbolUses)
             )
@@ -2697,7 +2709,7 @@ type DeclarationChecker =
         then
             ValueNone
         elif result.Leftovers.HasDeferredChecks then
-            DeclarationChecker.ShiftRefusedHook $"%A{old.Key.Name}: it holds deferred union nullness checks"
+            result.Start.Context.ShiftRefusedHook $"%A{old.Key.Name}: it holds deferred union nullness checks"
             ValueNone
         else
             let start = result.Start
@@ -2708,15 +2720,17 @@ type DeclarationChecker =
 
     static member private ShiftLocked(result: DeclarationResult, decl: ParsedDeclaration, delta: int) : DeclarationResult voption =
         let old = result.Declaration
-        let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, old.ScopeRange.End, delta)
+        let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, old.ScopeRange.End, delta, result.ShareKey)
 
         // A refused or failed shift restores what it moved in place, so `result` is left as it was
         try
             match DeclarationChecker.ShiftWith(s, result, decl) with
-            | ValueSome _ as shifted -> shifted
+            | ValueSome _ as shifted ->
+                s.Release()
+                shifted
             | ValueNone ->
                 s.Undo()
-                DeclarationChecker.ShiftRefusedHook(defaultArg s.Refused "")
+                result.Start.Context.ShiftRefusedHook(defaultArg s.Refused "")
                 ValueNone
         with _ ->
             s.Undo()
@@ -2794,8 +2808,6 @@ type DeclarationChecker =
         shifted.SetFinishTypedUses result.FinishTypedUses
         ValueSome shifted
 
-    /// Runs with the reason each time Shift refuses a declaration whose text is the same at another line. For tests.
-    static member val ShiftRefusedHook: string -> unit = ignore with get, set
 
     /// The environment after the declaration of `result`, assembled from `envBefore` without checking it again: what
     /// it defined (its values and entities), what it opened, its module structure. For name resolution it equals the

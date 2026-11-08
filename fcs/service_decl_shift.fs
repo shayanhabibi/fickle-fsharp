@@ -21,25 +21,106 @@ open FSharp.Compiler.Text.Position
 open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
 
+let private finishMisses = ref 0L
+
+/// Counts a check the finish ran for a shifted result that reported at a range of the file outside the declaration.
+let CountFinishMiss () = System.Threading.Interlocked.Increment(&finishMisses.contents) |> ignore
+
+/// How many such checks have run in the process. For tests.
+let FinishMisses () = System.Threading.Interlocked.Read(&finishMisses.contents)
+
+/// The parameter of the file's method `container` names `name`, as it is now: a named argument's resolution copies
+/// the parameter's identifier, which a shift of the method's declaration moves.
+let calleeName (container: ArgumentContainer option) (name: string) =
+    match container with
+    | Some(ArgumentContainer.Method(FSharp.Compiler.Infos.FSMeth(_, _, vref, _))) when vref.IsLocalRef ->
+        match vref.Deref.ValReprInfo with
+        | Some(ValReprInfo(_, args, _)) ->
+            args
+            |> List.concat
+            |> List.tryPick (fun arg ->
+                match arg.Name with
+                | Some n when n.idText = name -> Some n
+                | _ -> None)
+        | None -> None
+    | _ -> None
+
+/// A name resolution with a named argument's parameter at its current place (see calleeName).
+let currentParameter (r: CapturedNameResolution) =
+    match r.Item with
+    | Item.OtherName(Some id, ty, None, container, m) when Range.equals m id.idRange ->
+        match calleeName container id.idText with
+        | Some current when not (Range.equals current.idRange id.idRange) ->
+            CapturedNameResolution(
+                Item.OtherName(Some current, ty, None, container, current.idRange),
+                r.ItemWithInst.TyparInstantiation,
+                r.ItemOccurrence,
+                r.NameResolutionEnv,
+                r.AccessorDomain,
+                r.Range
+            )
+        | _ -> r
+    | _ -> r
+
 /// Moves every range of one declaration's syntax by `delta` lines. A range belongs to the declaration when it is in
 /// its file and starts inside its old range: a scope that starts there and runs to the end of the module is moved
 /// whole, as every line after the declaration moved with it.
 ///
 /// What the declaration's check made (its values, entities, type parameters, local values) is moved in place, once
 /// each. What it only refers to (another declaration's values, types and type parameters) is left: that declaration
-/// is moved by its own shift, or did not move. A range of the declaration's own syntax (an expression, a diagnostic, a
-/// name resolution) that is in the file but outside the declaration cannot be told apart from another declaration's,
-/// so the shift is refused (Refused): the declaration is checked again.
+/// is moved by its own shift, or did not move. A range of the declaration's own syntax, or of an item it made, that
+/// is in the file but outside the declaration cannot be told apart from another declaration's, so the shift is
+/// refused (Refused): the declaration is checked again. Nothing in the file is ever left unmoved silently.
+///
+/// Which items a declaration made is decided by identity, not by where they are now: the first shift of a check's
+/// result records each item it moves under the check's key (`owner`, its ShareKey), and every later shift asks that
+/// record first. Only an item no shift has moved yet is decided by position, against ranges as its check left them.
+/// A position alone is not enough: an earlier declaration's item moved by its own shift in the same edit can land
+/// inside the next declaration's old range.
+///
+/// The writes in place happen under the file's FileStart lock and check lock only. Later files' checks and lazily
+/// built results read the same values, entities and type parameters on other threads without those locks, so such a
+/// reader can see some of a declaration's items moved and others not yet (or a range written while it reads it); it
+/// sees them all moved once the shift has returned. Nothing a check computes depends on these ranges.
 [<Sealed>]
-type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
+type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int, owner: obj) =
+    static let owners = System.Runtime.CompilerServices.ConditionalWeakTable<obj, obj>()
     let moved = HashSet<obj>(HashIdentity.Reference)
     let exprs = Dictionary<Expr, Expr>(HashIdentity.Reference)
     let links = Dictionary<Expr ref, Expr ref>(HashIdentity.Reference)
     let undo = ResizeArray<unit -> unit>()
     let mutable refused: string option = None
 
+    /// A shifter for what a shifted result's deferred checks report at the finish: what it needs is copied, so the
+    /// closures keep no shifter, and no chain of shifters, alive.
+    static member Create(fileIndex, oldRange, scopeEnd, delta) = Shifter(fileIndex, oldRange, scopeEnd, delta, obj ())
+
+    member _.Parameters = fileIndex, oldRange, scopeEnd, delta
+
+    /// Drops what the shift built up, once its result is made.
+    member _.Release() =
+        moved.Clear()
+        exprs.Clear()
+        links.Clear()
+        undo.Clear()
+
     /// The first reason the shift cannot be made, if any.
     member _.Refused = refused
+
+    /// Whether the declaration made `o`: the record of an earlier shift, or for an item no shift has moved yet,
+    /// `inside` (its range, as its check left it, is inside the declaration).
+    member _.Owns(o: obj, inside: bool) =
+        match owners.TryGetValue o with
+        | true, k -> obj.ReferenceEquals(k, owner)
+        | _ -> inside
+
+    /// Records that the declaration made `o`; false when another declaration's shift recorded it.
+    member _.Claim(o: obj) =
+        match owners.TryGetValue o with
+        | true, k -> obj.ReferenceEquals(k, owner)
+        | _ ->
+            owners.AddOrUpdate(o, owner)
+            true
 
     /// Records how to restore a value it is about to write in place.
     member _.Save(restore: unit -> unit) = undo.Add restore
@@ -72,8 +153,6 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
             x.Refuse $"a range of its own outside it: %s{stringOfRange m}"
             m
 
-    /// A range that may be another declaration's: moved only when it is this one's.
-    member x.IfOwn(m: range) = if x.Belongs m then x.Move m else m
 
     /// The scope of an environment or an open the declaration's check notified: it can start after the declaration,
     /// where the declarations after it start, and runs to the end of the enclosing module; it is moved when it starts
@@ -82,18 +161,22 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
     member x.Scope(m: range) =
         if m.FileIndex = fileIndex && posGeq m.Start oldRange.Start && posGeq scopeEnd m.Start then x.Move m else x.Own m
 
-    member x.IdentIfOwn(id: Ident) = if x.Belongs id.idRange then Ident(id.idText, x.Move id.idRange) else id
+    /// An identifier of the declaration's own syntax or items, as Own.
+    member x.IdentOwn(id: Ident) =
+        let m = x.Own id.idRange
+        if Range.equals m id.idRange then id else Ident(id.idText, m)
 
-    /// A shifter of the same declaration and delta that has moved nothing and refused nothing.
-    member _.Fresh() = Shifter(fileIndex, oldRange, scopeEnd, delta)
+    member x.OtherRange(other: (range * bool) option) = other |> Option.map (fun (m, isImpl) -> x.Own m, isImpl)
 
     /// Whether `o` has not been moved yet, marking it moved.
     member _.First(o: obj) = moved.Add o
 
     // ---- Attributes, type parameters and argument infos ----
 
+    /// An attribute of an item the declaration made: in the declaration, or in another file (a signature's)
     member x.Attrib(Attrib(tcref, kind, args, props, appliedToGetterOrSetter, targets, m) as attrib) =
         if not (x.Belongs m) then
+            x.Own m |> ignore
             attrib
         else
             let attribExpr (AttribExpr(source, evaluated)) = AttribExpr(x.Expr source, x.Expr evaluated)
@@ -115,25 +198,27 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
 
     member x.Constraint(c: TyparConstraint) =
         match c with
-        | TyparConstraint.CoercesTo(ty, m) -> TyparConstraint.CoercesTo(ty, x.IfOwn m)
-        | TyparConstraint.DefaultsTo(priority, ty, m) -> TyparConstraint.DefaultsTo(priority, ty, x.IfOwn m)
-        | TyparConstraint.SupportsNull m -> TyparConstraint.SupportsNull(x.IfOwn m)
-        | TyparConstraint.NotSupportsNull m -> TyparConstraint.NotSupportsNull(x.IfOwn m)
-        | TyparConstraint.MayResolveMember(info, m) -> TyparConstraint.MayResolveMember(info, x.IfOwn m)
-        | TyparConstraint.IsNonNullableStruct m -> TyparConstraint.IsNonNullableStruct(x.IfOwn m)
-        | TyparConstraint.IsReferenceType m -> TyparConstraint.IsReferenceType(x.IfOwn m)
-        | TyparConstraint.SimpleChoice(tys, m) -> TyparConstraint.SimpleChoice(tys, x.IfOwn m)
-        | TyparConstraint.RequiresDefaultConstructor m -> TyparConstraint.RequiresDefaultConstructor(x.IfOwn m)
-        | TyparConstraint.IsEnum(ty, m) -> TyparConstraint.IsEnum(ty, x.IfOwn m)
-        | TyparConstraint.SupportsComparison m -> TyparConstraint.SupportsComparison(x.IfOwn m)
-        | TyparConstraint.SupportsEquality m -> TyparConstraint.SupportsEquality(x.IfOwn m)
-        | TyparConstraint.IsDelegate(aty, bty, m) -> TyparConstraint.IsDelegate(aty, bty, x.IfOwn m)
-        | TyparConstraint.IsUnmanaged m -> TyparConstraint.IsUnmanaged(x.IfOwn m)
-        | TyparConstraint.AllowsRefStruct m -> TyparConstraint.AllowsRefStruct(x.IfOwn m)
+        | TyparConstraint.CoercesTo(ty, m) -> TyparConstraint.CoercesTo(ty, x.Own m)
+        | TyparConstraint.DefaultsTo(priority, ty, m) -> TyparConstraint.DefaultsTo(priority, ty, x.Own m)
+        | TyparConstraint.SupportsNull m -> TyparConstraint.SupportsNull(x.Own m)
+        | TyparConstraint.NotSupportsNull m -> TyparConstraint.NotSupportsNull(x.Own m)
+        | TyparConstraint.MayResolveMember(info, m) -> TyparConstraint.MayResolveMember(info, x.Own m)
+        | TyparConstraint.IsNonNullableStruct m -> TyparConstraint.IsNonNullableStruct(x.Own m)
+        | TyparConstraint.IsReferenceType m -> TyparConstraint.IsReferenceType(x.Own m)
+        | TyparConstraint.SimpleChoice(tys, m) -> TyparConstraint.SimpleChoice(tys, x.Own m)
+        | TyparConstraint.RequiresDefaultConstructor m -> TyparConstraint.RequiresDefaultConstructor(x.Own m)
+        | TyparConstraint.IsEnum(ty, m) -> TyparConstraint.IsEnum(ty, x.Own m)
+        | TyparConstraint.SupportsComparison m -> TyparConstraint.SupportsComparison(x.Own m)
+        | TyparConstraint.SupportsEquality m -> TyparConstraint.SupportsEquality(x.Own m)
+        | TyparConstraint.IsDelegate(aty, bty, m) -> TyparConstraint.IsDelegate(aty, bty, x.Own m)
+        | TyparConstraint.IsUnmanaged m -> TyparConstraint.IsUnmanaged(x.Own m)
+        | TyparConstraint.AllowsRefStruct m -> TyparConstraint.AllowsRefStruct(x.Own m)
 
-    /// A type parameter this declaration declares or inferred (its name is in the declaration), moved in place.
+    /// A type parameter this declaration declares or inferred, moved in place. One another declaration made (its name
+    /// is there, or its shift recorded it) is that declaration's to move, by its own shift or by checking it again,
+    /// which checks again what depends on it: a shifted row does not keep results of a re-checked one (FileGraph).
     member x.Typar(tp: Typar) =
-        if x.Belongs tp.Range && x.First tp then
+        if x.First tp && x.Owns(tp, x.Belongs tp.Range) && x.Claim tp then
             let id = tp.typar_id
             x.Save(fun () -> tp.typar_id <- id)
             tp.typar_id <- Ident(id.idText, x.Move id.idRange)
@@ -152,8 +237,15 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
 
     member x.Typars(tps: Typars) = List.iter x.Typar tps
 
-    member x.ArgReprInfo(info: ArgReprInfo) =
-        if x.First info then
+    /// The argument info of a value this declaration made.
+    member x.ArgReprInfo(info: ArgReprInfo) = x.ArgReprInfoWith(info, true)
+
+    /// An argument info a name resolution holds (a named argument's): another declaration's when that one's value
+    /// holds it, which is decided as for type parameters.
+    member x.ArgReprInfoWith(info: ArgReprInfo, ofOwnValue: bool) =
+        let inside = ofOwnValue || (info.Name |> Option.exists (fun id -> x.Belongs id.idRange))
+
+        if x.First info && x.Owns(info, inside) && x.Claim info then
             let name, otherRange, attribs = info.Name, info.OtherRange, info.Attribs
 
             x.Save(fun () ->
@@ -161,8 +253,8 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                 info.OtherRange <- otherRange
                 info.Attribs <- attribs)
 
-            info.Name <- info.Name |> Option.map x.IdentIfOwn
-            info.OtherRange <- info.OtherRange |> Option.map x.IfOwn
+            info.Name <- info.Name |> Option.map x.IdentOwn
+            info.OtherRange <- info.OtherRange |> Option.map x.Own
             info.Attribs <- x.WellKnown info.Attribs
 
     member x.ValReprInfo(ValReprInfo(typars, args, ret)) =
@@ -170,19 +262,22 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
             List.iter x.ArgReprInfo group
 
         x.ArgReprInfo ret
-        ValReprInfo(typars |> List.map (fun (TyparReprInfo(id, kind)) -> TyparReprInfo(x.IdentIfOwn id, kind)), args, ret)
+        ValReprInfo(typars |> List.map (fun (TyparReprInfo(id, kind)) -> TyparReprInfo(x.IdentOwn id, kind)), args, ret)
 
     // ---- Values and entities ----
 
     /// A value this declaration made: a module value or member it publishes, or a local value its expressions bind.
     member x.Val(v: Val) =
         if x.First v then
-            if v.val_range.FileIndex = fileIndex && not (x.Belongs v.val_range) then
+            if not (x.Owns(v, true)) then
+                x.Refuse $"its value %s{v.LogicalName} was moved by another declaration's shift"
+            elif v.val_range.FileIndex = fileIndex && not (x.Belongs v.val_range) then
                 x.Refuse $"its value %s{v.LogicalName} is outside it: %s{stringOfRange v.val_range}"
             else
+                x.Claim v |> ignore
                 let m = v.val_range
                 x.Save(fun () -> v.val_range <- m)
-                v.val_range <- x.IfOwn m
+                v.val_range <- x.Own m
 
                 match v.Type with
                 | TType_forall(tps, _) -> x.Typars tps
@@ -199,7 +294,7 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                         data.val_attribs <- saved.val_attribs
                         data.val_defn <- saved.val_defn)
 
-                    data.val_other_range <- data.val_other_range |> Option.map (fun (m, isImpl) -> x.IfOwn m, isImpl)
+                    data.val_other_range <- data.val_other_range |> Option.map (fun (m, isImpl) -> x.Own m, isImpl)
                     data.val_repr_info <- data.val_repr_info |> Option.map x.ValReprInfo
                     data.val_repr_info_for_display <- data.val_repr_info_for_display |> Option.map x.ValReprInfo
                     data.arg_repr_info_for_display |> Option.iter x.ArgReprInfo
@@ -217,8 +312,8 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                 f.rfield_pattribs <- pattribs
                 f.rfield_fattribs <- fattribs)
 
-            f.rfield_id <- x.IdentIfOwn f.rfield_id
-            f.rfield_other_range <- f.rfield_other_range |> Option.map (fun (m, isImpl) -> x.IfOwn m, isImpl)
+            f.rfield_id <- x.IdentOwn f.rfield_id
+            f.rfield_other_range <- f.rfield_other_range |> Option.map (fun (m, isImpl) -> x.Own m, isImpl)
             f.rfield_pattribs <- x.Attribs f.rfield_pattribs
             f.rfield_fattribs <- x.Attribs f.rfield_fattribs
 
@@ -227,16 +322,19 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
     /// declarations hold the rest.
     member x.EntityWith(e: Entity, withContents: bool) =
         if x.First e then
-            if e.entity_range.FileIndex = fileIndex && not (x.Belongs e.entity_range) then
+            if not (x.Owns(e, true)) then
+                x.Refuse $"its entity %s{e.LogicalName} was moved by another declaration's shift"
+            elif e.entity_range.FileIndex = fileIndex && not (x.Belongs e.entity_range) then
                 x.Refuse $"its entity %s{e.LogicalName} is outside it: %s{stringOfRange e.entity_range}"
             else
+                x.Claim e |> ignore
                 let m, attribs = e.entity_range, e.EntityAttribs
 
                 x.Save(fun () ->
                     e.entity_range <- m
                     e.SetEntityAttribs attribs)
 
-                e.entity_range <- x.IfOwn m
+                e.entity_range <- x.Own m
                 x.Typars e.Typars
                 e.SetEntityAttribs(x.WellKnown attribs)
 
@@ -244,7 +342,7 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                 | Some data when x.First data ->
                     let otherRange = data.entity_other_range
                     x.Save(fun () -> data.entity_other_range <- otherRange)
-                    data.entity_other_range <- otherRange |> Option.map (fun (m, isImpl) -> x.IfOwn m, isImpl)
+                    data.entity_other_range <- otherRange |> Option.map (fun (m, isImpl) -> x.Own m, isImpl)
 
                     match data.entity_exn_info with
                     | TExnFresh fields -> Array.iter x.RecdField fields.FieldsByIndex
@@ -260,8 +358,8 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                             case.OtherRangeOpt <- otherRange
                             case.Attribs <- caseAttribs)
 
-                        case.Id <- x.IdentIfOwn case.Id
-                        case.OtherRangeOpt <- case.OtherRangeOpt |> Option.map (fun (m, isImpl) -> x.IfOwn m, isImpl)
+                        case.Id <- x.IdentOwn case.Id
+                        case.OtherRangeOpt <- case.OtherRangeOpt |> Option.map (fun (m, isImpl) -> x.Own m, isImpl)
                         case.Attribs <- x.Attribs case.Attribs
                         Array.iter x.RecdField case.RecdFieldsArray
 
@@ -271,7 +369,7 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                     let aug = e.TypeContents
                     let interfaces = aug.tcaug_interfaces
                     x.Save(fun () -> aug.tcaug_interfaces <- interfaces)
-                    aug.tcaug_interfaces <-aug.tcaug_interfaces |> List.map (fun (ty, compGen, m) -> ty, compGen, x.IfOwn m)
+                    aug.tcaug_interfaces <-aug.tcaug_interfaces |> List.map (fun (ty, compGen, m) -> ty, compGen, x.Own m)
 
                     // An augmentation elsewhere in the file adds its members here too: its own shift moves them
                     match aug.tcaug_adhoc_list with
@@ -457,7 +555,7 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
     /// A value a name resolution refers to: moved when this declaration made it. A class's `let` value is bound
     /// nowhere in its typed contents (its uses read the class's field), so only its resolutions reach it.
     member x.ValIfOwn(vref: ValRef) =
-        if vref.IsLocalRef && x.Belongs vref.Deref.val_range then
+        if vref.IsLocalRef && x.Owns(vref.Deref, x.Belongs vref.Deref.val_range) then
             x.Val vref.Deref
 
     member x.Item(item: Item) =
@@ -468,15 +566,21 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
         | Item.ActivePatternCase(APElemRef(_, vref, _, _)) ->
             x.ValIfOwn vref
             item
-        | Item.ActivePatternResult(info, ty, idx, m) ->Item.ActivePatternResult(info, ty, idx, x.IfOwn m)
-        | Item.AnonRecdField(info, tys, idx, m) -> Item.AnonRecdField(info, tys, idx, x.IfOwn m)
-        | Item.NewDef id -> Item.NewDef(x.IdentIfOwn id)
-        | Item.Property(name, infos, Some m) -> Item.Property(name, infos, Some(x.IfOwn m))
-        | Item.ImplicitOp(id, sln) -> Item.ImplicitOp(x.IdentIfOwn id, sln)
+        | Item.ActivePatternResult(info, ty, idx, m) ->Item.ActivePatternResult(info, ty, idx, x.Own m)
+        | Item.AnonRecdField(info, tys, idx, m) -> Item.AnonRecdField(info, tys, idx, x.Own m)
+        | Item.NewDef id -> Item.NewDef(x.IdentOwn id)
+        | Item.Property(name, infos, Some m) -> Item.Property(name, infos, Some(x.Own m))
+        | Item.ImplicitOp(id, sln) -> Item.ImplicitOp(x.IdentOwn id, sln)
+        // A named argument of a method of the file names the method's parameter, which the method's declaration owns and
+        // its shift moves: the resolution is given the parameter's current name when the results are built (calleeName)
+        | Item.OtherName(Some id, _, None, container, m) when
+            not (x.Belongs id.idRange) && Range.equals m id.idRange && (calleeName container id.idText).IsSome
+            ->
+            item
         | Item.OtherName(id, ty, argInfo, container, m) ->
-            Option.iter x.ArgReprInfo argInfo
-            Item.OtherName(Option.map x.IdentIfOwn id, ty, argInfo, container, x.IfOwn m)
-        | Item.SetterArg(id, inner) -> Item.SetterArg(x.IdentIfOwn id, x.Item inner)
+            argInfo |> Option.iter (fun info -> x.ArgReprInfoWith(info, false))
+            Item.OtherName(Option.map x.IdentOwn id, ty, argInfo, container, x.Own m)
+        | Item.SetterArg(id, inner) -> Item.SetterArg(x.IdentOwn id, x.Item inner)
         | Item.TypeVar(_, tp) ->
             x.Typar tp
             item
