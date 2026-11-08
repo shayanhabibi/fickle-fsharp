@@ -543,6 +543,7 @@ type DeclarationResult
         rawDiagnostics: PhasedDiagnostic[],
         leavesFreeTypars: bool,
         dependsOnLater: bool,
+        openTypars: Typar[],
         leavesUnsolved: bool,
         slotsAtCheck: IReadOnlyDictionary<Val, SlotSig list * bool>,
         envAfter: DeclEnv,
@@ -597,6 +598,15 @@ type DeclarationResult
     /// which entity references compare by object, so a result holding the old ones is not one to check against the new
     /// ones, whatever their fingerprints say.
     member _.DefinesEntities = not (Seq.isEmpty delta.AllEntities)
+
+    /// The inference variables that made this result DependsOnLaterDeclarations, as the check left them: every one that
+    /// is open is one of these, and it is empty exactly when the result does not depend on later declarations.
+    member internal _.OpenTypars = openTypars
+
+    /// `OpenTypars`, each with where it comes from. For diagnosing why a result depends on later declarations.
+    member _.DescribeOpenTypars() =
+        openTypars
+        |> Array.map (fun tp -> $"%s{tp.DisplayName}#%d{tp.Stamp} at %s{tp.Range.FileName}(%d{tp.Range.StartLine},%d{tp.Range.StartColumn}) solved=%b{tp.IsSolved} rigidity=%A{tp.Rigidity}")
 
     /// Whether the check left an inference variable nothing has solved anywhere in what it checked, bodies included.
     /// The finish's defaults solve such a variable, or not when an earlier default in the file fails, so what the
@@ -1636,6 +1646,26 @@ module internal DeclarationCheck =
            |> List.collect inlineBodies
            |> List.exists (fun (_, body) -> anySolvable (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars)
 
+    /// The inference variables `leavesOpenTypes` and `ComputeUngeneralizableTypars` find, as they stand.
+    let openTypars (env: TcEnv) (contribution: ModuleOrNamespaceType) ((contents, _, _): CheckedDeclaration) =
+        let found = ResizeArray<Typar>()
+
+        let add (typars: Zset<Typar>) =
+            typars |> Zset.iter (fun tp -> if tp.Rigidity <> TyparRigidity.Rigid then found.Add tp)
+
+        add (GeneralizationHelpers.ComputeUngeneralizableTypars env)
+        add (freeInModuleTy contribution).FreeTypars
+
+        for _, body in contents |> List.collect inlineBodies do
+            add (freeInExpr CollectTyparsNoCaching body).FreeTyvars.FreeTypars
+
+        found.ToArray() |> Array.distinctBy _.Stamp
+
+    /// Whether an inference variable a check left is open now: its solution, followed through, or a variable a
+    /// constraint links it to, is still to be solved.
+    let isOpen (tp: Typar) =
+        anySolvable (freeInType CollectTyparsNoCaching (mkTyparTy tp)).FreeTypars
+
     /// Whether what a declaration publishes, or anything it checked (every body, not only inline ones), holds an
     /// inference variable nothing has solved.
     ///
@@ -2493,6 +2523,29 @@ type DeclarationChecker =
                 ct.ThrowIfCancellationRequested()
                 DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct)))
 
+    /// Whether an inference variable that any of `results` left is still open, with the latest finish undone: the
+    /// finish's defaults never count as solving one. Results checked in order with nothing checked after the last are
+    /// what later declarations would see.
+    static member WindowOpen(start: FileStart, results: DeclarationResult[], ct: CancellationToken) : bool =
+        lock start.Sync (fun () ->
+            start.UndoLastFinish()
+
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                ct.ThrowIfCancellationRequested()
+                results |> Array.exists (fun result -> result.OpenTypars |> Array.exists DeclarationCheck.isOpen)))
+
+    /// The fingerprints of `results` as they stand, with the latest finish undone: for a result that depended on later
+    /// declarations, what the declarations after them see once they have been solved.
+    static member PrintsNow(start: FileStart, results: DeclarationResult[]) : string[] =
+        lock start.Sync (fun () ->
+            start.UndoLastFinish()
+
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                let state = start.Context.State
+                let _, logger = DeclarationCheck.newLoggers state
+                use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+                results |> Array.map (fun result -> DeclarationCheck.fingerprintOf result.Delta result.Checked result.SlotsAtCheck)))
+
     static member private CheckDeclarationLocked(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         let state = start.Context.State
         let capturing, logger = DeclarationCheck.newLoggers state
@@ -2652,6 +2705,7 @@ type DeclarationChecker =
             logger.Diagnostics,
             leavesFreeTypars,
             dependsOnLater,
+            DeclarationCheck.openTypars envAfter.Env delta checkedDecl,
             leavesUnsolved,
             slots,
             envAfter,
@@ -2812,6 +2866,7 @@ type DeclarationChecker =
                 rawDiagnostics,
                 result.LeavesFreeTypars,
                 result.DependsOnLaterDeclarations,
+                result.OpenTypars,
                 result.LeavesUnsolved,
                 result.SlotsAtCheck,
                 envAfter,
