@@ -73,7 +73,7 @@ type DeclarationContent =
       /// Something resolves to a name the syntax does not show, such as the `?` operator: the declaration depends on
       /// every earlier declaration
       HasUnresolvable: bool
-      /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a unit of measure, a module abbreviation,
+      /// Every later declaration depends on this one: open, an [<AutoOpen>] module, a module abbreviation,
       /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
       /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
       /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
@@ -1394,23 +1394,7 @@ module internal DeclarationCheck =
         | SynModuleDecl.Attributes _
         | SynModuleDecl.Expr _
         | SynModuleDecl.HashDirective _ -> true
-        // What may be a unit of measure: a type's free entities leave out the units in it, so TypedUses does not show
-        // what uses one. The attribute can go by another name, so any attribute counts on what a unit can be: an
-        // abbreviation, or a definition whose kind is not written with no constructor and only static members.
-        | SynModuleDecl.Types(typeDefns, _) ->
-            let onlyStatic (members: SynMemberDefn list) =
-                members
-                |> List.forall (function
-                    | SynMemberDefn.Member(memberDefn = SynBinding(valData = SynValData(memberFlags = Some flags))) -> not flags.IsInstance
-                    | _ -> false)
-
-            typeDefns
-            |> List.exists (fun (SynTypeDefn(typeInfo = SynComponentInfo(attributes = attributes); typeRepr = repr; members = extra; implicitConstructor = ctor)) ->
-                not attributes.IsEmpty
-                && (match repr with
-                    | SynTypeDefnRepr.Simple((SynTypeDefnSimpleRepr.TypeAbbrev _ | SynTypeDefnSimpleRepr.None _), _) -> ctor.IsNone
-                    | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Unspecified; members = members) -> ctor.IsNone && onlyStatic members && onlyStatic extra
-                    | _ -> findSynAttribute "Measure" attributes))
+        | SynModuleDecl.Types _ -> false
         // Any attribute: [<AutoOpen>] can go by another name
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes); decls = decls) ->
             not attributes.IsEmpty || List.exists inner decls
@@ -1850,8 +1834,58 @@ module internal DeclarationCheck =
             Zset.iter addTycon ftyvs.FreeTycons
             Zset.iter addVal ftyvs.FreeTraitSolutions
 
-        let addType ty = addTyvars (freeInType CollectAll ty)
         let addTcref (tcref: TyconRef) = if tcref.IsLocalRef then addTycon tcref.Deref
+
+        // A type's free entities leave out the units of measure in it, which entity references compare by object as they
+        // do any other's
+        let seenTypars = HashSet<Stamp>()
+
+        let rec addUnitsOfMeasure (unt: Measure) =
+            match stripUnitEqns unt with
+            | Measure.Const(tcref, _) -> addTcref tcref
+            | Measure.Prod(a, b, _) ->
+                addUnitsOfMeasure a
+                addUnitsOfMeasure b
+            | Measure.Inv a
+            | Measure.RationalPower(a, _) -> addUnitsOfMeasure a
+            | Measure.Var _
+            | Measure.One _ -> ()
+
+        let rec addUnits (ty: TType) =
+            match stripTyparEqns ty with
+            | TType_measure unt -> addUnitsOfMeasure unt
+            | TType_app(_, tinst, _)
+            | TType_ucase(_, tinst)
+            | TType_tuple(_, tinst)
+            | TType_anon(_, tinst) -> List.iter addUnits tinst
+            | TType_fun(domainTy, rangeTy, _) ->
+                addUnits domainTy
+                addUnits rangeTy
+            | TType_forall(tps, bodyTy) ->
+                List.iter addUnitsOfTypar tps
+                addUnits bodyTy
+            | TType_var(tp, _) -> addUnitsOfTypar tp
+
+        and addUnitsOfTypar (tp: Typar) =
+            if seenTypars.Add tp.Stamp then
+                for constr in tp.Constraints do
+                    match constr with
+                    | TyparConstraint.CoercesTo(ty, _)
+                    | TyparConstraint.DefaultsTo(_, ty, _)
+                    | TyparConstraint.IsEnum(ty, _) -> addUnits ty
+                    | TyparConstraint.IsDelegate(a, b, _) ->
+                        addUnits a
+                        addUnits b
+                    | TyparConstraint.SimpleChoice(tys, _) -> List.iter addUnits tys
+                    | TyparConstraint.MayResolveMember(TTrait(tys = tys; objAndArgTys = argTys; returnTyOpt = returnTy), _) ->
+                        List.iter addUnits tys
+                        List.iter addUnits argTys
+                        Option.iter addUnits returnTy
+                    | _ -> ()
+
+        let addType ty =
+            addTyvars (freeInType CollectAll ty)
+            addUnits ty
         let addVref (vref: ValRef) = if vref.IsLocalRef then addVal vref.Deref
 
         let addFreeVars (fvs: FreeVars) =
@@ -1903,6 +1937,7 @@ module internal DeclarationCheck =
         let rec published (mty: ModuleOrNamespaceType) =
             for v in mty.AllValsAndMembers do
                 addTyvars (freeInVal CollectAll v)
+                addUnits v.Type
 
             for entity in mty.AllEntities do
                 if entity.IsModuleOrNamespace then
@@ -1933,6 +1968,7 @@ module internal DeclarationCheck =
                 addType ty
 
             addTyvars (accFreeInTypars CollectAll tycon.Typars emptyFreeTyvars)
+            List.iter addUnitsOfTypar tycon.Typars
 
         refs.Remove self |> ignore
         refs |> Array.ofSeq |> Array.sort, [| for kv in held -> kv.Key, kv.Value |]
