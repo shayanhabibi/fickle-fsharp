@@ -593,6 +593,11 @@ type DeclarationResult
     /// current results (ruling R15), so they need no dependency.
     member _.DependsOnLaterDeclarations = dependsOnLater
 
+    /// Whether the declaration publishes a type, an exception or a module. Another check of it gives new entities,
+    /// which entity references compare by object, so a result holding the old ones is not one to check against the new
+    /// ones, whatever their fingerprints say.
+    member _.DefinesEntities = not (Seq.isEmpty delta.AllEntities)
+
     /// Whether the check left an inference variable nothing has solved anywhere in what it checked, bodies included.
     /// The finish's defaults solve such a variable, or not when an earlier default in the file fails, so what the
     /// finish renders and takes for this result depends on the other declarations of the file.
