@@ -406,13 +406,32 @@ type internal Leftovers
         for KeyValue(key, m) in namedDebugPoints do
             into.namedDebugPointsForInlinedCode[key] <- m
 
-    /// Checks the finish runs, which hold the ranges they report at where no shift reaches them
-    member _.HasDeferredChecks = preDefaults.Length > 0 || final.Length > 0 || not deferredUnionNullnessChecks.IsEmpty
+    /// Deferred union nullness checks, which compare a range they keep to themselves with one in the solver's state:
+    /// a shift could move only one of them.
+    member _.HasDeferredChecks = not deferredUnionNullnessChecks.IsEmpty
 
+    /// Whether the finish runs checks this check deferred
+    member _.HasFinishChecks = preDefaults.Length > 0 || final.Length > 0
+
+    /// The checks the finish runs (post-inference checks, such as a member constraint retried or a type's nullness)
+    /// keep the ranges they report at to themselves: each is run with what it reports, and what it raises, moved.
     member _.Shifted(s: DeclarationShift.Shifter) =
+        let moved (check: unit -> unit) =
+            fun () ->
+                // Its own shifter: one that refuses has no effect at the finish, which leaves the range as it was
+                let s = s.Fresh()
+                use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+
+                try
+                    check ()
+                with e ->
+                    match s.Exn e with
+                    | same when obj.ReferenceEquals(same, e) -> reraise ()
+                    | movedExn -> raise movedExn
+
         Leftovers(
-            preDefaults,
-            final,
+            Array.map moved preDefaults,
+            Array.map moved final,
             extraCxs |> List.map (fun (stamp, (info, m)) -> stamp, (info, s.Own m)),
             unionsWithDeferredAttributes,
             deferredUnionNullnessChecks,
@@ -586,6 +605,11 @@ type DeclarationResult
     member internal _.Delta: ModuleOrNamespaceType = delta
     /// Whether the delta is combined into the file's contents, as a namespace fragment's is, rather than added.
     member internal _.DeltaCombines = deltaCombines
+
+    /// Whether the check deferred checks to the finish (post-inference checks), which a shift moves as they run. For
+    /// tests.
+    member _.DefersChecks = leftovers.HasFinishChecks
+
     member internal _.Sink = sink
     member internal _.Leftovers = leftovers
     member internal _.Nesting = nesting
@@ -2619,7 +2643,8 @@ type DeclarationChecker =
     ///
     /// ValueNone when the declaration is not the same at another line, or when what the check left holds a range of
     /// the declaration's own syntax elsewhere in the file (which another declaration's, moved or not, could be), or
-    /// checks the finish runs with ranges they keep to themselves: check the declaration again.
+    /// deferred union nullness checks (Leftovers.HasDeferredChecks): check the declaration again. The other checks the
+    /// finish runs for it are run with what they report, and what they raise, moved.
     ///
     /// Like CheckDeclaration, it undoes the latest FinishFile on the same FileStart first, under the FileStart's lock
     /// and then the file's check lock, so no finish's saved values (conformance's other ranges among them) are left to
@@ -2635,17 +2660,22 @@ type DeclarationChecker =
             let start = result.Start
 
             lock start.Sync (fun () ->
-                let mutable latest = result
+                let chain = ResizeArray [ result ]
 
-                while not (isNull latest.ShiftedTo) do
-                    latest <- !!latest.ShiftedTo
+                while not (isNull chain[chain.Count - 1].ShiftedTo) do
+                    chain.Add(!!chain[chain.Count - 1].ShiftedTo)
+
+                let latest = chain[chain.Count - 1]
 
                 if latest.Declaration.Range.Start = decl.Range.Start && not (obj.ReferenceEquals(latest, result)) then
                     ValueSome latest
                 else
                     match DeclarationChecker.ShiftFrom(latest, decl) with
                     | ValueSome shifted as found ->
-                        latest.ShiftedTo <- shifted
+                        // Each earlier result points at the latest, so the results in between can be collected
+                        for r in chain do
+                            r.ShiftedTo <- shifted
+
                         found
                     | ValueNone -> ValueNone)
 
@@ -2663,9 +2693,11 @@ type DeclarationChecker =
             || decl.Depth <> old.Depth
             || decl.IsModuleHeader <> old.IsModuleHeader
             || not (String.Equals(decl.Range.FileName, old.Range.FileName, StringComparison.Ordinal))
-            || result.Leftovers.HasDeferredChecks
             || result.Start.Context.RefuseShifts
         then
+            ValueNone
+        elif result.Leftovers.HasDeferredChecks then
+            DeclarationChecker.ShiftRefusedHook $"%A{old.Key.Name}: it holds deferred union nullness checks"
             ValueNone
         else
             let start = result.Start

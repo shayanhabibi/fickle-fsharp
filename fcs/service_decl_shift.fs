@@ -84,6 +84,9 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
 
     member x.IdentIfOwn(id: Ident) = if x.Belongs id.idRange then Ident(id.idText, x.Move id.idRange) else id
 
+    /// A shifter of the same declaration and delta that has moved nothing and refused nothing.
+    member _.Fresh() = Shifter(fileIndex, oldRange, scopeEnd, delta)
+
     /// Whether `o` has not been moved yet, marking it moved.
     member _.First(o: obj) = moved.Add o
 
@@ -270,12 +273,12 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int) =
                     x.Save(fun () -> aug.tcaug_interfaces <- interfaces)
                     aug.tcaug_interfaces <-aug.tcaug_interfaces |> List.map (fun (ty, compGen, m) -> ty, compGen, x.IfOwn m)
 
+                    // An augmentation elsewhere in the file adds its members here too: its own shift moves them
                     match aug.tcaug_adhoc_list with
                     | null -> ()
                     | members ->
                         for _, vref in members do
-                            if vref.IsLocalRef then
-                                x.Val vref.Deref
+                            x.ValIfOwn vref
                 elif withContents then
                     x.ModuleType e.ModuleOrNamespaceType
 
@@ -611,3 +614,11 @@ and [<Sealed>] ObjectShift private () =
             | _ -> e
 
     static member Exn(s: Shifter, e: exn) = ObjectShift.ExnAt(s, e, 0)
+
+/// Passes each diagnostic on with its ranges moved.
+[<Sealed>]
+type ShiftingLogger(next: DiagnosticsLogger, shift: PhasedDiagnostic -> PhasedDiagnostic) =
+    inherit DiagnosticsLogger("ShiftingLogger")
+    override _.DiagnosticSink diagnostic = next.DiagnosticSink(shift diagnostic)
+    override _.ErrorCount = next.ErrorCount
+    override _.CheckForRealErrorsIgnoringWarnings = next.CheckForRealErrorsIgnoringWarnings
