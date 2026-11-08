@@ -269,12 +269,17 @@ type Shifter(fileIndex: int, oldRange: range, scopeEnd: pos, delta: int, owner: 
     /// A value this declaration made: a module value or member it publishes, or a local value its expressions bind.
     member x.Val(v: Val) =
         if x.First v then
-            if not (x.Owns(v, true)) then
+            // A local value is reachable from its own declaration only, so only the others need a record
+            let shared = v.IsModuleBinding || v.IsMember
+
+            if shared && not (x.Owns(v, true)) then
                 x.Refuse $"its value %s{v.LogicalName} was moved by another declaration's shift"
             elif v.val_range.FileIndex = fileIndex && not (x.Belongs v.val_range) then
                 x.Refuse $"its value %s{v.LogicalName} is outside it: %s{stringOfRange v.val_range}"
             else
-                x.Claim v |> ignore
+                if shared then
+                    x.Claim v |> ignore
+
                 let m = v.val_range
                 x.Save(fun () -> v.val_range <- m)
                 v.val_range <- x.Own m
