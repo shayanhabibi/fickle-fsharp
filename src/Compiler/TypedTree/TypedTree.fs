@@ -1869,7 +1869,8 @@ type UnionCase =
       mutable XmlDocSig: string
 
       /// Name/range of the case
-      Id: Ident
+      // MUTABILITY: moved when a line insert shifts the declaration (DeclarationChecker.Shift)
+      mutable Id: Ident
 
       /// If this field is populated, this is the implementation range for an item in a signature, otherwise it is
       /// the signature range for an item in an implementation
@@ -1999,7 +2000,8 @@ type RecdField =
       mutable rfield_fattribs: Attribs
 
       /// Name/declaration-location of the field
-      rfield_id: Ident
+      // MUTABILITY: moved when a line insert shifts the declaration (DeclarationChecker.Shift)
+      mutable rfield_id: Ident
 
       rfield_name_generated: bool
 

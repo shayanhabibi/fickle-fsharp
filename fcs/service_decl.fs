@@ -235,6 +235,10 @@ type ProjectContext internal (state: CompilerState) =
     /// For tests: how many times CheckFile's results on this context built a name-resolution sink and check results.
     member _.CheckResultsBuilt = checks.CheckResultsBuilt
 
+    /// For tests: when set, DeclarationChecker.Shift refuses every declaration of this context, so its callers check
+    /// them again.
+    member val RefuseShifts = false with get, set
+
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
     member internal _.ParseLock(fileName: string) = parseLocks.GetOrAdd(fileName, fun _ -> obj ())
@@ -360,6 +364,62 @@ type internal Nesting =
 type internal FinishUndo() =
     member val Log: ResizeArray<unit -> unit> | null = null with get, set
 
+/// What checking left in cenv that CheckImplFileTail reads, to replay into the finish's own cenv.
+[<Sealed>]
+type internal Leftovers
+    (
+        preDefaults: (unit -> unit)[],
+        final: (unit -> unit)[],
+        extraCxs: (Stamp * (TraitConstraintInfo * range)) list,
+        unionsWithDeferredAttributes: Set<Stamp>,
+        deferredUnionNullnessChecks: (TType * range) list,
+        createsGeneratedProvidedTypes: bool,
+        namedDebugPoints: KeyValuePair<NamedDebugPointKey, range>[]
+    ) =
+    static member Of(cenv: TcFileState) =
+        let css = cenv.css
+
+        Leftovers(
+            css.PostInferenceChecksPreDefaults.ToArray(),
+            css.PostInferenceChecksFinal.ToArray(),
+            // Oldest first for each type variable, so adding them again keeps their order
+            css.ExtraCxs.Fold (fun stamp cx acc -> (stamp, cx) :: acc) [],
+            css.UnionsWithDeferredAttributes,
+            css.DeferredUnionNullnessChecks,
+            cenv.createsGeneratedProvidedTypes,
+            Array.ofSeq cenv.namedDebugPointsForInlinedCode
+        )
+
+    member _.Apply(into: TcFileState) =
+        into.css.PostInferenceChecksPreDefaults.AddRange preDefaults
+        into.css.PostInferenceChecksFinal.AddRange final
+
+        for stamp, cx in extraCxs do
+            into.css.ExtraCxs.Add(stamp, cx)
+
+        into.css.UnionsWithDeferredAttributes <- Set.union into.css.UnionsWithDeferredAttributes unionsWithDeferredAttributes
+        into.css.DeferredUnionNullnessChecks <- deferredUnionNullnessChecks @ into.css.DeferredUnionNullnessChecks
+
+        if createsGeneratedProvidedTypes then
+            into.createsGeneratedProvidedTypes <- true
+
+        for KeyValue(key, m) in namedDebugPoints do
+            into.namedDebugPointsForInlinedCode[key] <- m
+
+    /// Checks the finish runs, which hold the ranges they report at where no shift reaches them
+    member _.HasDeferredChecks = preDefaults.Length > 0 || final.Length > 0 || not deferredUnionNullnessChecks.IsEmpty
+
+    member _.Shifted(s: DeclarationShift.Shifter) =
+        Leftovers(
+            preDefaults,
+            final,
+            extraCxs |> List.map (fun (stamp, (info, m)) -> stamp, (info, s.Own m)),
+            unionsWithDeferredAttributes,
+            deferredUnionNullnessChecks,
+            createsGeneratedProvidedTypes,
+            namedDebugPoints |> Array.map (fun kv -> KeyValuePair(kv.Key, s.Own kv.Value))
+        )
+
 /// An implementation file set up for checking its declarations one at a time.
 [<Sealed>]
 type FileStart
@@ -374,7 +434,7 @@ type FileStart
         scope: ImplFileDeclarationScope,
         scopeContents: ModuleOrNamespaceType,
         sink: TcResultsSinkImpl,
-        leftovers: TcFileState -> unit,
+        leftovers: Leftovers,
         rawDiagnostics: PhasedDiagnostic[]
     ) =
     let sync = obj ()
@@ -440,14 +500,17 @@ type DeclarationResult
         delta: ModuleOrNamespaceType,
         deltaCombines: bool,
         sink: TcResultsSinkImpl,
-        leftovers: TcFileState -> unit,
+        leftovers: Leftovers,
         nesting: Nesting,
         typedUses: DeclarationRef[],
-        references: (DeclarationRef * string list * string)[]
+        references: (DeclarationRef * string list * string)[],
+        shareKey: obj
     ) =
     let mutable finishTypedUses: DeclarationRef[] = [||]
 
     member _.Key = declaration.Key
+    /// What FinishFile keeps its computations for this result by: the check's, which shifting it keeps (see Shift)
+    member internal _.ShareKey = shareKey
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
     /// later declarations solving its inference variables, and only then: FileResult.Fingerprints has the final one,
     /// which differs from this one only when DependsOnLaterDeclarations.
@@ -498,6 +561,8 @@ type DeclarationResult
         | atFinish -> Array.append typedUses atFinish |> Array.distinct |> Array.sort
 
     member internal _.SetFinishTypedUses(uses: DeclarationRef[]) = finishTypedUses <- uses
+    member internal _.FinishTypedUses = finishTypedUses
+    member internal _.CheckTypedUses = typedUses
     /// The module values of the project the check marked referenced: the declaration defining each, the path of the
     /// module it is in, and its name
     member internal _.References = references
@@ -574,17 +639,19 @@ type FileResult
 type internal FinishShare =
     { Fingerprint: string
       Diagnostics: FSharpDiagnostic[]
-      ErrorCount: int }
+      ErrorCount: int
+      /// The line the declaration started on: a shifted result reuses the diagnostics only when it has none
+      Line: int }
 
 /// What the latest finish of a FileStart computed that the next finish of it may reuse: per result given to it, by
-/// reference, for the options and line directives it rendered with; and its signature, for the keys and
-/// fingerprints it had.
+/// its ShareKey (a shifted result has its check's), for the options and line directives it rendered with; and its
+/// signature, for the keys and fingerprints it had.
 [<Sealed>]
 type internal FinishShares
     (
         options: FSharpDiagnosticOptions,
         directives: (int * (int * int)) list,
-        shares: Dictionary<DeclarationResult, FinishShare>,
+        shares: Dictionary<obj, FinishShare>,
         keys: DeclarationKey[],
         fingerprints: string[],
         signature: FileSignature option
@@ -1278,34 +1345,6 @@ module internal DeclarationCheck =
 
     let sorted (names: seq<string>) =
         names |> Seq.distinct |> Seq.toArray |> Array.sortWith (fun a b -> String.CompareOrdinal(a, b))
-
-    /// What checking left in cenv that CheckImplFileTail reads, to replay into the finish's own cenv.
-    let leftoversOf (cenv: TcFileState) : TcFileState -> unit =
-        let css = cenv.css
-        let preDefaults = css.PostInferenceChecksPreDefaults.ToArray()
-        let final = css.PostInferenceChecksFinal.ToArray()
-        // Oldest first for each type variable, so adding them again keeps their order
-        let extraCxs = css.ExtraCxs.Fold (fun stamp cx acc -> (stamp, cx) :: acc) []
-        let unionsWithDeferredAttributes = css.UnionsWithDeferredAttributes
-        let deferredUnionNullnessChecks = css.DeferredUnionNullnessChecks
-        let createsGeneratedProvidedTypes = cenv.createsGeneratedProvidedTypes
-        let namedDebugPoints = Array.ofSeq cenv.namedDebugPointsForInlinedCode
-
-        fun into ->
-            into.css.PostInferenceChecksPreDefaults.AddRange preDefaults
-            into.css.PostInferenceChecksFinal.AddRange final
-
-            for stamp, cx in extraCxs do
-                into.css.ExtraCxs.Add(stamp, cx)
-
-            into.css.UnionsWithDeferredAttributes <- Set.union into.css.UnionsWithDeferredAttributes unionsWithDeferredAttributes
-            into.css.DeferredUnionNullnessChecks <- deferredUnionNullnessChecks @ into.css.DeferredUnionNullnessChecks
-
-            if createsGeneratedProvidedTypes then
-                into.createsGeneratedProvidedTypes <- true
-
-            for KeyValue(key, m) in namedDebugPoints do
-                into.namedDebugPointsForInlinedCode[key] <- m
 
     /// A checker state of its own (solver, caches, sink), with a new initial environment and accumulator for the file.
     let newCheckerState (state: CompilerState) (tcState: TcState) rootSigOpt file (sink: TcResultsSinkImpl) =
@@ -2113,7 +2152,7 @@ type DeclarationChecker =
                     scope,
                     scope.Env.eModuleOrNamespaceTypeAccumulator.Value,
                     sink,
-                    DeclarationCheck.leftoversOf cenv,
+                    Leftovers.Of cenv,
                     logger.Diagnostics
                 )
 
@@ -2556,11 +2595,144 @@ type DeclarationChecker =
             delta,
             deltaCombines,
             sink,
-            DeclarationCheck.leftoversOf cenv,
+            Leftovers.Of cenv,
             nesting,
             DeclarationCheck.typedUsesOf definitions self delta contents (Some sink),
-            references
+            references,
+            obj ()
         )
+
+    /// The result of `decl`, the same declaration as `result`'s at another line, without checking it again: when
+    /// `decl` has the result's text (IsUnchangedFrom), the same start column and is in the same module, but starts on
+    /// another line. Every range of what the check left is moved by the line delta: its typed contents, the values,
+    /// entities and type parameters it made (moved in place: they belong to this result, which `result` no longer
+    /// is), its name resolutions, its diagnostics and what the finish replays from it. The fingerprint, the flags,
+    /// TypedUses and references are kept, and the delta is the same object (IsSameDelta). FinishFile reuses what it
+    /// computed for `result` for the new result too (FileResult.Reused), its diagnostics only when it had none.
+    ///
+    /// ValueNone when the declaration is not the same at another line, or when what the check left holds a range of
+    /// the declaration's own syntax elsewhere in the file (which another declaration's, moved or not, could be), or
+    /// checks the finish runs with ranges they keep to themselves: check the declaration again.
+    ///
+    /// Like CheckDeclaration, it undoes the latest FinishFile on the same FileStart first, under the FileStart's lock
+    /// and then the file's check lock, so no finish's saved values (conformance's other ranges among them) are left to
+    /// be restored over what it moves. `result` must not be used after a shift that returned a result.
+    static member Shift(result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption =
+        let old = result.Declaration
+        let delta = decl.Range.StartLine - old.Range.StartLine
+
+        if
+            delta = 0
+            || not (decl.IsUnchangedFrom old)
+            || decl.Range.StartColumn <> old.Range.StartColumn
+            || decl.Within <> old.Within
+            || decl.Key <> old.Key
+            || decl.Depth <> old.Depth
+            || decl.IsModuleHeader <> old.IsModuleHeader
+            || not (String.Equals(decl.Range.FileName, old.Range.FileName, StringComparison.Ordinal))
+            || result.Leftovers.HasDeferredChecks
+            || result.Start.Context.RefuseShifts
+        then
+            ValueNone
+        else
+            let start = result.Start
+
+            lock start.Sync (fun () ->
+                start.UndoLastFinish()
+
+                lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                    DeclarationChecker.ShiftLocked(result, decl, delta)))
+
+    static member private ShiftLocked(result: DeclarationResult, decl: ParsedDeclaration, delta: int) : DeclarationResult voption =
+        let old = result.Declaration
+        let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, old.ScopeRange.End, delta)
+
+        // A refused or failed shift restores what it moved in place, so `result` is left as it was
+        try
+            match DeclarationChecker.ShiftWith(s, result, decl) with
+            | ValueSome _ as shifted -> shifted
+            | ValueNone ->
+                s.Undo()
+                DeclarationChecker.ShiftRefusedHook(defaultArg s.Refused "")
+                ValueNone
+        with _ ->
+            s.Undo()
+            reraise ()
+
+    static member private ShiftWith(s: DeclarationShift.Shifter, result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption =
+        let start = result.Start
+        let state = start.Context.State
+        let rawDiagnostics = result.RawDiagnostics |> Array.map s.Diagnostic
+        let leftovers = result.Leftovers.Shifted s
+        let sink = s.Sink(state.tcGlobals, result.Sink)
+        let contents, actions, attribs = result.Checked
+        let contents = List.map s.Contents contents
+        let attribs = attribs |> List.map (fun (targets, attrib) -> targets, s.Attrib attrib)
+        let checkedDecl = contents, actions, attribs
+        s.ModuleType result.Delta
+
+        let nesting, envAfter =
+            let env = result.EnvAfter
+
+            match result.Nesting with
+            | ModuleHeader(depth, frame) ->
+                frame.Entity |> Option.iter (fun entity -> s.EntityWith(entity, false))
+
+                let frame =
+                    { frame with
+                        ScopeRange = s.Scope frame.ScopeRange
+                        Range = s.Own frame.Range }
+
+                let frames =
+                    match env.Frames with
+                    | _ :: outer -> frame :: outer
+                    | [] -> []
+
+                ModuleHeader(depth, frame), DeclEnv(env.Env, env.Parent, env.TypeNames, frames, env.Definitions)
+            | InModules _ as nesting ->
+                let frames =
+                    match env.Frames with
+                    | frame :: outer when not frame.Checked.IsEmpty -> { frame with Checked = checkedDecl :: frame.Checked.Tail } :: outer
+                    | frames -> frames
+
+                nesting, DeclEnv(env.Env, env.Parent, env.TypeNames, frames, env.Definitions)
+
+        if s.Refused.IsSome then
+            ValueNone
+        else
+
+        use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+
+        let shifted =
+            DeclarationResult(
+                start,
+                decl,
+                result.Fingerprint,
+                result.AtCheck,
+                DeclarationCheck.diagnosticsOf state start.Parse.FileName (DeclarationCheck.refiltered state.tcConfig.diagnosticsOptions rawDiagnostics),
+                rawDiagnostics,
+                result.LeavesFreeTypars,
+                result.DependsOnLaterDeclarations,
+                result.LeavesUnsolved,
+                result.SlotsAtCheck,
+                envAfter,
+                result.EnvAtEnd,
+                checkedDecl,
+                result.Delta,
+                result.DeltaCombines,
+                sink,
+                leftovers,
+                nesting,
+                result.CheckTypedUses,
+                result.References,
+                result.ShareKey
+            )
+
+        shifted.SetFinishTypedUses result.FinishTypedUses
+        ValueSome shifted
+
+    /// Runs with the reason each time Shift refuses a declaration whose text is the same at another line. For tests.
+    static member val ShiftRefusedHook: string -> unit = ignore with get, set
 
     /// The environment after the declaration of `result`, assembled from `envBefore` without checking it again: what
     /// it defined (its values and entities), what it opened, its module structure. For name resolution it equals the
@@ -2739,8 +2911,9 @@ type DeclarationChecker =
             |> Array.map (fun result ->
                 match known with
                 | Some known when not result.DependsOnLaterDeclarations && not result.LeavesUnsolved ->
-                    match known.TryGetValue result with
-                    | true, share -> ValueSome share
+                    match known.TryGetValue result.ShareKey with
+                    // A shifted result renders its diagnostics at its own lines; its fingerprint and errors are the same
+                    | true, share when share.Line = result.Declaration.Range.StartLine || share.Diagnostics.Length = 0 -> ValueSome share
                     | _ -> ValueNone
                 | _ -> ValueNone)
 
@@ -2771,10 +2944,10 @@ type DeclarationChecker =
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
         let sink = TcResultsSinkImpl(state.tcGlobals)
         let cenv, envFile, moduleTyAcc = DeclarationCheck.newCheckerState state tcState start.RootSigOpt file sink
-        start.Leftovers cenv
+        start.Leftovers.Apply cenv
 
         for result in results do
-            result.Leftovers cenv
+            result.Leftovers.Apply cenv
 
         endPhase "leftovers"
 
@@ -2992,15 +3165,16 @@ type DeclarationChecker =
                 LazyThreadSafetyMode.ExecutionAndPublication
             )
 
-        let kept = Dictionary<DeclarationResult, FinishShare>(HashIdentity.Reference)
+        let kept = Dictionary<obj, FinishShare>(HashIdentity.Reference)
 
         // A fingerprint that is not describable counts as changed every time, so it is taken again
         for i in 0 .. results.Length - 1 do
             if not results[i].DependsOnLaterDeclarations && not results[i].LeavesUnsolved && not (finalPrints[i].StartsWith "?") then
-                kept[results[i]] <-
+                kept[results[i].ShareKey] <-
                     { Fingerprint = finalPrints[i]
                       Diagnostics = rendered[i]
-                      ErrorCount = errorCountOf i }
+                      ErrorCount = errorCountOf i
+                      Line = results[i].Declaration.Range.StartLine }
 
         start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None))
         let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)

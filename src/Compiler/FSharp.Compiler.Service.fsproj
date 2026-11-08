@@ -633,6 +633,7 @@
     <Compile Include="Interactive\fsi.fsi" />
     <Compile Include="Interactive\fsi.fs" />
     <Compile Include="../../fcs/service_slim.fs" />
+    <Compile Include="../../fcs/service_decl_shift.fs" />
     <Compile Include="../../fcs/service_decl.fs" />
 
     <!-- A legacy resolver used to help with scripting diagnostics in the Visual Studio tools -->
