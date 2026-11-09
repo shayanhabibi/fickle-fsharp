@@ -847,7 +847,8 @@ type FileResult
         phaseAllocated: IReadOnlyDictionary<string, int64>,
         reused: int,
         topAttrs: TopAttribs,
-        beforeRead: unit -> unit
+        beforeRead: unit -> unit,
+        buildAgain: (unit -> FSharpCheckFileResults) voption
     ) =
     member _.Diagnostics = diagnostics
     /// The assembly-level attributes the file's tail gave: its signature's fingerprint leaves them out when the file
@@ -875,6 +876,12 @@ type FileResult
             beforeRead ()
 
         checkResults.Value
+    /// As CheckResults, for a reader that copies out what it needs: CheckFile's are checked again for this read and not
+    /// kept, so this result goes on holding only its inputs, unless CheckResults was read first. FinishFile's are CheckResults.
+    member this.CheckResultsNotKept =
+        match buildAgain with
+        | ValueSome build when not checkResults.IsValueCreated -> build ()
+        | _ -> this.CheckResults
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
     /// refilter, leftovers, envAtEnd, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
     /// setup, tail (the check), definitions, fingerprint, render.
@@ -3289,13 +3296,10 @@ type DeclarationChecker =
             // the context, which reaches every parse of the project
             let checks = ctx.Checks
 
-            let checkResults =
-                Lazy<FSharpCheckFileResults>(
-                    (fun () -> DeclarationCheck.buildCheckResults checks before moduleNamesBefore parse diagnostics),
-                    LazyThreadSafetyMode.ExecutionAndPublication
-                )
+            let build () = DeclarationCheck.buildCheckResults checks before moduleNamesBefore parse diagnostics
+            let checkResults = Lazy<FSharpCheckFileResults>(build, LazyThreadSafetyMode.ExecutionAndPublication)
 
-            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore)
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore, ValueSome build)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
@@ -4376,4 +4380,4 @@ type DeclarationChecker =
             if Monitor.IsEntered(checks.FileLock fileName) && not (Monitor.IsEntered sync) then
                 invalidOp $"%s{fileName}: read while holding the file's check lock"
 
-        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead)
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead, ValueNone)
