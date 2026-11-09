@@ -237,6 +237,9 @@ type ProjectContext internal (state: CompilerState) =
     /// For tests: how many times CheckFile's results on this context built a name-resolution sink and check results.
     member _.CheckResultsBuilt = checks.CheckResultsBuilt
 
+    /// Runs `f` holding the file's check lock, as a declaration check does. For tests.
+    member _.HoldingCheckLock(fileName: string, f: unit -> 'T) : 'T = lock (checks.FileLock fileName) f
+
     /// For tests: when set, DeclarationChecker.Shift refuses every declaration of this context, so its callers check
     /// them again.
     member val RefuseShifts = false with get, set
@@ -513,6 +516,8 @@ type FileStart
     member internal _.RawDiagnostics = rawDiagnostics
     /// Held while finishing the file, and while a replay hides the members later declarations add (Augmented).
     member internal _.Sync = sync
+    /// The environment BeginFile gave: what the end environment is folded from
+    member val internal EnvAtStart: DeclEnv = Unchecked.defaultof<_> with get, set
 
     /// Undoes what the latest finish changed in the declarations' typed trees, once.
     member internal _.UndoLastFinish() =
@@ -697,7 +702,8 @@ type FileResult
         phaseTicks: IReadOnlyDictionary<string, int64>,
         phaseAllocated: IReadOnlyDictionary<string, int64>,
         reused: int,
-        topAttrs: TopAttribs
+        topAttrs: TopAttribs,
+        beforeRead: unit -> unit
     ) =
     member _.Diagnostics = diagnostics
     /// The assembly-level attributes the file's tail gave: its signature's fingerprint leaves them out when the file
@@ -719,9 +725,14 @@ type FileResult
     /// the same FileStart, as it left them, as for every result checked by declaration, so a superseded FileResult's
     /// queries show the implementation unconformed (without the signature's argument names and xml docs) until the
     /// next finish's results are built. Query the latest FileResult.
-    member _.CheckResults = checkResults.Value
+    member _.CheckResults =
+        // Outside the lazy, which would keep the exception for every later read
+        if not checkResults.IsValueCreated then
+            beforeRead ()
+
+        checkResults.Value
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
-    /// refilter, leftovers, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
+    /// refilter, leftovers, envAtEnd, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
     /// setup, tail (the check), definitions, fingerprint, render.
     member _.PhaseTicks = phaseTicks
     /// The bytes the checking thread allocated in each part, as PhaseTicks names them.
@@ -765,7 +776,8 @@ type internal FinishShares
         shares: Dictionary<obj, FinishShare>,
         keys: DeclarationKey[],
         fingerprints: string[],
-        signature: FileSignature option
+        signature: FileSignature option,
+        envs: (obj * DeclEnv)[]
     ) =
     member _.Options = options
     member _.Directives = directives
@@ -774,6 +786,8 @@ type internal FinishShares
     member _.Fingerprints = fingerprints
     /// None when the finish's tail failed
     member _.Signature = signature
+    /// The environment after each declaration as the finish assembled it, with the result's ShareKey
+    member _.Envs = envs
 
 module internal DeclarationCheck =
 
@@ -1848,6 +1862,19 @@ module internal DeclarationCheck =
                 tcaug.tcaug_adhoc <- adhoc
                 tcaug.tcaug_adhoc_list <- adhocList
 
+    /// Runs `replay`, which may leave modules, and puts back the types it gave them: leaving a module gives it its contents
+    /// so far, which only a finish may publish.
+    let keepingModuleTypes (entities: Entity list) (replay: unit -> 'T) : 'T =
+        let saved = entities |> List.map (fun e -> e, e.entity_modul_type)
+
+        try
+            replay ()
+        finally
+            for e, t in saved do
+                e.entity_modul_type <- t
+
+    let framesOf (env: DeclEnv) = env.Frames |> List.choose _.Entity
+
     let definitionsBefore (before: FileSignature list) =
         (Map.empty, before) ||> List.fold (fun acc signature -> Map.foldBack Map.add signature.Definitions acc)
 
@@ -2520,7 +2547,9 @@ type DeclarationChecker =
                     logger.Diagnostics
                 )
 
-            start, DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [], DeclarationCheck.definitionsBefore before)
+            let env0 = DeclEnv(scope.Env, scope.Parent, scope.TypeNames, [], DeclarationCheck.definitionsBefore before)
+            start.EnvAtStart <- env0
+            start, env0
 
     /// For each of the project's files, given in file order, the ascending indices of the earlier files checking it
     /// reads: the file dependency graph graph-mode checking builds, transitively closed. A file that depends on a
@@ -2751,7 +2780,7 @@ type DeclarationChecker =
                     LazyThreadSafetyMode.ExecutionAndPublication
                 )
 
-            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs)
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
@@ -3175,12 +3204,137 @@ type DeclarationChecker =
             invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
         // As CheckDeclaration: nothing applies a finish's changes again while it reads the declaration's items
-        lock result.Start.Sync (fun () -> DeclarationChecker.ExtendEnvLocked(envBefore, result))
+        lock result.Start.Sync (fun () ->
+            result.Start.UndoLastFinish()
+            DeclarationChecker.ExtendEnvLocked(envBefore, result))
+
+    /// ExtendEnv, leaving the latest finish in effect and every module's type as it is. For an environment that only
+    /// CheckDeclarationAdHoc and queries read: no finish follows to apply again what an undo takes back.
+    static member ExtendEnvAdHoc(envBefore: DeclEnv, result: DeclarationResult) : DeclEnv =
+        if result.Declaration.Depth > envBefore.Frames.Length then
+            invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+
+        lock result.Start.Sync (fun () ->
+            DeclarationCheck.keepingModuleTypes (DeclarationCheck.framesOf envBefore) (fun () ->
+                DeclarationChecker.ExtendEnvLocked(envBefore, result)))
+
+    /// CheckDeclaration for a result only queries read, never finished or depended on: it leaves the latest finish in
+    /// effect, so the published FileResult still reads as it was, and every module's type as it is. What the finish solved
+    /// stays solved while this checks: at a settled file an earlier declaration's open variables are all in a segment's
+    /// rows, so check from the segment's leader, whose new results hold new variables and types.
+    static member CheckDeclarationAdHoc(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
+        if decl.Depth > envBefore.Frames.Length then
+            invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+
+        lock start.Sync (fun () ->
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                ct.ThrowIfCancellationRequested()
+
+                DeclarationCheck.keepingModuleTypes (DeclarationCheck.framesOf envBefore) (fun () ->
+                    DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct))))
+
+    /// The environment after `results`, folded from BeginFile's with ExtendEnv, and the environment after each. The
+    /// results at the start of `known` keep theirs: a shifted result has its check's ShareKey and holds what it holds. A
+    /// file's end is inside its last module, as a full check's is; a declaration checked whole has no replay for what it
+    /// leaves inside it, so the environment its check left stands. Under Sync, with no finish in effect to undo.
+    static member private AssembleEnvAtEnd(start: FileStart, results: DeclarationResult[], known: (obj * DeclEnv)[]) =
+        let envs = Array.zeroCreate results.Length
+        let mutable env = start.EnvAtStart
+        let mutable reusing = true
+
+        for i in 0 .. results.Length - 1 do
+            let result = results[i]
+
+            if reusing && i < known.Length && obj.ReferenceEquals(fst known[i], result.ShareKey) then
+                env <- snd known[i]
+            else
+                reusing <- false
+                env <- DeclarationChecker.ExtendEnvLocked(env, result)
+
+            envs[i] <- result.ShareKey, env
+
+        let atEnd =
+            match Array.tryLast results with
+            | Some last ->
+                match last.Declaration.Syntax with
+                | SynModuleDecl.NamespaceFragment _ -> last.EnvAtEnd
+                | SynModuleDecl.NestedModule _ when not last.Declaration.IsModuleHeader -> last.EnvAtEnd
+                | _ -> env.Env
+            | None -> env.Env
+
+        atEnd, envs
+
+    /// The captured environment for the positions after the last declaration: the environments the kept declarations
+    /// captured reach them too, and hold the names as they were when those declarations were checked.
+    static member private CaptureEnvAtEnd(sink: TcResultsSinkImpl, results: DeclarationResult[], atEnd: TcEnv) =
+        match Array.tryLast results with
+        | Some last -> (sink :> ITypecheckResultsSink).NotifyEnvWithScope(last.Declaration.Range.EndRange, atEnd.NameEnv, atEnd.AccessRights)
+        | None -> ()
+
+    /// Check results over `results` without closing the file: the sinks merged and the end environment assembled, with
+    /// no tail run and nothing changed. For queries of names and types at a position (completion); they have no
+    /// diagnostics, assembly signature or implementation file, and read the declarations' typed trees as the latest
+    /// finish left them. `results` may hold results of CheckDeclarationAdHoc. The members a replay hides are hidden and
+    /// back before this returns, under the FileStart's lock; a query must not overlap another thread's ExtendEnv.
+    static member ViewResults(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FSharpCheckFileResults =
+        if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
+            invalidArg (nameof parse) "The parse is of another file than the FileStart's."
+
+        let state = start.Context.State
+        let tcState = start.TcState
+
+        lock start.Sync (fun () ->
+            lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                let known =
+                    match start.LastShares with
+                    | :? FinishShares as last -> last.Envs
+                    | _ -> [||]
+
+                let modules =
+                    [ for result in results do
+                          match result.Nesting with
+                          | ModuleHeader(_, { Entity = Some entity }) -> entity
+                          | _ -> () ]
+
+                let atEnd, _ =
+                    DeclarationCheck.keepingModuleTypes modules (fun () -> DeclarationChecker.AssembleEnvAtEnd(start, results, known))
+
+                let sink = TcResultsSinkImpl(state.tcGlobals)
+                DeclarationChecker.CaptureEnvAtEnd(sink, results, atEnd)
+
+                let sinks =
+                    [ yield start.Sink
+                      for result in results do
+                          yield result.Sink
+                      yield sink ]
+
+                let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
+
+                let scope =
+                    TypeCheckInfo(
+                        state.tcConfig,
+                        state.tcGlobals,
+                        tcState.CcuSig,
+                        Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
+                        tcState.Ccu,
+                        state.tcImports,
+                        atEnd.AccessRights,
+                        state.projectOptions.ProjectFileName,
+                        parse.FileName,
+                        Some state.projectOptions,
+                        resolutions,
+                        symbolUses,
+                        atEnd.NameEnv,
+                        None,
+                        None,
+                        openDeclarations
+                    )
+
+                FSharpCheckFileResults(parse.FileName, [||], Some scope, parse.DependencyFiles, None, true)))
 
     static member private ExtendEnvLocked(envBefore: DeclEnv, result: DeclarationResult) : DeclEnv =
         let decl = result.Declaration
         let start = result.Start
-        start.UndoLastFinish()
         let state = start.Context.State
         use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
@@ -3382,6 +3536,13 @@ type DeclarationChecker =
 
         endPhase "leftovers"
 
+        // Before the assembly below, which gives the modules their types: replaying leaves modules too
+        let envAtEndNow, envs =
+            DeclarationChecker.AssembleEnvAtEnd(start, results, (match last with Some last -> last.Envs | None -> [||]))
+
+        DeclarationChecker.CaptureEnvAtEnd(sink, results, envAtEndNow)
+        endPhase "envAtEnd"
+
         let scopeContents, compiledDefs, envAtEnd =
             DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results
 
@@ -3463,7 +3624,7 @@ type DeclarationChecker =
 
         let signature, ownSigForFile, tcEnvAtEnd, implFileOpt =
             match tail with
-            | Some(topAttrs, implFile, tcEnvAtEnd, createsGeneratedProvidedTypes, ownSigForFile) ->
+            | Some(topAttrs, implFile, _, createsGeneratedProvidedTypes, ownSigForFile) ->
                 let fingerprint = DeclarationCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs
                 let describable (print: string) = not (print.StartsWith "?")
 
@@ -3501,7 +3662,7 @@ type DeclarationChecker =
                             definitions
                             (Lazy<string>.CreateFromValue fingerprint)
 
-                signature, ownSigForFile, tcEnvAtEnd, Some implFile
+                signature, ownSigForFile, envAtEndNow, Some implFile
             | None ->
                 DeclarationCheck.failedFileSignature parse.FileName start.ModuleNamesDict,
                 Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
@@ -3607,7 +3768,7 @@ type DeclarationChecker =
                       ErrorCount = errorCountOf i
                       Line = results[i].Declaration.Range.StartLine }
 
-        start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None))
+        start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None), envs)
         let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)
         endPhase "sinks"
         let topAttrs =
@@ -3615,4 +3776,9 @@ type DeclarationChecker =
             | Some(topAttrs, _, _, _, _) -> topAttrs
             | None -> EmptyTopAttrs
 
-        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs)
+        // m2: building the results takes the FileStart's lock and then the file's check lock, never the other way round
+        let beforeRead () =
+            if Monitor.IsEntered(checks.FileLock fileName) && not (Monitor.IsEntered sync) then
+                invalidOp $"%s{fileName}: read while holding the file's check lock"
+
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead)
