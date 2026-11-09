@@ -709,7 +709,8 @@ type DeclarationResult
         typedUses: DeclarationRef[],
         heldDefinitions: (Stamp * DeclarationRef)[],
         references: (DeclarationRef * string list * string)[],
-        shareKey: obj
+        shareKey: obj,
+        capturedScope: range
     ) =
     let mutable finishTypedUses: DeclarationRef[] = [||]
     let mutable shiftedTo: DeclarationResult | null = null
@@ -717,6 +718,10 @@ type DeclarationResult
     member _.Key = declaration.Key
     /// What FinishFile keeps its computations for this result by: the check's, which shifting it keeps (see Shift)
     member internal _.ShareKey = shareKey
+    /// The scope the check was given for the declaration (its ScopeRange then), moved by each shift of the result: the
+    /// scope its environments and opens hold. The current parse's scope can end elsewhere, when a declaration was added
+    /// or edited below it since; ScopesNow maps this one to it.
+    member _.CapturedScope = capturedScope
     /// Made by CheckDeclarationAdHoc: its types are its own, and no finish holds it
     member val internal IsAdHoc = false with get, set
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
@@ -3540,7 +3545,8 @@ type DeclarationChecker =
             typedUses,
             heldDefinitions,
             references,
-            obj ()
+            obj (),
+            decl.ScopeRange
         )
 
     /// The result of `decl`, the same declaration as `result`'s at another line, without checking it again: when
@@ -3618,7 +3624,7 @@ type DeclarationChecker =
 
     static member private ShiftLocked(result: DeclarationResult, decl: ParsedDeclaration, delta: int) : DeclarationResult voption =
         let old = result.Declaration
-        let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, old.ScopeRange.End, delta, result.ShareKey)
+        let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, result.CapturedScope.End, delta, result.ShareKey)
 
         // A refused or failed shift restores what it moved in place, so `result` is left as it was
         try
@@ -3702,7 +3708,8 @@ type DeclarationChecker =
                 result.CheckTypedUses,
                 result.HeldDefinitions,
                 result.References,
-                result.ShareKey
+                result.ShareKey,
+                s.Move result.CapturedScope
             )
 
         shifted.SetFinishTypedUses result.FinishTypedUses
@@ -3929,7 +3936,7 @@ type DeclarationChecker =
         DeclarationCheck.scopesNow
             start.Sink
             (DeclarationCheck.fileEndOf start.Parse)
-            (results |> Array.map (fun r -> r.Sink, r.Declaration.Range, r.Declaration.ScopeRange))
+            (results |> Array.map (fun r -> r.Sink, r.Declaration.Range, r.CapturedScope))
             parse
             (fun () -> DeclarationChecker.Split parse |> Array.map (fun d -> d.Range, d.ScopeRange))
 
