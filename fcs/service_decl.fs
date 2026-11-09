@@ -2400,7 +2400,7 @@ module internal SymbolKeys =
             elif t.IsTupleType then
                 "(" + arguments (if t.IsStructTupleType then "#" else "*") + ")"
             elif t.IsAnonRecordType then
-                "{" + String.concat ";" t.AnonRecordTypeDetails.SortedFieldNames + ":" + arguments "," + "}"
+                "{" + String.concat "," t.AnonRecordTypeDetails.SortedFieldNames + ":" + arguments "," + "}"
             elif t.HasTypeDefinition then
                 entityPath t.TypeDefinition + "<" + arguments "," + ">"
             else
@@ -2525,11 +2525,12 @@ module internal SymbolKeys =
         | None -> false
 
     /// A member's key without what a signature can state differently from an implementation it conforms to, which can be
-    /// more generic: its types. A value's key has none.
+    /// more generic: its types, keeping how many arguments it has. A value's key has none.
     let private withoutTypes (key: string) =
         match key.Split '|' with
-        | [| assembly; kind; parent; apparent; name; isInstance; _typars; role; _types |] ->
-            String.concat "|" [ assembly; kind; parent; apparent; name; isInstance; role ]
+        | [| assembly; kind; parent; apparent; name; isInstance; _typars; role; types |] ->
+            let arguments = if types = "" then 0 else types.Split(';').Length
+            String.concat "|" [ assembly; kind; parent; apparent; name; isInstance; role; string arguments ]
         | _ -> key
 
     /// Whether a signature's definition can be what an implementation of `key` conformed to
