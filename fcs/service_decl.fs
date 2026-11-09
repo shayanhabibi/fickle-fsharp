@@ -420,7 +420,8 @@ type FileSignature
         fingerprint: Lazy<string>,
         moduleType: ModuleOrNamespaceType,
         asImplementation: (TcState -> TcState) option,
-        failed: bool
+        failed: bool,
+        uses: (struct (Item * ItemOccurrence * range))[]
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
     /// implementation file with a signature file, the signature file's. Unequal for anything not describable. A check
@@ -435,6 +436,8 @@ type FileSignature
     member internal _.ModuleNamesDict = moduleNamesDict
     /// The declaration defining each entity and value later files see of this file, by stamp
     member internal _.Definitions = definitions
+    /// What a signature file's check resolved, as a sink held it: nothing else of the sink is kept
+    member internal _.Uses = uses
     /// The module type the file adds to the checker state, for tests
     member internal _.ModuleType = moduleType
     /// For tests: every type variable or entity the signature's types use that it does not itself hold. Empty for a
@@ -2351,7 +2354,7 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None, false)
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None, false, [||])
 
     /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
     let failedFileSignature fileName moduleNamesDict =
@@ -2364,7 +2367,8 @@ module internal DeclarationCheck =
             Lazy<string>.CreateFromValue("!failed"),
             Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
             None,
-            true
+            true,
+            [||]
         )
 
 /// Text keys for symbols that hold across copies: a key reads names and types, never stamps, ranges or which object.
@@ -2615,6 +2619,15 @@ type DeclarationChecker =
         match defined |> List.filter (SymbolKeys.defines key) with
         | [] when conformed -> SymbolKeys.locationOf key defined
         | exact -> SymbolKeys.locationOf key exact
+
+    /// What a signature file's check resolved: each range, whether it defines, and the symbol. The ranges are this check's
+    /// (FileSig.Next may keep another check for later files).
+    static member SignatureUses(ctx: ProjectContext, signature: FileSignature) : (struct (range * bool * FSharpSymbol))[] =
+        let state = ctx.State
+        let cenv = SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
+
+        signature.Uses
+        |> Array.map (fun (struct (item, occurrence, m)) -> struct (m, (occurrence = ItemOccurrence.Binding), FSharpSymbol.Create(cenv, item)))
 
     /// The location of the definition of what `key` names in a file's check results: its signature location, which is
     /// the implementation's when the file has no signature, or the signature doesn't expose it, or it didn't conform for
@@ -2932,6 +2945,7 @@ type DeclarationChecker =
                 use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
                 let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
                 let amap = state.tcImports.GetImportMap()
+                let sink = TcResultsSinkImpl(state.tcGlobals)
 
                 // The fingerprint reads the compiled names of the file's values, which are given on first read
                 let sigFileType, createsGeneratedProvidedTypes, fingerprint =
@@ -2945,7 +2959,7 @@ type DeclarationChecker =
                                  tcState.Ccu,
                                  checkForErrors,
                                  DeclarationCheck.conditionalDefines state,
-                                 TcResultsSink.NoSink,
+                                 TcResultsSink.WithSink sink,
                                  state.tcConfig.internalTestSpanStackReferring,
                                  state.tcConfig.diagnosticsOptions)
                                 tcState.TcEnvFromSignatures
@@ -2978,7 +2992,11 @@ type DeclarationChecker =
                     Lazy<string>.CreateFromValue fingerprint,
                     sigFileType,
                     Some asImplementation,
-                    false
+                    false,
+                    [| for chunk in sink.GetSymbolUses().AllUsesOfSymbols do
+                           for u in chunk do
+                               if u.ItemOccurrence <> ItemOccurrence.RelatedText then
+                                   struct (u.ItemWithInst.Item, u.ItemOccurrence, u.Range) |]
                 )
 
     /// For tests: each access path of the entities, values, fields and union cases in the signature's module type, as
