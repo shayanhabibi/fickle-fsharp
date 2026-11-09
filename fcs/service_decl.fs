@@ -274,6 +274,139 @@ type ProjectContext internal (state: CompilerState) =
         with get () = dependencies
         and set (snapshot: DependencySnapshot option) = dependencies <- snapshot
 
+/// What no print of a signature shows: whether its types link to its own binders and entities.
+module internal SignatureScope =
+
+    /// A rigid type variable used outside the binder that scopes it, and an entity of the file that is not the
+    /// signature's own, each as a line. An inference variable error recovery left free is not one.
+    let outOfScope (fileName: string) (mty: ModuleOrNamespaceType) : string[] =
+        let own = HashSet<Stamp>()
+
+        let rec addOwn (m: ModuleOrNamespaceType) =
+            for e in m.AllEntities do
+                own.Add e.Stamp |> ignore
+
+                if e.IsModuleOrNamespace then
+                    addOwn e.ModuleOrNamespaceType
+
+        addOwn mty
+        let problems = ResizeArray<string>()
+
+        let rec ty (where: string) (scope: Typar list) (t: TType) =
+            match stripTyparEqns t with
+            | TType_var(tp, _) -> typar where scope tp
+            | TType_app(tcref, args, _) ->
+                entity where tcref
+                List.iter (ty where scope) args
+            | TType_fun(a, b, _) ->
+                ty where scope a
+                ty where scope b
+            | TType_tuple(_, args)
+            | TType_anon(_, args) -> List.iter (ty where scope) args
+            | TType_forall(tps, body) ->
+                let inner = tps @ scope
+                binders where inner tps
+                ty where inner body
+            | TType_measure m -> measure where scope m
+            | TType_ucase(ucref, args) ->
+                entity where ucref.TyconRef
+                List.iter (ty where scope) args
+
+        and measure where scope (m: Measure) =
+            match stripUnitEqns m with
+            | Measure.Var tp -> typar where scope tp
+            | Measure.Const(tcref, _) -> entity where tcref
+            | Measure.Prod(a, b, _) ->
+                measure where scope a
+                measure where scope b
+            | Measure.Inv a
+            | Measure.RationalPower(a, _) -> measure where scope a
+            | Measure.One _ -> ()
+
+        and typar where scope (tp: Typar) =
+            if tp.Rigidity = TyparRigidity.Rigid && not (scope |> List.exists (fun s -> obj.ReferenceEquals(s, tp))) then
+                problems.Add $"%s{where}: %s{tp.DisplayName}#%d{tp.Stamp} is out of scope"
+
+        and entity where (tcref: TyconRef) =
+            if tcref.IsLocalRef
+               && String.Equals(tcref.Deref.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase)
+               && not (own.Contains tcref.Deref.Stamp) then
+                problems.Add $"%s{where}: %s{tcref.DisplayName}#%d{tcref.Deref.Stamp} is not the signature's own"
+
+        and binders where scope (tps: Typar list) =
+            for tp in tps do
+                for c in tp.Constraints do
+                    let inConstraint = $"%s{where}, a constraint of %s{tp.DisplayName}"
+
+                    match c with
+                    | TyparConstraint.CoercesTo(t, _)
+                    | TyparConstraint.DefaultsTo(_, t, _)
+                    | TyparConstraint.IsEnum(t, _) -> ty inConstraint scope t
+                    | TyparConstraint.IsDelegate(a, b, _) ->
+                        ty inConstraint scope a
+                        ty inConstraint scope b
+                    | TyparConstraint.SimpleChoice(ts, _) -> List.iter (ty inConstraint scope) ts
+                    | TyparConstraint.MayResolveMember(TTrait(supportTys, _, _, argTys, returnTy, _, _, _), _) ->
+                        List.iter (ty inConstraint scope) supportTys
+                        List.iter (ty inConstraint scope) argTys
+                        Option.iter (ty inConstraint scope) returnTy
+                    | _ -> ()
+
+        let rec walk (m: ModuleOrNamespaceType) =
+            for v in m.AllValsAndMembers do
+                let where = $"val %s{v.LogicalName}"
+                ty where [] v.Type
+
+                let scope =
+                    match stripTyparEqns v.Type with
+                    | TType_forall(tps, _) -> tps
+                    | _ -> []
+
+                for TSlotSig(_, _, ctps, mtps, paramTys, returnTy) in v.ImplementedSlotSigs do
+                    let inner = ctps @ mtps @ scope
+                    let inSlot = where + ", a slot it implements"
+                    binders inSlot inner (ctps @ mtps)
+
+                    for group in paramTys do
+                        for TSlotParam(_, paramTy, _, _, _, _) in group do
+                            ty inSlot inner paramTy
+
+                    Option.iter (ty inSlot inner) returnTy
+
+            for e in m.AllEntities do
+                let where = $"type %s{e.LogicalName}"
+                let scope = e.Typars
+                binders where scope scope
+
+                if e.IsModuleOrNamespace then
+                    walk e.ModuleOrNamespaceType
+                else
+                    for f in e.AllFieldsArray do
+                        ty $"%s{where}, field %s{f.LogicalName}" scope f.FormalType
+
+                    if e.IsUnionTycon then
+                        for case in e.UnionCasesArray do
+                            for f in case.RecdFieldsArray do
+                                ty $"%s{where}, case %s{case.DisplayName}" scope f.FormalType
+
+                    Option.iter (ty $"%s{where}, its abbreviation" scope) e.TypeAbbrev
+
+        walk mty
+        problems.ToArray()
+
+    /// The type parameters of every value, in the order the signature holds them
+    let typarNames (mty: ModuleOrNamespaceType) : string[] =
+        let rec walk (m: ModuleOrNamespaceType) =
+            [ for v in m.AllValsAndMembers do
+                  for tp in v.Typars do
+                      yield $"%s{v.LogicalName}: %s{tp.DisplayName}"
+
+              for e in m.AllEntities do
+                  if e.IsModuleOrNamespace then
+                      yield! walk e.ModuleOrNamespaceType ]
+
+        Array.ofList (walk mty)
+
 /// What a file adds to the state later files are checked in.
 [<Sealed>]
 type FileSignature
@@ -303,6 +436,11 @@ type FileSignature
     member internal _.Definitions = definitions
     /// The module type the file adds to the checker state, for tests
     member internal _.ModuleType = moduleType
+    /// For tests: every type variable or entity the signature's types use that it does not itself hold. Empty for a
+    /// sound signature, as no print can tell.
+    member _.OutOfScope() = SignatureScope.outOfScope fileName moduleType
+    /// For tests: the names of the type parameters of the signature's values.
+    member _.TyparNames() = SignatureScope.typarNames moduleType
     /// For a signature file: what graph-mode checking's ArtificialImplFile node does, adding the signature's contents
     /// to the environment implementation files are checked in. A file set up from a signature file without the
     /// implementation file behind it sees the signature there, as in graph mode.

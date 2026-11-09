@@ -53,6 +53,19 @@ type MutationLog =
         with get () = MutationLog.current
         and set (log: ResizeArray<unit -> unit> | null) = MutationLog.current <- log
 
+    /// Runs `f` with no log active: what it changes has no earlier state an undo should go back to, such as a type
+    /// variable it has just made, which another pass goes on holding.
+    static member Unlogged(f: unit -> 'T) : 'T =
+        match MutationLog.current with
+        | null -> f ()
+        | outer ->
+            MutationLog.current <- null
+
+            try
+                f ()
+            finally
+                MutationLog.current <- outer
+
     /// Runs undo actions, latest first.
     static member Undo(log: ResizeArray<unit -> unit>) =
         for i in log.Count - 1 .. -1 .. 0 do

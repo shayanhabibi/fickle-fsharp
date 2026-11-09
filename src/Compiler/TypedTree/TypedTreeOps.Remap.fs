@@ -385,10 +385,12 @@ module internal TypeRemapping =
                     tpinst = bindTypars tps (generalizeTypars tpsR) tyenv.tpinst
                 }
 
-            (tps, tpsR)
-            ||> List.iter2 (fun tporig tp ->
-                tp.SetConstraints(remapTyparConstraintsAux tyenv tporig.Constraints)
-                tp.SetAttribs(tporig.Attribs |> remapAttrib))
+            // A copy holds the originals' constraints until here: undoing this would give them back to it
+            MutationLog.Unlogged(fun () ->
+                (tps, tpsR)
+                ||> List.iter2 (fun tporig tp ->
+                    tp.SetConstraints(remapTyparConstraintsAux tyenv tporig.Constraints)
+                    tp.SetAttribs(tporig.Attribs |> remapAttrib)))
 
             tpsR, tyenv
 

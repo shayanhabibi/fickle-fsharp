@@ -38,6 +38,9 @@ type MutationLog =
     /// The active log of this thread, or null.
     static member Current: (ResizeArray<unit -> unit> | null) with get, set
 
+    /// Runs `f` with no log active, for what has no earlier state an undo should go back to.
+    static member Unlogged: f: (unit -> 'T) -> 'T
+
     /// Runs undo actions, latest first.
     static member Undo: log: ResizeArray<unit -> unit> -> unit
 
