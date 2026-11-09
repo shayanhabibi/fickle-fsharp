@@ -511,7 +511,7 @@ type FileStart
     member internal _.Leftovers = leftovers
     /// What setting up the file reported, before filtering: FinishFile filters it with its parse's #nowarn scopes
     member internal _.RawDiagnostics = rawDiagnostics
-    /// Held while finishing the file.
+    /// Held while finishing the file, and while a replay hides the members later declarations add (Augmented).
     member internal _.Sync = sync
 
     /// Undoes what the latest finish changed in the declarations' typed trees, once.
@@ -854,6 +854,22 @@ module internal DeclarationCheck =
         match file.Contents with
         | [ SynModuleOrNamespace(isRecursive = false) ] -> true
         | _ -> false
+
+    /// Whether the file is several fragments with an augmentation anywhere inside them. Such a file is checked whole, as
+    /// `module rec` is: a fragment is one row, so a type and its augmentation in different fragments are never tied,
+    /// and one fragment holding both is replayed with the type already augmented.
+    let fragmentsHoldAugmentation (file: ParsedImplFileInput) =
+        let rec holds (decls: SynModuleDecl list) =
+            decls
+            |> List.exists (fun decl ->
+                match decl with
+                | SynModuleDecl.Types(typeDefns, _) -> List.exists isAugmentation typeDefns
+                | SynModuleDecl.NestedModule(decls = nested) -> holds nested
+                | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(decls = nested)) -> holds nested
+                | _ -> false)
+
+        file.Contents.Length > 1
+        && file.Contents |> List.exists (fun (SynModuleOrNamespace(decls = decls)) -> holds decls)
 
     /// Loggers filtering by these options, whose #nowarn scopes may be a parse's copy.
     let newLoggersWith (diagnosticsOptions: FSharpDiagnosticOptions) =
@@ -1808,24 +1824,24 @@ module internal DeclarationCheck =
     let asOfDeclaration (start: FileStart) (definitions: Map<Stamp, DeclarationRef>) (replay: unit -> 'T) : 'T =
         let hidden = ResizeArray()
 
-        for KeyValue(tycon, added) in start.Augmented do
-            let later = HashSet<Stamp>(added |> Seq.map _.Stamp |> Seq.filter (definitions.ContainsKey >> not))
-
-            if later.Count > 0 then
-                let tcaug = tycon.TypeContents
-                hidden.Add((tcaug, tcaug.tcaug_adhoc, tcaug.tcaug_adhoc_list))
-
-                tcaug.tcaug_adhoc <-
-                    tcaug.tcaug_adhoc
-                    |> Map.map (fun _ members -> members |> List.filter (fun (m: ValRef) -> not (later.Contains m.Stamp)))
-                    |> Map.filter (fun _ members -> not members.IsEmpty)
-
-                tcaug.tcaug_adhoc_list <-
-                    match tcaug.tcaug_adhoc_list with
-                    | null -> null
-                    | members -> ResizeArray(members |> Seq.filter (fun (_, m) -> not (later.Contains m.Stamp)))
-
         try
+            for KeyValue(tycon, added) in start.Augmented do
+                let later = HashSet<Stamp>(added |> Seq.map _.Stamp |> Seq.filter (definitions.ContainsKey >> not))
+
+                if later.Count > 0 then
+                    let tcaug = tycon.TypeContents
+                    hidden.Add((tcaug, tcaug.tcaug_adhoc, tcaug.tcaug_adhoc_list))
+
+                    tcaug.tcaug_adhoc <-
+                        tcaug.tcaug_adhoc
+                        |> Map.map (fun _ members -> members |> List.filter (fun (m: ValRef) -> not (later.Contains m.Stamp)))
+                        |> Map.filter (fun _ members -> not members.IsEmpty)
+
+                    tcaug.tcaug_adhoc_list <-
+                        match tcaug.tcaug_adhoc_list with
+                        | null -> null
+                        | members -> ResizeArray(members |> Seq.filter (fun (_, m) -> not (later.Contains m.Stamp)))
+
             replay ()
         finally
             for tcaug, adhoc, adhocList in hidden do
@@ -2254,6 +2270,8 @@ type DeclarationChecker =
             if DeclarationCheck.splitsFragment file then
                 let (SynModuleOrNamespace(decls = decls)) = List.exactlyOne file.Contents
                 count decls
+            elif DeclarationCheck.fragmentsHoldAugmentation file then
+                1
             else
                 file.Contents.Length
 
