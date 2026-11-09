@@ -493,8 +493,11 @@ type FileStart
     let sync = obj ()
     let finishUndo = FinishUndo()
     let mutable lastShares: obj | null = null
+    let augmented = ConditionalWeakTable<Tycon, ResizeArray<ValRef>>()
 
     member internal _.Context = ctx
+    /// Each type a later declaration's check gave members in place, with those members. Under Sync.
+    member internal _.Augmented = augmented
     /// The parse the file was set up from.
     member _.Parse = parse
     member internal _.File = file
@@ -1774,6 +1777,55 @@ module internal DeclarationCheck =
     let addDefinitions (definitions: Map<Stamp, DeclarationRef>) (declaration: DeclarationRef) (delta: ModuleOrNamespaceType) =
         (definitions, stampsOf delta) ||> Seq.fold (fun acc stamp -> Map.add stamp declaration acc)
 
+    /// Records the members `delta` gave types it does not define, which an augmentation adds to the type in place.
+    let recordAugmentations (start: FileStart) (delta: ModuleOrNamespaceType) =
+        let definesHere = HashSet<Stamp>(stampsOf delta)
+
+        let rec visit (mty: ModuleOrNamespaceType) =
+            for v in mty.AllValsAndMembers do
+                if v.IsIntrinsicMember && v.MemberApparentEntity.IsLocalRef then
+                    let target = v.MemberApparentEntity.Deref
+
+                    if not (definesHere.Contains target.Stamp) then
+                        start.Augmented.GetOrCreateValue(target).Add(mkLocalValRef v)
+
+            for entity in mty.AllEntities do
+                if entity.IsModuleOrNamespace then
+                    visit entity.ModuleOrNamespaceType
+
+        visit delta
+
+    /// Runs `replay` with each augmented type holding only the members of the declarations in `definitions`, so a
+    /// replay of a declaration reads the type as that declaration's check did: the check of an earlier declaration
+    /// never saw what a later one added, and what it read decided what entered its environment (C#-style extension
+    /// members, `open type`). The members go back before the FileStart's lock is released.
+    let asOfDeclaration (start: FileStart) (definitions: Map<Stamp, DeclarationRef>) (replay: unit -> 'T) : 'T =
+        let hidden = ResizeArray()
+
+        for KeyValue(tycon, added) in start.Augmented do
+            let later = HashSet<Stamp>(added |> Seq.map _.Stamp |> Seq.filter (definitions.ContainsKey >> not))
+
+            if later.Count > 0 then
+                let tcaug = tycon.TypeContents
+                hidden.Add((tcaug, tcaug.tcaug_adhoc, tcaug.tcaug_adhoc_list))
+
+                tcaug.tcaug_adhoc <-
+                    tcaug.tcaug_adhoc
+                    |> Map.map (fun _ members -> members |> List.filter (fun (m: ValRef) -> not (later.Contains m.Stamp)))
+                    |> Map.filter (fun _ members -> not members.IsEmpty)
+
+                tcaug.tcaug_adhoc_list <-
+                    match tcaug.tcaug_adhoc_list with
+                    | null -> null
+                    | members -> ResizeArray(members |> Seq.filter (fun (_, m) -> not (later.Contains m.Stamp)))
+
+        try
+            replay ()
+        finally
+            for tcaug, adhoc, adhocList in hidden do
+                tcaug.tcaug_adhoc <- adhoc
+                tcaug.tcaug_adhoc_list <- adhocList
+
     let definitionsBefore (before: FileSignature list) =
         (Map.empty, before) ||> List.fold (fun acc signature -> Map.foldBack Map.add signature.Definitions acc)
 
@@ -2840,6 +2892,7 @@ type DeclarationChecker =
 
         let self = { File = start.Parse.FileName; Key = Some decl.Key }
         let definitions = DeclarationCheck.addDefinitions envBefore.Definitions self delta
+        DeclarationCheck.recordAugmentations start delta
         let envAfter = DeclEnv(envAfter.Env, envAfter.Parent, envAfter.TypeNames, envAfter.Frames, definitions)
         let contents, _, _ = checkedDecl
 
@@ -3146,7 +3199,8 @@ type DeclarationChecker =
 
             let env =
                 if checks then
-                    ExtendEnvWithDeclaration cenv decl.ScopeRange env decl.Syntax result.Delta
+                    DeclarationCheck.asOfDeclaration start definitions (fun () ->
+                        ExtendEnvWithDeclaration cenv decl.ScopeRange env decl.Syntax result.Delta)
                 else
                     env
 
