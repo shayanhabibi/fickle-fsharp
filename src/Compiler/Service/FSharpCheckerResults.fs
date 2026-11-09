@@ -2533,6 +2533,70 @@ type internal TypeCheckInfo
             getToolTipTextCache.Put(AnyCallerThread, key, res)
             res
 
+    /// GetStructuredToolTipText's tooltip, uncached, without the documentation of each element it knows the source of,
+    /// and those sources in element order
+    member _.GetToolTipParts(line, lineStr, colAtEndOfNames, names, width) : ToolTipText * FSharpDocSource option list =
+        DiagnosticsScope.Protect
+            range0
+            (fun () ->
+                let declItemsOpt =
+                    GetDeclItemsForNamesAtPosition(
+                        None,
+                        Some names,
+                        None,
+                        None,
+                        line,
+                        lineStr,
+                        colAtEndOfNames,
+                        ResolveTypeNamesToCtors,
+                        ResolveOverloads.Yes,
+                        None,
+                        (fun () -> []),
+                        FSharpCodeCompletionOptions.Default
+                    )
+
+                match declItemsOpt with
+                | None -> emptyToolTip, []
+                | Some(items, denv, _, m) ->
+                    let items =
+                        match items with
+                        | [ { Kind = CompletionItemKind.Property } as prop; { Kind = CompletionItemKind.Field }; { Kind = CompletionItemKind.Field } ] ->
+                            [ prop ]
+                        | _ -> items
+
+                    // The item FormatItemDescriptionToToolTipElement describes: a group gives one element per overload
+                    let rec shown item =
+                        match item with
+                        | Item.ImplicitOp(_, { contents = Some(TraitConstraintSln.FSMethSln(vref = vref)) }) -> Item.Value vref
+                        | Item.SetterArg(_, item) -> shown item
+                        | item -> item
+
+                    let parts =
+                        items
+                        |> List.map (fun x ->
+                            let symbol = Some(FSharpSymbol.Create(cenv, x.Item))
+                            let element = FormatStructuredDescriptionOfItem false infoReader tcAccessRights m denv x.ItemWithInst symbol width
+
+                            match element with
+                            | ToolTipElement.Group data ->
+                                let sources =
+                                    match shown x.Item with
+                                    | Item.CtorGroup(_, minfos)
+                                    | Item.MethodGroup(_, minfos, _) as group when minfos.Length = data.Length ->
+                                        minfos |> List.map (fun minfo -> GetDocSourceOfMethInfoItem infoReader m group minfo false)
+                                    | _ when data.Length = 1 -> [ GetDocSourceOfItem infoReader m x.Item ]
+                                    | _ -> data |> List.map (fun _ -> None)
+
+                                let data =
+                                    List.zip data sources
+                                    |> List.map (fun (d, source) -> if source.IsSome then { d with XmlDoc = FSharpXmlDoc.None } else d)
+
+                                ToolTipElement.Group data, sources
+                            | element -> element, [])
+
+                    ToolTipText(parts |> List.map fst), parts |> List.collect snd)
+            (fun err -> ToolTipText [ ToolTipElement.CompositionError err ], [])
+
     member _.GetF1Keyword(line, lineStr, colAtEndOfNames, names) : string option =
         DiagnosticsScope.Protect
             range0
@@ -3559,6 +3623,12 @@ type FSharpCheckFileResults
             | None -> emptyToolTip
             | Some(scope, _builderOpt) -> scope.GetReferenceResolutionStructuredToolTipText(line, colAtEndOfNames, width)
         | _ -> emptyToolTip
+
+    member x.GetToolTipParts(line, colAtEndOfNames, lineText, names, tokenTag, width) =
+        match tokenTagToTokenId tokenTag, details with
+        | TOKEN_IDENT, Some(scope, _builderOpt) -> scope.GetToolTipParts(line, lineText, colAtEndOfNames, names, width)
+        | TOKEN_IDENT, None -> emptyToolTip, []
+        | _ -> x.GetToolTip(line, colAtEndOfNames, lineText, names, tokenTag, width), []
 
     member _.GetDescription(symbol: FSharpSymbol, inst: (FSharpGenericParameter * FSharpType) list, displayFullName, range: range) =
         match details with
