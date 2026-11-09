@@ -713,6 +713,8 @@ type DeclarationResult
     member _.Key = declaration.Key
     /// What FinishFile keeps its computations for this result by: the check's, which shifting it keeps (see Shift)
     member internal _.ShareKey = shareKey
+    /// Made by CheckDeclarationAdHoc: its types are its own, and no finish holds it
+    member val internal IsAdHoc = false with get, set
     /// The fingerprint as the check left the declaration. Finishing the file can still change it, by defaults or by
     /// later declarations solving its inference variables, and only then: FileResult.Fingerprints has the final one,
     /// which differs from this one only when DependsOnLaterDeclarations.
@@ -1805,6 +1807,17 @@ module internal DeclarationCheck =
     /// taken in `f` describes what FinishFile leaves; the declarations after it see the variables unsolved, so the
     /// cutoff for them also has a fingerprint taken outside `f` (finishedFingerprint keeps both). The diagnostics are
     /// discarded: FinishFile reports them.
+    /// What the finish does to a declaration's unsolved variables. What it reports, and an error it raises, are dropped.
+    let applyDefaults (g: TcGlobals) (scratch: unit -> TcFileState) (contents: ModuleOrNamespaceContents, attribs: Attribs) (env: TcEnv) =
+        try
+            use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
+            // A checker state of its own: what solving defers is not this check's to run
+            let scratch = scratch ()
+            ApplyDefaults scratch g env.DisplayEnv range0 contents attribs
+            SolveInternalUnknowns g scratch env.DisplayEnv contents attribs
+        with RecoverableException _ ->
+            ()
+
     let whileFinished
         (g: TcGlobals)
         (scratch: unit -> TcFileState)
@@ -1817,15 +1830,7 @@ module internal DeclarationCheck =
         MutationLog.Current <- log
 
         try
-            (try
-                use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
-                // A checker state of its own: what solving defers is not this check's to run
-                let scratch = scratch ()
-                ApplyDefaults scratch g env.DisplayEnv range0 contents attribs
-                SolveInternalUnknowns g scratch env.DisplayEnv contents attribs
-             with RecoverableException _ ->
-                ())
-
+            applyDefaults g scratch (contents, attribs) env
             f ()
         finally
             MutationLog.Undo log
@@ -3356,10 +3361,12 @@ type DeclarationChecker =
             DeclarationCheck.keepingModuleTypes (DeclarationCheck.framesOf envBefore) (fun () ->
                 DeclarationChecker.ExtendEnvLocked(envBefore, result)))
 
-    /// CheckDeclaration for a result only queries read, never finished or depended on: it leaves the latest finish in
-    /// effect, so the published FileResult still reads as it was, and every module's type as it is. What the finish solved
-    /// stays solved while this checks: at a settled file an earlier declaration's open variables are all in a segment's
-    /// rows, so check from the segment's leader, whose new results hold new variables and types.
+    /// CheckDeclaration for a result only queries read, never finished or depended on. It leaves the latest finish in
+    /// effect and every module's type as it is. CheckDeclaration would undo the finish, and no finish follows a query:
+    /// the published FileResult's queries would then read the undone state until the next edit, with a defaulted type
+    /// unsolved (`ResizeArray<'a>`) and a signature file's docs gone. What the finish solved stays solved while this
+    /// checks: at a settled file an earlier declaration's open variables are all in a segment's rows, so check a segment
+    /// from its leader to its last row, whose new results hold new variables and types.
     static member CheckDeclarationAdHoc(start: FileStart, envBefore: DeclEnv, decl: ParsedDeclaration, ct: CancellationToken) : DeclarationResult =
         if decl.Depth > envBefore.Frames.Length then
             invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
@@ -3369,7 +3376,9 @@ type DeclarationChecker =
                 ct.ThrowIfCancellationRequested()
 
                 DeclarationCheck.keepingModuleTypes (DeclarationCheck.framesOf envBefore) (fun () ->
-                    DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct))))
+                    let result = DeclarationChecker.CheckDeclarationLocked(start, envBefore, decl, ct)
+                    result.IsAdHoc <- true
+                    result)))
 
     /// The environment after `results`, folded from BeginFile's with ExtendEnv, and the environment after each. The
     /// results at the start of `known` keep theirs: a shifted result has its check's ShareKey and holds what it holds. A
@@ -3402,18 +3411,59 @@ type DeclarationChecker =
 
         atEnd, envs
 
-    /// The captured environment for the positions after the last declaration: the environments the kept declarations
-    /// captured reach them too, and hold the names as they were when those declarations were checked.
-    static member private CaptureEnvAtEnd(sink: TcResultsSinkImpl, results: DeclarationResult[], atEnd: TcEnv) =
-        match Array.tryLast results with
-        | Some last -> (sink :> ITypecheckResultsSink).NotifyEnvWithScope(last.Declaration.Range.EndRange, atEnd.NameEnv, atEnd.AccessRights)
-        | None -> ()
+    /// The index of the declaration whose captured environment answers a query at the 1-based line and 0-based column of
+    /// check results over `results`, by the rule queries use (GetBestEnvForPos): the nearest environment before the
+    /// position inside the most deeply nested one around it, unless it knows fewer record fields. ValueSome -1 for what
+    /// the file's setup captured, ValueNone when nothing was captured around or before it: the environment at the file's
+    /// end answers.
+    static member AnsweringDeclaration(start: FileStart, results: DeclarationResult[], line: int, column: int) : int voption =
+        let at = FSharp.Compiler.Text.Position.mkPos line column
+
+        let captured =
+            [| for (m, nenv, _) in start.Sink.GetResolutions().CapturedEnvs do
+                   yield -1, m, nenv
+
+               for i in 0 .. results.Length - 1 do
+                   for (m, nenv, _) in results[i].Sink.GetResolutions().CapturedEnvs do
+                       yield i, m, nenv |]
+
+        let mutable around = ValueNone
+
+        for i, m, nenv in captured do
+            if rangeContainsPos m at then
+                match around with
+                | ValueSome(_, best, _) when not (rangeContainsRange best m) -> ()
+                | _ -> around <- ValueSome(i, m, nenv)
+
+        let mutable before = ValueNone
+
+        for i, m, nenv in captured do
+            if rangeBeforePos m at && not (FSharp.Compiler.Text.Position.posEq m.End at) then
+                let contained =
+                    match around with
+                    | ValueSome(_, best, _) -> rangeContainsRange best m
+                    | ValueNone -> true
+
+                if contained then
+                    match before with
+                    | ValueSome(_, right: range, _) when
+                        not (FSharp.Compiler.Text.Position.posGt m.End right.End || (FSharp.Compiler.Text.Position.posEq m.End right.End && FSharp.Compiler.Text.Position.posGt m.Start right.Start))
+                        ->
+                        ()
+                    | _ -> before <- ValueSome(i, m, nenv)
+
+        match before, around with
+        | ValueSome(i, _, _), ValueNone -> ValueSome i
+        | ValueSome(i, _, (b: NameResolutionEnv)), ValueSome(_, _, (d: NameResolutionEnv)) when b.eFieldLabels.Count >= d.eFieldLabels.Count -> ValueSome i
+        | _, ValueSome(i, _, _) -> ValueSome i
+        | ValueNone, ValueNone -> ValueNone
 
     /// Check results over `results` without closing the file: the sinks merged and the end environment assembled, with
     /// no tail run and nothing changed. For queries of names and types at a position (completion); they have no
     /// diagnostics, assembly signature or implementation file, and read the declarations' typed trees as the latest
-    /// finish left them. `results` may hold results of CheckDeclarationAdHoc. The members a replay hides are hidden and
-    /// back before this returns, under the FileStart's lock; a query must not overlap another thread's ExtendEnv.
+    /// finish left them, and the file's defaults applied to the results of CheckDeclarationAdHoc among `results`, which
+    /// are this view's alone. The members a replay hides are hidden and back before this returns, under the FileStart's
+    /// lock; a query must not overlap another thread's ExtendEnv.
     static member ViewResults(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : FSharpCheckFileResults =
         if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then
             invalidArg (nameof parse) "The parse is of another file than the FileStart's."
@@ -3423,6 +3473,16 @@ type DeclarationChecker =
 
         lock start.Sync (fun () ->
             lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->
+                // As a full check's queries see them, after the file's defaults: these results are this view's alone
+                let scratch () =
+                    let scratch, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+                    scratch
+
+                for result in results do
+                    if result.IsAdHoc then
+                        let contents, _, attribs = result.Checked
+                        DeclarationCheck.applyDefaults state.tcGlobals scratch (TMDefs contents, List.map snd attribs) result.EnvAfter.Env
+
                 let known =
                     match start.LastShares with
                     | :? FinishShares as last -> last.Envs
@@ -3437,14 +3497,10 @@ type DeclarationChecker =
                 let atEnd, _ =
                     DeclarationCheck.keepingModuleTypes modules (fun () -> DeclarationChecker.AssembleEnvAtEnd(start, results, known))
 
-                let sink = TcResultsSinkImpl(state.tcGlobals)
-                DeclarationChecker.CaptureEnvAtEnd(sink, results, atEnd)
-
                 let sinks =
                     [ yield start.Sink
                       for result in results do
-                          yield result.Sink
-                      yield sink ]
+                          yield result.Sink ]
 
                 let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
 
@@ -3678,7 +3734,6 @@ type DeclarationChecker =
         let envAtEndNow, envs =
             DeclarationChecker.AssembleEnvAtEnd(start, results, (match last with Some last -> last.Envs | None -> [||]))
 
-        DeclarationChecker.CaptureEnvAtEnd(sink, results, envAtEndNow)
         endPhase "envAtEnd"
 
         let scopeContents, compiledDefs, envAtEnd =
