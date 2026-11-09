@@ -738,6 +738,12 @@ type ProjectAssembly internal (fingerprint: string, data: Lazy<ProjectAssemblyDa
     member _.Fingerprint = fingerprint
     /// Pickled when first read: a referencing project reads it only when the fingerprint has changed.
     member internal _.Data = data.Value
+    /// Whether a referencing project reads the file at the path instead: a project with type provider generated types.
+    /// Pickles the assembly. Such a project is as of its last build.
+    member _.ReadsFileOnDisk =
+        match data.Value with
+        | ProjectAssemblyDataResult.Available _ -> false
+        | ProjectAssemblyDataResult.Unavailable _ -> true
 
 /// What a finish rendered and fingerprinted for one result.
 [<NoEquality; NoComparison>]
@@ -2091,6 +2097,10 @@ type DeclarationChecker =
     /// not the file at the path. Everything else is as CreateProject.
     static member CreateProject(options: FSharpProjectOptions, references: IReadOnlyDictionary<string, ProjectAssembly>) : Async<ProjectContext> =
         async {
+            // Here, where the caller sees a failure: the imports turn one into a missing reference, in no logger
+            for assembly in references.Values do
+                assembly.Data |> ignore
+
             let projectReferences =
                 [ for KeyValue(path, assembly) in references ->
                       { new IProjectReference with
@@ -2101,6 +2111,10 @@ type DeclarationChecker =
             let! state = initializeCompilerStateWith projectReferences options ignore
             return ProjectContext state
         }
+
+    /// For tests: an assembly whose pickle raises.
+    static member FailingProjectAssembly(message: string) : ProjectAssembly =
+        ProjectAssembly("!failing", Lazy<ProjectAssemblyDataResult>(fun () -> failwith message))
 
     /// The project's assembly from its files' results and signatures, as an incremental build gives one: `files` are
     /// the implementation files' results and `signatures` every file's, in file order. Each signature must be what the

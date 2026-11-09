@@ -276,7 +276,25 @@ module internal SignatureFingerprint =
                 let n = typarNumbers.Count
                 typarNumbers[tp] <- n
                 add ("'" + string n + " new")
-                add (shown tp.StaticReq + " " + shown tp.Kind)
+                // A name inference gave is not the user's, and CheckFile and FinishFile need not agree on it
+                add (if tp.IsCompilerGenerated then "-" else tp.Name)
+                add (shown tp.StaticReq + " " + shown tp.Kind + " " + shown tp.Rigidity + " " + shown tp.DynamicReq)
+
+                add (
+                    flag tp.EqualityConditionalOn
+                    + " "
+                    + flag tp.ComparisonConditionalOn
+                    + " "
+                    + flag tp.IsCompatFlex
+                    + " "
+                    + flag tp.typar_flags.IsSupportsNullFlex
+                    + " "
+                    + flag tp.IsCompilerGenerated
+                    + " "
+                    + flag tp.IsFromError
+                )
+
+                attribs tp.Attribs
                 add (string tp.Constraints.Length)
                 List.iter constr tp.Constraints
 
@@ -420,10 +438,13 @@ module internal SignatureFingerprint =
             attribs v.Attribs
             optConstant v.LiteralValue
             add (shown v.InlineInfo + " " + flag v.IsMutable + " " + flag v.IsCompilerGenerated + " " + flag v.IsExtensionMember)
+            add (shown v.val_flags.BaseOrThisInfo + " " + flag v.val_flags.IsMemberOrModuleBinding + " " + flag v.val_flags.IsIncrClassSpecialMember)
+            add (flag v.val_flags.IsTypeFunction + " " + flag v.val_flags.PermitsExplicitTypeInstantiation + " " + flag v.val_flags.IsGeneratedEventVal + " " + flag v.val_flags.IsFixed)
 
             match v.ValReprInfo with
             | Some (ValReprInfo (typarInfos, argGroups, result)) ->
                 add (string typarInfos.Length)
+                for TyparReprInfo (_, kind) in typarInfos do add (shown kind)
                 add (string argGroups.Length)
                 for group in argGroups do
                     add (string group.Length)
@@ -446,7 +467,7 @@ module internal SignatureFingerprint =
         and field (f: RecdField) =
             add (if f.IsCompilerGenerated then generatedName f.LogicalName else f.LogicalName)
             ty f.FormalType
-            add (flag f.IsMutable + " " + flag f.IsStatic + " " + flag f.IsVolatile)
+            add (flag f.IsMutable + " " + flag f.IsStatic + " " + flag f.IsVolatile + " " + flag f.IsCompilerGenerated)
             optConstant f.LiteralValue
             access f.Accessibility
             attribs f.PropertyAttribs
@@ -459,6 +480,7 @@ module internal SignatureFingerprint =
             access e.Accessibility
             access e.TypeReprAccessibility
             attribs e.Attribs
+            add (flag e.IsPrefixDisplay + " " + flag e.entity_flags.HasSelfReferentialConstructor + " " + flag e.entity_flags.IsStructRecordOrUnionType + " " + shown e.TypeOrMeasureKind)
             typars e.Typars
 
             if e.IsModuleOrNamespace then
@@ -1007,7 +1029,11 @@ module internal ParseAndCheck =
             ccu.Deref.InvalidateEvent.Add(fun _ -> reset())
         )
 
-        let assemblyName = !! Path.GetFileNameWithoutExtension(projectOptions.ProjectFileName)
+        // The name the build gives the assembly (<AssemblyName>, by -o:): InternalsVisibleTo reads it, and references resolve by it
+        let assemblyName =
+            match tcConfig.outputFile with
+            | Some(output: string) -> !! Path.GetFileNameWithoutExtension(output)
+            | None -> !! Path.GetFileNameWithoutExtension(projectOptions.ProjectFileName)
         let tcInitial, openDecls0 = GetInitialTcEnv (assemblyName, rangeStartup, tcConfig, tcImports, tcGlobals)
         let tcInitialState = GetInitialTcState (rangeStartup, assemblyName, tcConfig, tcGlobals, tcImports, tcInitial, openDecls0)
 
