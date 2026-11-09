@@ -2571,6 +2571,8 @@ type internal TypeCheckInfo
                         | Item.SetterArg(_, item) -> shown item
                         | item -> item
 
+                    let scope = DocScope()
+
                     let parts =
                         items
                         |> List.map (fun x ->
@@ -2579,12 +2581,20 @@ type internal TypeCheckInfo
 
                             match element with
                             | ToolTipElement.Group data ->
+                                // A source that fails keeps the element's doc, as GetToolTip shows it
+                                let guarded f =
+                                    try
+                                        f ()
+                                    with _ ->
+                                        None
+
                                 let sources =
                                     match shown x.Item with
                                     | Item.CtorGroup(_, minfos)
                                     | Item.MethodGroup(_, minfos, _) as group when minfos.Length = data.Length ->
-                                        minfos |> List.map (fun minfo -> GetDocSourceOfMethInfoItem infoReader m group minfo false)
-                                    | _ when data.Length = 1 -> [ GetDocSourceOfItem infoReader m x.Item ]
+                                        minfos
+                                        |> List.map (fun minfo -> guarded (fun () -> GetDocSourceOfMethInfoItem infoReader scope m group minfo false))
+                                    | _ when data.Length = 1 -> [ guarded (fun () -> GetDocSourceOfItem infoReader scope m x.Item) ]
                                     | _ -> data |> List.map (fun _ -> None)
 
                                 let data =

@@ -936,6 +936,13 @@ module internal SymbolHelpers =
 
         |> GetXmlDocFromLoader infoReader
 
+    /// An entity's name as its declaration gives it, with the number of its type parameters when it has any, which
+    /// tells apart the types of one name that FCS's XmlDocSig tells apart (`Box` and `Box<'T>`)
+    let private sourceNameOfEntity (tcref: TyconRef) =
+        match tcref.Typars.Length with
+        | 0 -> tcref.DisplayNameCore
+        | n -> tcref.DisplayNameCore + "`" + string n
+
     /// The enclosing namespaces and modules of an entity and its own name, as the source names them
     let private sourcePathOfEntity (tcref: TyconRef) =
         let enclosing =
@@ -946,25 +953,36 @@ module internal SymbolHelpers =
                     name.Substring(0, name.Length - FSharpModuleSuffix.Length)
                 | _ -> name)
 
-        String.concat "." (enclosing @ [ tcref.DisplayNameCore ])
+        String.concat "." (enclosing @ [ sourceNameOfEntity tcref ])
 
-    /// A declaration's file and, when it has a signature in another file, that file: the first is the doc, unless empty
-    let private ownersAt (path: string) (own: range) (signature: range) =
+    /// A declaration's file and, when it has a signature in another file, that file at `signaturePath`: the first is the
+    /// doc, unless empty
+    let private ownersAt (path: string) (own: range) (signature: range) (signaturePath: string) =
         [ yield { FileName = own.FileName; Path = path }
           if not (String.Equals(signature.FileName, own.FileName, StringComparison.OrdinalIgnoreCase)) then
-              yield { FileName = signature.FileName; Path = path } ]
+              yield { FileName = signature.FileName; Path = signaturePath } ]
+
+    /// The declarations of a source file: what is compiled, or provided, has no `///` of its own there
+    let private isSourceEntity (tcref: TyconRef) = not (tcref.IsILTycon || tcref.IsProvided)
 
     let private ownersOfEntity (tcref: TyconRef) =
-        if tcref.IsILTycon then None
+        if not (isSourceEntity tcref) then None
         else
             let kind = if tcref.IsModuleOrNamespace then "N:" else "T:"
-            Some(ownersAt (kind + sourcePathOfEntity tcref) tcref.Range tcref.SigRange)
+            let path = kind + sourcePathOfEntity tcref
+            Some(ownersAt path tcref.Range tcref.SigRange path)
 
     let private ownersOfUnionCase (ucref: UnionCaseRef) =
-        Some(ownersAt ("C:" + sourcePathOfEntity ucref.TyconRef + "." + ucref.CaseName) ucref.UnionCase.Range ucref.UnionCase.SigRange)
+        if not (isSourceEntity ucref.TyconRef) then None
+        else
+            let path = "C:" + sourcePathOfEntity ucref.TyconRef + "." + ucref.CaseName
+            Some(ownersAt path ucref.UnionCase.Range ucref.UnionCase.SigRange path)
 
     let private ownersOfField (rfref: RecdFieldRef) =
-        Some(ownersAt ("F:" + sourcePathOfEntity rfref.TyconRef + "." + rfref.FieldName) rfref.RecdField.Range rfref.RecdField.SigRange)
+        if not (isSourceEntity rfref.TyconRef) then None
+        else
+            let path = "F:" + sourcePathOfEntity rfref.TyconRef + "." + rfref.FieldName
+            Some(ownersAt path rfref.RecdField.Range rfref.RecdField.SigRange path)
 
     /// A member's kind and name as its declaration gives them
     let private memberTag (v: ValRef) =
@@ -985,11 +1003,30 @@ module internal SymbolHelpers =
             elif isProperty then Some("property " + name)
             else Some("member " + name)
 
-    /// A value's path: its module's and its name, or for a member its type's, its kind and name, and its place among the
-    /// declarations of its file with that kind and name in its type (or its extensions in the module)
-    let private ownersOfVal (g: TcGlobals) (vref: ValRef) =
+    /// The members of a type, or a module's extensions of it, once per tooltip
+    [<Sealed>]
+    type DocScope() =
+        member val Members = System.Collections.Generic.Dictionary<struct (Stamp * Stamp), ValRef list>()
+
+    /// The place of a declaration at `at` among `places` in its file, by position
+    let private placeOf (places: range list) (at: range) =
+        places
+        |> List.filter (fun r -> String.Equals(r.FileName, at.FileName, StringComparison.OrdinalIgnoreCase))
+        |> List.map _.Start
+        |> List.distinct
+        |> List.sortWith (fun a b -> compare (a.Line, a.Column) (b.Line, b.Column))
+        |> List.tryFindIndex (fun p -> Position.posEq p at.Start)
+        |> Option.defaultValue 0
+
+    /// A value's path: its module's (or type's, for a class `let`) and its name, or for a member its type's, its kind and
+    /// name, and its place among the declarations of its file with that kind and name in its type (or its extensions in
+    /// the module). A signature file's member is placed among the signature's, which can list them in another order or
+    /// leave one out.
+    let private ownersOfVal (g: TcGlobals) (scope: DocScope) (vref: ValRef) =
         match vref.MemberInfo, vref.TryDeclaringEntity with
-        | None, Parent parent -> Some(ownersAt ("V:" + sourcePathOfEntity parent + "." + vref.LogicalName) vref.Range vref.SigRange)
+        | None, Parent parent ->
+            let path = "V:" + sourcePathOfEntity parent + "." + vref.LogicalName
+            Some(ownersAt path vref.Range vref.SigRange path)
         | None, ParentNone -> None
         | Some _, declaring ->
             match memberTag vref with
@@ -997,105 +1034,117 @@ module internal SymbolHelpers =
             | Some tag ->
                 let apparent = vref.MemberApparentEntity
 
-                let typePath, siblings =
+                let typePath, key, scan =
                     match declaring with
                     | Parent p when not (tyconRefEq g p apparent) ->
-                        sourcePathOfEntity p + "." + apparent.DisplayNameCore,
-                        p.ModuleOrNamespaceType.AllValsAndMembers
-                        |> Seq.map mkLocalValRef
-                        |> Seq.filter (fun v -> v.IsMember && tyconRefEq g v.MemberApparentEntity apparent)
-                        |> List.ofSeq
-                    | _ -> sourcePathOfEntity apparent, apparent.MembersOfFSharpTyconSorted
+                        let scan () =
+                            p.ModuleOrNamespaceType.AllValsAndMembers
+                            |> Seq.map mkLocalValRef
+                            |> Seq.filter (fun v -> v.IsMember && tyconRefEq g v.MemberApparentEntity apparent)
+                            |> List.ofSeq
 
-                let places =
-                    siblings
-                    |> List.filter (fun v ->
-                        memberTag v = Some tag
-                        && String.Equals(v.Range.FileName, vref.Range.FileName, StringComparison.OrdinalIgnoreCase))
-                    |> List.map (fun v -> v.Range.Start)
-                    |> List.distinct
-                    |> List.sortWith (fun a b -> compare (a.Line, a.Column) (b.Line, b.Column))
+                        sourcePathOfEntity p + "." + sourceNameOfEntity apparent, struct (p.Stamp, apparent.Stamp), scan
+                    | _ -> sourcePathOfEntity apparent, struct (apparent.Stamp, apparent.Stamp), (fun () -> apparent.MembersOfFSharpTyconSorted)
 
-                let ordinal = places |> List.tryFindIndex (fun p -> Position.posEq p vref.Range.Start) |> Option.defaultValue 0
-                Some(ownersAt ("M:" + typePath + "." + tag + "#" + string ordinal) vref.Range vref.SigRange)
+                let siblings =
+                    match scope.Members.TryGetValue key with
+                    | true, s -> s
+                    | _ ->
+                        let s = scan ()
+                        scope.Members[key] <- s
+                        s
 
-    let private ownersOfMethInfo g (minfo: MethInfo) =
-        match minfo.ArbitraryValRef with
-        | Some vref -> ownersOfVal g vref
-        | None -> Some []
+                let alike = siblings |> List.filter (fun v -> memberTag v = Some tag)
+                let ordinal = placeOf (alike |> List.map _.Range) vref.Range
+                // The signature's declarations that the alike members conformed to
+                let signatureOrdinal = placeOf (alike |> List.map _.SigRange) vref.SigRange
+                let path = "M:" + typePath + "." + tag + "#"
+                Some(ownersAt (path + string ordinal) vref.Range vref.SigRange (path + string signatureOrdinal))
 
-    let private makeDocSource (infoReader: InfoReader) m d (owners: FSharpDocOwner list option) (stale: XmlDoc) (fallback: FSharpXmlDoc) =
+    let private ownersOfMethInfo g scope (minfo: MethInfo) =
+        match minfo with
+        | FSMeth(_, _, vref, _) -> ownersOfVal g scope vref
+        // Compiled or provided: the doc the check has is the doc
+        | _ -> None
+
+    let private makeDocSource (infoReader: InfoReader) scope m d (owners: FSharpDocOwner list option) (stale: XmlDoc) (fallback: FSharpXmlDoc) =
         match owners with
         | None -> None
         | Some owners ->
             let g = infoReader.g
 
-            let inherits =
-                try
-                    implicitInheritCandidates infoReader m d
-                    |> Seq.map (fun (cref, xmlDoc, target) ->
-                        let owners =
-                            match target with
-                            | DocTarget.Entity tcref -> ownersOfEntity tcref
-                            | DocTarget.Value(Some vref) -> ownersOfVal g vref
-                            | DocTarget.Value None -> Some []
+            // As far as FCS's own walk would get: a candidate that throws ends it, and those before it stay
+            let inherits = ResizeArray()
 
-                        // Not known: a declaration no file names, whose comment is the one the check has
-                        cref, defaultArg owners [ { FileName = ""; Path = "" } ], xmlDoc)
-                    |> List.ofSeq
-                with _ ->
-                    []
+            try
+                for cref, xmlDoc, target in implicitInheritCandidates infoReader m d do
+                    let owners =
+                        match target with
+                        | DocTarget.Entity tcref -> ownersOfEntity tcref
+                        | DocTarget.Value(Some vref) -> ownersOfVal g scope vref
+                        | DocTarget.Value None -> None
 
-            Some(FSharpDocSource(owners, stale, inherits, fallback, composeXmlComment))
+                    // Not known: a declaration no file names, whose comment is the one the check has
+                    inherits.Add((cref, defaultArg owners [ { FileName = ""; Path = "" } ], xmlDoc))
+            with _ ->
+                ()
+
+            Some(FSharpDocSource(owners, stale, List.ofSeq inherits, fallback, composeXmlComment))
 
     /// Where the documentation of a method's tooltip element comes from, as GetXmlCommentForMethInfoItem makes it
-    let GetDocSourceOfMethInfoItem (infoReader: InfoReader) m d (minfo: MethInfo) (loaded: bool) =
+    let GetDocSourceOfMethInfoItem (infoReader: InfoReader) scope m d (minfo: MethInfo) (loaded: bool) =
         let fallback =
             if minfo.HasDirectXmlComment then GetXmlDocHelpSigOfItemForLookup infoReader m d
             else mkXmlComment (GetXmlDocSigOfMethInfo infoReader m minfo)
 
         let fallback = if loaded then GetXmlDocFromLoader infoReader fallback else fallback
 
-        makeDocSource infoReader m d (ownersOfMethInfo infoReader.g minfo) minfo.XmlDoc fallback
+        makeDocSource infoReader scope m d (ownersOfMethInfo infoReader.g scope minfo) minfo.XmlDoc fallback
 
     /// Where the documentation of an item's tooltip element comes from, as GetXmlCommentForItem makes it. None when it
     /// isn't known which declarations it is read from.
-    let rec GetDocSourceOfItem (infoReader: InfoReader) m item : FSharpDocSource option =
+    let rec GetDocSourceOfItem (infoReader: InfoReader) scope m item : FSharpDocSource option =
         let g = infoReader.g
         let fallback () = GetXmlDocHelpSigOfItemForLookup infoReader m item |> GetXmlDocFromLoader infoReader
-        let source owners stale = makeDocSource infoReader m item owners stale (fallback ())
+        let source owners stale = makeDocSource infoReader scope m item owners stale (fallback ())
         let none () = source (Some []) XmlDoc.Empty
 
         match item with
         | Item.ImplicitOp(_, sln) ->
             match sln.Value with
-            | Some(TraitConstraintSln.FSMethSln(vref = vref)) -> GetDocSourceOfItem infoReader m (Item.Value vref)
+            | Some(TraitConstraintSln.FSMethSln(vref = vref)) -> GetDocSourceOfItem infoReader scope m (Item.Value vref)
             | _ -> none ()
         | Item.Value vref
-        | Item.CustomBuilder(_, vref) -> source (ownersOfVal g vref) vref.XmlDoc
+        | Item.CustomBuilder(_, vref) -> source (ownersOfVal g scope vref) vref.XmlDoc
         | Item.UnionCase(ucinfo, _)
         | Item.UnionCaseField(ucinfo, _) -> source (ownersOfUnionCase ucinfo.UnionCaseRef) ucinfo.UnionCase.XmlDoc
-        | Item.ActivePatternCase apref -> source (ownersOfVal g apref.ActivePatternVal) apref.ActivePatternVal.XmlDoc
+        | Item.ActivePatternCase apref -> source (ownersOfVal g scope apref.ActivePatternVal) apref.ActivePatternVal.XmlDoc
         | Item.ExnCase ecref -> source (ownersOfEntity ecref) ecref.XmlDoc
         | Item.RecdField rfinfo ->
             if rfinfo.TyconRef.IsFSharpException then source (ownersOfEntity rfinfo.TyconRef) rfinfo.TyconRef.XmlDoc
             else source (ownersOfField rfinfo.RecdFieldRef) rfinfo.RecdField.XmlDoc
         | Item.Property(info = pinfo :: _) ->
             match pinfo.ArbitraryValRef with
-            | Some vref when (match pinfo with FSProp _ -> true | _ -> false) -> source (ownersOfVal g vref) pinfo.XmlDoc
+            | Some vref when (match pinfo with FSProp _ -> true | _ -> false) -> source (ownersOfVal g scope vref) pinfo.XmlDoc
+            | _ -> None
+        | Item.Event einfo ->
+            match einfo with
+            | FSEvent(_, pinfo, _, _) ->
+                match pinfo.ArbitraryValRef with
+                | Some vref -> source (ownersOfVal g scope vref) einfo.XmlDoc
+                | None -> None
             | _ -> None
         | Item.CustomOperation(_, _, Some minfo)
         | Item.CtorGroup(_, minfo :: _)
         | Item.MethodGroup(_, minfo :: _, _) ->
-            GetDocSourceOfMethInfoItem infoReader m item minfo true
+            GetDocSourceOfMethInfoItem infoReader scope m item minfo true
         | Item.Types(_, AbbrevOrAppTy(tcref, _) :: _)
         | Item.UnqualifiedType(tcref :: _) -> source (ownersOfEntity tcref) tcref.XmlDoc
         | Item.ModuleOrNamespaces(modref :: _ as modrefs) when not (modrefs |> List.forall (fun modref -> modref.IsNamespace)) ->
             source (ownersOfEntity modref) modref.XmlDoc
-        | Item.OtherName(container = Some(ArgumentContainer.Method minfo)) -> source (ownersOfMethInfo g minfo) minfo.XmlDoc
+        | Item.OtherName(container = Some(ArgumentContainer.Method minfo)) -> source (ownersOfMethInfo g scope minfo) minfo.XmlDoc
         | Item.OtherName(container = Some(ArgumentContainer.Type tcref)) -> source (ownersOfEntity tcref) tcref.XmlDoc
-        | Item.SetterArg(_, item) -> GetDocSourceOfItem infoReader m item
-        | Item.Event _ -> None
+        | Item.SetterArg(_, item) -> GetDocSourceOfItem infoReader scope m item
         | _ -> none ()
 
 
