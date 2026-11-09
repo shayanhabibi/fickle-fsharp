@@ -918,7 +918,8 @@ type internal FinishShares
         keys: DeclarationKey[],
         fingerprints: string[],
         signature: FileSignature option,
-        envs: (obj * DeclEnv)[]
+        envs: (obj * DeclEnv)[],
+        exits: TcResultsSinkImpl[]
     ) =
     member _.Options = options
     member _.Directives = directives
@@ -929,6 +930,54 @@ type internal FinishShares
     member _.Signature = signature
     /// The environment after each declaration as the finish assembled it, with the result's ShareKey
     member _.Envs = envs
+    /// What leaving modules reported: at i, before the declaration at i, and last, after every declaration
+    member _.Exits = exits
+
+/// Scope ranges as the current text gives them, by the sink that captured them. `rows` holds each declaration's sink, range
+/// and scope range when it was checked; `current` gives each declaration's range and scope range in the current text.
+type internal ScopesNow
+    (
+        setup: TcResultsSinkImpl,
+        setupEnd: pos,
+        rows: (TcResultsSinkImpl * range * range)[],
+        fileEnd: pos,
+        current: unit -> (range * range)[]
+    ) =
+    let moved =
+        lazy
+            (let d = Dictionary<TcResultsSinkImpl, struct (range * range * range * range)>(HashIdentity.Reference)
+             let now = current ()
+
+             if now.Length = rows.Length then
+                 for i in 0 .. rows.Length - 1 do
+                     let sink, oldRange, oldScope = rows[i]
+                     let range, scope = now[i]
+                     d[sink] <- struct (oldRange, oldScope, range, scope)
+
+             d)
+
+    member _.Of (sink: TcResultsSinkImpl) (m: range) : range =
+        if obj.ReferenceEquals(sink, setup) then
+            if FSharp.Compiler.Text.Position.posEq m.End setupEnd then
+                mkFileIndexRange m.FileIndex m.Start fileEnd
+            else
+                m
+        else
+            match moved.Value.TryGetValue sink with
+            | true, struct (oldRange, oldScope, rangeNow, scopeNow) when FSharp.Compiler.Text.Position.posEq m.End oldScope.End ->
+                // The declaration's scope as its check was given it, or from the declaration's end to the scope's end
+                if FSharp.Compiler.Text.Position.posEq m.Start oldScope.Start then
+                    scopeNow
+                elif FSharp.Compiler.Text.Position.posEq m.Start oldRange.End then
+                    mkFileIndexRange m.FileIndex rangeNow.End scopeNow.End
+                else
+                    m
+            | true, _ -> m
+            | _ ->
+                // What leaving a module reported, at the scope its header's check was given
+                moved.Value.Values
+                |> Seq.tryPick (fun (struct (_, oldScope, _, scopeNow)) -> if Range.equals oldScope m then Some scopeNow else None)
+                |> Option.defaultValue m
 
 module internal DeclarationCheck =
 
@@ -1505,7 +1554,7 @@ module internal DeclarationCheck =
 
     /// Builds the scope's contents, checked declarations and environment at its end from the results in order,
     /// finishing each nested module after its declarations, as checking the file whole does.
-    let assemble (cenv: TcFileState) (scopeContents: ModuleOrNamespaceType) (scopeEnv: TcEnv) (results: DeclarationResult[]) =
+    let assemble (cenv: TcFileState) (scopeContents: ModuleOrNamespaceType) (scopeEnv: TcEnv) (results: DeclarationResult[]) (exits: TcResultsSinkImpl[]) =
         let root =
             { Frame = None
               Contents = scopeContents
@@ -1515,7 +1564,9 @@ module internal DeclarationCheck =
         let levels = Stack<Level>()
         levels.Push root
 
-        let close () =
+        // What leaving a module reports goes to `exits`, by the row it comes before, as a full check reports it there
+        let close (exit: TcResultsSinkImpl) =
+            use _ = WithNewTypecheckResultsSink(exit, cenv.tcSink)
             let level = levels.Pop()
             let parent = levels.Peek()
 
@@ -1534,9 +1585,11 @@ module internal DeclarationCheck =
                 parent.EnvAtEnd <- frame.OuterEnv
             | None -> ()
 
-        for result in results do
+        for i in 0 .. results.Length - 1 do
+            let result = results[i]
+
             while levels.Count - 1 > result.Nesting.Depth do
-                close ()
+                close exits[i]
 
             match result.Nesting with
             | ModuleHeader(_, frame) ->
@@ -1557,7 +1610,7 @@ module internal DeclarationCheck =
                 level.EnvAtEnd <- result.EnvAtEnd
 
         while levels.Count > 1 do
-            close ()
+            close exits[results.Length]
 
         root.Contents, List.ofSeq root.Checked, root.EnvAtEnd
 
@@ -1642,12 +1695,12 @@ module internal DeclarationCheck =
     /// The environment after leaving nested modules until the environment is in only `depth` of them, as the first
     /// declaration after a module is checked in. FinishFile finishes the modules again and reports what that finds,
     /// so what this reports is dropped. It gives each module its contents so far as its type, as FinishFile does.
-    let exitModules (state: CompilerState) (start: FileStart) (envBefore: DeclEnv) depth =
+    let exitModulesInto (exits: TcResultsSinkImpl) (state: CompilerState) (start: FileStart) (envBefore: DeclEnv) depth =
         if envBefore.Frames.Length <= depth then
             envBefore
         else
             use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
-            let cenv, _, _ = newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+            let cenv, _, _ = newCheckerState state start.TcState start.RootSigOpt start.File exits
 
             let rec exit (env: DeclEnv) =
                 match env.Frames with
@@ -1671,14 +1724,32 @@ module internal DeclarationCheck =
 
             exit envBefore
 
+    let exitModules (state: CompilerState) (start: FileStart) (envBefore: DeclEnv) depth =
+        exitModulesInto (TcResultsSinkImpl state.tcGlobals) state start envBefore depth
+
+    /// The end of a file's last fragment.
+    let fileEndOf (parse: FSharpParseFileResults) =
+        match parse.ParseTree with
+        | ParsedInput.ImplFile file when not file.Contents.IsEmpty -> (List.last file.Contents).Range.End
+        | _ -> parse.ParseTree.Range.End
+
+    /// What a kept result's scope ranges are for the current text. A declaration's scope reaches the end of its module
+    /// or file, and a declaration added since is outside the scope its check captured.
+    let scopesNow (setup: TcResultsSinkImpl) (setupEnd: pos) (rows: (TcResultsSinkImpl * range * range)[]) (parse: FSharpParseFileResults) (current: unit -> (range * range)[]) =
+        ScopesNow(setup, setupEnd, rows, fileEndOf parse, current)
+
     /// The results of several sinks as one sink's, in order.
-    let mergeSinks (g: TcGlobals) (sinks: TcResultsSinkImpl list) =
+    let mergeSinks (g: TcGlobals) (scopes: ScopesNow) (sinks: TcResultsSinkImpl list) =
         let all (pick: TcResolutions -> ResizeArray<'T>) =
             ResizeArray(sinks |> Seq.collect (fun sink -> pick (sink.GetResolutions())))
 
         let resolutions =
             TcResolutions(
-                all (fun r -> r.CapturedEnvs),
+                ResizeArray(
+                    sinks
+                    |> Seq.collect (fun sink ->
+                        sink.GetResolutions().CapturedEnvs |> Seq.map (fun (m, nenv, ad) -> scopes.Of sink m, nenv, ad))
+                ),
                 all (fun r -> r.CapturedExpressionTypings),
                 // What a shifted declaration copied from others, as it is now (DeclarationShift.currentItems)
                 ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentItems),
@@ -2005,6 +2076,31 @@ module internal DeclarationCheck =
             for tcaug, adhoc, adhocList in hidden do
                 tcaug.tcaug_adhoc <- adhoc
                 tcaug.tcaug_adhoc_list <- adhocList
+
+    /// A sink for what leaving modules reports before each of `results`, and last for after them all. One shared, empty,
+    /// where no module ends: a finish makes these for every declaration.
+    let exitSinks (g: TcGlobals) (results: DeclarationResult[]) =
+        let none = TcResultsSinkImpl g
+
+        let frames (result: DeclarationResult) =
+            match result.Nesting with
+            | ModuleHeader _ -> result.Nesting.Depth + 1
+            | InModules _ -> result.Nesting.Depth
+
+        Array.init (results.Length + 1) (fun i ->
+            let left = if i = 0 then 0 else frames results[i - 1]
+            let entering = if i = results.Length then 0 else results[i].Nesting.Depth
+            if entering < left then TcResultsSinkImpl g else none)
+
+    /// The sinks of a file's check as a full check reports to them: leaving a module, then the next declaration.
+    let inOrder (setup: TcResultsSinkImpl) (results: DeclarationResult[]) (exits: TcResultsSinkImpl[]) =
+        [ yield setup
+
+          for i in 0 .. results.Length - 1 do
+              yield exits[i]
+              yield results[i].Sink
+
+          yield exits[results.Length] ]
 
     /// Runs `replay`, which may leave modules, and puts back the types it gave them: leaving a module gives it its contents
     /// so far, which only a finish may publish.
@@ -3547,7 +3643,7 @@ type DeclarationChecker =
     /// results at the start of `known` keep theirs: a shifted result has its check's ShareKey and holds what it holds. A
     /// file's end is inside its last module, as a full check's is; a declaration checked whole has no replay for what it
     /// leaves inside it, so the environment its check left stands. Under Sync, with no finish in effect to undo.
-    static member private AssembleEnvAtEnd(start: FileStart, results: DeclarationResult[], known: (obj * DeclEnv)[]) =
+    static member private AssembleEnvAtEnd(start: FileStart, results: DeclarationResult[], known: (obj * DeclEnv)[], exits: TcResultsSinkImpl[] voption) =
         let envs = Array.zeroCreate results.Length
         let mutable env = start.EnvAtStart
         let mutable reusing = true
@@ -3559,9 +3655,18 @@ type DeclarationChecker =
                 env <- snd known[i]
             else
                 reusing <- false
+
+                match exits with
+                | ValueSome exits -> env <- DeclarationCheck.exitModulesInto exits[i] start.Context.State start env result.Declaration.Depth
+                | ValueNone -> ()
+
                 env <- DeclarationChecker.ExtendEnvLocked(env, result)
 
             envs[i] <- result.ShareKey, env
+
+        match exits with
+        | ValueSome exits -> DeclarationCheck.exitModulesInto exits[results.Length] start.Context.State start env 0 |> ignore
+        | ValueNone -> ()
 
         let atEnd =
             match Array.tryLast results with
@@ -3574,52 +3679,72 @@ type DeclarationChecker =
 
         atEnd, envs
 
-    /// The index of the declaration whose captured environment answers a query at the 1-based line and 0-based column of
-    /// check results over `results`, by the rule queries use (GetBestEnvForPos): the nearest environment before the
-    /// position inside the most deeply nested one around it, unless it knows fewer record fields. ValueSome -1 for what
-    /// the file's setup captured, ValueNone when nothing was captured around or before it: the environment at the file's
-    /// end answers.
-    static member AnsweringDeclaration(start: FileStart, results: DeclarationResult[], line: int, column: int) : int voption =
+    /// What a query at the 1-based line and 0-based column of check results over `results` can read, by the rule queries
+    /// use (GetBestEnvForPos): the most deeply nested environment around the position and the nearest one before it inside
+    /// that. Which of the two it takes depends on how many record fields each knows, and that is only known once both
+    /// are current, so these are both: the indexes of the declarations that captured them; the index of the declaration
+    /// a module's leaving reported one before, or the number of results for after the last, or -1; and whether nothing was
+    /// captured around or before it, when the environment at the file's end answers.
+    static member AnsweringDeclarations(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults, line: int, column: int) : struct (int[] * int * bool) =
         let at = FSharp.Compiler.Text.Position.mkPos line column
+        let setup = -1
+        let exitBase = results.Length + 1
+        let scopes = DeclarationChecker.ScopesNowOf(start, results, parse)
+
+        let exits =
+            match start.LastShares with
+            | :? FinishShares as last when last.Exits.Length = results.Length + 1 -> last.Exits
+            | _ -> DeclarationCheck.exitSinks start.Context.State.tcGlobals results
 
         let captured =
-            [| for (m, nenv, _) in start.Sink.GetResolutions().CapturedEnvs do
-                   yield -1, m, nenv
+            [| let of' (i: int) (sink: TcResultsSinkImpl) =
+                   [| for (m, nenv, _) in sink.GetResolutions().CapturedEnvs -> i, scopes.Of sink m, nenv |]
+
+               yield! of' setup start.Sink
 
                for i in 0 .. results.Length - 1 do
-                   for (m, nenv, _) in results[i].Sink.GetResolutions().CapturedEnvs do
-                       yield i, m, nenv |]
+                   yield! of' (exitBase + i) exits[i]
+                   yield! of' i results[i].Sink
+
+               yield! of' (exitBase + results.Length) exits[results.Length] |]
 
         let mutable around = ValueNone
 
-        for i, m, nenv in captured do
+        for i, m, _ in captured do
             if rangeContainsPos m at then
                 match around with
-                | ValueSome(_, best, _) when not (rangeContainsRange best m) -> ()
-                | _ -> around <- ValueSome(i, m, nenv)
+                | ValueSome(_, best) when not (rangeContainsRange best m) -> ()
+                | _ -> around <- ValueSome(i, m)
 
         let mutable before = ValueNone
 
-        for i, m, nenv in captured do
+        for i, m, _ in captured do
             if rangeBeforePos m at && not (FSharp.Compiler.Text.Position.posEq m.End at) then
                 let contained =
                     match around with
-                    | ValueSome(_, best, _) -> rangeContainsRange best m
+                    | ValueSome(_, best) -> rangeContainsRange best m
                     | ValueNone -> true
 
                 if contained then
                     match before with
-                    | ValueSome(_, right: range, _) when
+                    | ValueSome(_, right: range) when
                         not (FSharp.Compiler.Text.Position.posGt m.End right.End || (FSharp.Compiler.Text.Position.posEq m.End right.End && FSharp.Compiler.Text.Position.posGt m.Start right.Start))
                         ->
                         ()
-                    | _ -> before <- ValueSome(i, m, nenv)
+                    | _ -> before <- ValueSome(i, m)
 
-        match before, around with
-        | ValueSome(i, _, _), ValueNone -> ValueSome i
-        | ValueSome(i, _, (b: NameResolutionEnv)), ValueSome(_, _, (d: NameResolutionEnv)) when b.eFieldLabels.Count >= d.eFieldLabels.Count -> ValueSome i
-        | _, ValueSome(i, _, _) -> ValueSome i
-        | ValueNone, ValueNone -> ValueNone
+        let found =
+            [ match around with
+              | ValueSome(i, _) -> yield i
+              | ValueNone -> ()
+
+              match before with
+              | ValueSome(i, _) -> yield i
+              | ValueNone -> () ]
+
+        let rows = found |> List.filter (fun i -> i >= 0 && i < exitBase) |> List.distinct |> Array.ofList
+        let exit = found |> List.filter (fun i -> i >= exitBase) |> List.fold (fun acc i -> max acc (i - exitBase)) -1
+        struct (rows, exit, found.IsEmpty)
 
     /// Check results over `results` without closing the file: the sinks merged and the end environment assembled, with
     /// no tail run and nothing changed. For queries of names and types at a position (completion); they have no
@@ -3646,26 +3771,20 @@ type DeclarationChecker =
                         let contents, _, attribs = result.Checked
                         DeclarationCheck.applyDefaults state.tcGlobals scratch (TMDefs contents, List.map snd attribs) result.EnvAfter.Env
 
-                let known =
-                    match start.LastShares with
-                    | :? FinishShares as last -> last.Envs
-                    | _ -> [||]
-
                 let modules =
                     [ for result in results do
                           match result.Nesting with
                           | ModuleHeader(_, { Entity = Some entity }) -> entity
                           | _ -> () ]
 
+                // The whole fold: what the finish's leaving a module reported holds names as they were at the module's header
+                let exits = DeclarationCheck.exitSinks state.tcGlobals results
+
                 let atEnd, _ =
-                    DeclarationCheck.keepingModuleTypes modules (fun () -> DeclarationChecker.AssembleEnvAtEnd(start, results, known))
+                    DeclarationCheck.keepingModuleTypes modules (fun () -> DeclarationChecker.AssembleEnvAtEnd(start, results, [||], ValueSome exits))
 
-                let sinks =
-                    [ yield start.Sink
-                      for result in results do
-                          yield result.Sink ]
-
-                let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
+                let resolutions, symbolUses, openDeclarations =
+                    DeclarationCheck.mergeSinks state.tcGlobals (DeclarationChecker.ScopesNowOf(start, results, parse)) (DeclarationCheck.inOrder start.Sink results exits)
 
                 let scope =
                     TypeCheckInfo(
@@ -3688,6 +3807,14 @@ type DeclarationChecker =
                     )
 
                 FSharpCheckFileResults(parse.FileName, [||], Some scope, parse.DependencyFiles, None, true)))
+
+    static member private ScopesNowOf(start: FileStart, results: DeclarationResult[], parse: FSharpParseFileResults) : ScopesNow =
+        DeclarationCheck.scopesNow
+            start.Sink
+            (DeclarationCheck.fileEndOf start.Parse)
+            (results |> Array.map (fun r -> r.Sink, r.Declaration.Range, r.Declaration.ScopeRange))
+            parse
+            (fun () -> DeclarationChecker.Split parse |> Array.map (fun d -> d.Range, d.ScopeRange))
 
     static member private ExtendEnvLocked(envBefore: DeclEnv, result: DeclarationResult) : DeclEnv =
         let decl = result.Declaration
@@ -3893,14 +4020,16 @@ type DeclarationChecker =
 
         endPhase "leftovers"
 
+        let exits = DeclarationCheck.exitSinks state.tcGlobals results
+
         // Before the assembly below, which gives the modules their types: replaying leaves modules too
         let envAtEndNow, envs =
-            DeclarationChecker.AssembleEnvAtEnd(start, results, (match last with Some last -> last.Envs | None -> [||]))
+            DeclarationChecker.AssembleEnvAtEnd(start, results, (match last with Some last -> last.Envs | None -> [||]), ValueNone)
 
         endPhase "envAtEnd"
 
         let scopeContents, compiledDefs, envAtEnd =
-            DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results
+            DeclarationCheck.assemble cenv start.ScopeContents start.Scope.Env results exits
 
         endPhase "assemble"
         let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
@@ -4066,11 +4195,8 @@ type DeclarationChecker =
         let fileName = parse.FileName
         let dependencyFiles = parse.DependencyFiles
 
-        let sinks =
-            [ yield start.Sink
-              for result in results do
-                  yield result.Sink
-              yield sink ]
+        let sinks = DeclarationCheck.inOrder start.Sink results exits @ [ sink ]
+        let scopes = DeclarationChecker.ScopesNowOf(start, results, parse)
 
         let checkResults =
             Lazy<FSharpCheckFileResults>(
@@ -4086,7 +4212,7 @@ type DeclarationChecker =
                             | later -> later.AddRange log
                         | _ -> ()
 
-                        let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals sinks
+                        let resolutions, symbolUses, openDeclarations = DeclarationCheck.mergeSinks state.tcGlobals scopes sinks
                         DeclarationCheck.compiledNamesOf state resolutions implFileOpt
 
                         let scope =
@@ -4124,7 +4250,7 @@ type DeclarationChecker =
                       ErrorCount = errorCountOf i
                       Line = results[i].Declaration.Range.StartLine }
 
-        start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None), envs)
+        start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None), envs, exits)
         let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)
         endPhase "sinks"
         let topAttrs =
