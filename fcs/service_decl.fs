@@ -25,6 +25,7 @@ open FSharp.Compiler.GraphChecking
 open FSharp.Compiler.NameResolution
 open FSharp.Compiler.ParseAndCheckInputs
 open FSharp.Compiler.SourceCodeServices
+open FSharp.Compiler.Symbols
 open FSharp.Compiler.Syntax
 open FSharp.Compiler.SyntaxTreeOps
 open FSharp.Compiler.TcGlobals
@@ -2270,8 +2271,170 @@ module internal DeclarationCheck =
             true
         )
 
+/// Text keys for symbols that hold across copies: a key reads names and types, never stamps, ranges or which object.
+module internal SymbolKeys =
+    let private entityPath (e: FSharpEntity) = e.AccessPath + "." + e.LogicalName
+
+    /// Types with abbreviations stripped and type variables numbered by first appearance, as a signature may spell
+    /// either differently from its implementation. What this doesn't know prints the same `_`: two overloads it can't
+    /// tell apart get one key, and a lookup finds two definitions rather than a wrong one.
+    let private typesText (cenv: SymbolEnv) (types: TType list) =
+        let typars = Dictionary<string, int>()
+
+        let rec text (t: FSharpType) =
+            let t = t.StripAbbreviations()
+            let arguments (separator: string) = t.GenericArguments |> Seq.map text |> String.concat separator
+
+            if t.IsGenericParameter then
+                let name = t.GenericParameter.Name
+
+                match typars.TryGetValue name with
+                | true, i -> $"'%d{i}"
+                | _ ->
+                    typars[name] <- typars.Count
+                    $"'%d{typars.Count - 1}"
+            elif t.IsFunctionType then
+                "(" + arguments "->" + ")"
+            elif t.IsTupleType then
+                "(" + arguments (if t.IsStructTupleType then "#" else "*") + ")"
+            elif t.HasTypeDefinition then
+                entityPath t.TypeDefinition + "<" + arguments "," + ">"
+            else
+                "_"
+
+        types |> List.map (fun t -> text (FSharpType(cenv, t))) |> String.concat ";"
+
+    let private ofVal (cenv: SymbolEnv) (assembly: string) (v: ValRef) =
+        let parent =
+            match v.TryDeclaringEntity with
+            | Parent p -> entityPath (FSharpEntity(cenv, p))
+            | ParentNone -> ""
+
+        match v.MemberInfo with
+        | None -> $"%s{assembly}|value|%s{parent}|%s{v.LogicalName}"
+        | Some info ->
+            let arguments = ArgInfosOfMember cenv.g v |> List.concat |> List.map fst
+            let apparent = entityPath (FSharpEntity(cenv, v.MemberApparentEntity))
+
+            // An interface's implementation, or an override, can have the name and arguments of a member of the type, or of
+            // another interface's: what it implements tells them apart
+            let implements =
+                info.ImplementedSlotSigs |> List.map (fun slot -> slot.Name + ":" + typesText cenv [ slot.DeclaringType ]) |> List.sort |> String.concat ","
+
+            let start (kind: string) (name: string) =
+                $"%s{assembly}|%s{kind}|%s{parent}|%s{apparent}|%s{name}|%b{v.IsInstanceMember}|%d{v.Typars.Length}|%s{implements}"
+
+            match info.MemberFlags.MemberKind with
+            | SynMemberKind.PropertyGet -> start "property" v.PropertyName + "|" + typesText cenv arguments
+            // What it sets comes last: the index before that is what tells a property's overloads apart
+            | SynMemberKind.PropertySet ->
+                start "property" v.PropertyName + "|" + typesText cenv (List.take (arguments.Length - 1) arguments)
+            | _ ->
+                // Conversions overload on what they return
+                let types =
+                    if v.LogicalName = "op_Explicit" || v.LogicalName = "op_Implicit" then [ v.Type ] else arguments
+
+                start "member" v.LogicalName + "|" + typesText cenv types
+
+    let ofSymbol (symbol: FSharpSymbol) : string option =
+        let assembly () = symbol.Assembly.SimpleName
+
+        try
+            match symbol with
+            | :? FSharpEntity as e ->
+                let kind =
+                    if e.IsNamespace then "namespace"
+                    elif e.IsFSharpModule then "module"
+                    else "type"
+
+                Some $"%s{assembly ()}|%s{kind}|%s{entityPath e}"
+            | :? FSharpUnionCase as c -> Some $"%s{assembly ()}|case|%s{entityPath c.DeclaringEntity}|%s{c.Name}"
+            | :? FSharpField as f when f.IsAnonRecordField -> None
+            | :? FSharpField as f ->
+                match f.DeclaringUnionCase, f.DeclaringEntity with
+                | Some c, _ -> Some $"%s{assembly ()}|field|%s{entityPath c.DeclaringEntity}|%s{c.Name}|%s{f.Name}"
+                | None, Some e -> Some $"%s{assembly ()}|field|%s{entityPath e}|%s{f.Name}"
+                | None, None -> None
+            // A case goes to its pattern's value, as FCS's location does. One that names no value is inside its definition.
+            | :? FSharpActivePatternCase as c ->
+                match c.Item with
+                | Item.ActivePatternCase apref when apref.ActivePatternVal.IsModuleBinding || apref.ActivePatternVal.IsMember ->
+                    Some(ofVal symbol.SymbolEnv (assembly ()) apref.ActivePatternVal)
+                | _ -> None
+            | :? FSharpMemberOrFunctionOrValue as v when not v.IsModuleValueOrMember -> None
+            | :? FSharpMemberOrFunctionOrValue as v ->
+                let valOf =
+                    match v.Item with
+                    | Item.Value vref -> Some vref
+                    | Item.MethodGroup(_, m :: _, _)
+                    | Item.CtorGroup(_, m :: _) -> m.ArbitraryValRef
+                    | Item.Property(_, p :: _, _) -> p.ArbitraryValRef
+                    | Item.Event e -> e.ArbitraryValRef
+                    | _ -> None
+
+                match valOf with
+                | Some vref -> Some(ofVal symbol.SymbolEnv (assembly ()) vref)
+                // No F# value: an external assembly's member, which no source file defines
+                | None -> Some $"%s{assembly ()}|external|%s{v.FullName}|%s{v.XmlDocSig}"
+            | _ -> None
+        with :? InvalidOperationException ->
+            None
+
+    /// Everything a signature file defines, as symbols
+    let rec definedIn (cenv: SymbolEnv) (m: ModuleOrNamespaceType) : seq<FSharpSymbol> =
+        seq {
+            for v in m.AllValsAndMembers do
+                yield FSharpMemberOrFunctionOrValue(cenv, mkLocalValRef v)
+
+            for e in m.AllEntities do
+                let eref = mkLocalEntityRef e
+                yield FSharpEntity(cenv, eref)
+
+                if e.IsModuleOrNamespace then
+                    yield! definedIn cenv e.ModuleOrNamespaceType
+                else
+                    for f in e.AllFieldsArray do
+                        yield FSharpField(cenv, mkRecdFieldRef eref f.LogicalName)
+
+                    for c in e.UnionCasesArray do
+                        let cref = mkUnionCaseRef eref c.LogicalName
+                        yield FSharpUnionCase(cenv, cref)
+
+                        for i in 0 .. c.RecdFieldsArray.Length - 1 do
+                            yield FSharpField(cenv, cref, i)
+        }
+
 [<AbstractClass; Sealed>]
 type DeclarationChecker =
+
+    /// <summary>
+    /// A text key for a symbol, equal for a definition, its copies in later files' signatures and in another project's
+    /// in-memory assembly, and the objects an older check holds: the defining assembly, the kind, the path and name, and
+    /// for a member the types of its arguments, which tell overloads apart. None for a local.
+    /// </summary>
+    /// <remarks>
+    /// Not an index among overloads: a signature can list them in another order than its implementation, and an index
+    /// shifts when one is added before it, when the same text still names the same overload. Read inside a read of the
+    /// file that holds the symbol.
+    /// </remarks>
+    static member SymbolKey(symbol: FSharpSymbol) : string option = SymbolKeys.ofSymbol symbol
+
+    /// The range in a signature file of what `key` names, read from this check of it, which FileSig.Next may have kept
+    /// from later files for having the same print. None when it defines no such thing, or more than one: a property's
+    /// getter and setter count as one, the getter, as FCS's location does.
+    static member SignatureLocation(ctx: ProjectContext, signature: FileSignature, key: string) : range option =
+        let state = ctx.State
+        let cenv = SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
+
+        let found =
+            SymbolKeys.definedIn cenv signature.ModuleType
+            |> Seq.filter (fun s -> SymbolKeys.ofSymbol s = Some key)
+            |> Seq.toList
+
+        match found with
+        | [ only ] -> only.SignatureLocation
+        | first :: _ when key.Contains "|property|" -> first.SignatureLocation
+        | _ -> None
 
     static member CreateProject(options: FSharpProjectOptions) : Async<ProjectContext> =
         async {
