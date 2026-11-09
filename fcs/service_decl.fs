@@ -12,10 +12,12 @@ open Internal.Utilities.Library
 open Internal.Utilities.Library.Extras
 
 open FSharp.Compiler
+open FSharp.Compiler.AbstractIL.IL
 open FSharp.Compiler.CheckBasics
 open FSharp.Compiler.CheckDeclarations
 open FSharp.Compiler.CheckExpressions
 open FSharp.Compiler.CodeAnalysis
+open FSharp.Compiler.CompilerConfig
 open FSharp.Compiler.CompilerDiagnostics
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.DiagnosticsLogger
@@ -691,9 +693,13 @@ type FileResult
         checkResults: Lazy<FSharpCheckFileResults>,
         phaseTicks: IReadOnlyDictionary<string, int64>,
         phaseAllocated: IReadOnlyDictionary<string, int64>,
-        reused: int
+        reused: int,
+        topAttrs: TopAttribs
     ) =
     member _.Diagnostics = diagnostics
+    /// The assembly-level attributes the file's tail gave: its signature's fingerprint leaves them out when the file
+    /// has a signature file.
+    member internal _.TopAttrs = topAttrs
     /// Each declaration's fingerprint after the file's inference scope is closed.
     member _.Fingerprints = fingerprints
     /// FinishFile's is the previous finish's object, on the same FileStart, when every final fingerprint and the
@@ -720,6 +726,15 @@ type FileResult
     /// How many results' final fingerprint, finish TypedUses and rendered diagnostics came from the previous finish
     /// of the same FileStart. For tests; 0 for CheckFile.
     member _.Reused = reused
+
+/// A project's assembly as a referencing project sees it, built from the project's checked files without compiling.
+[<Sealed>]
+type ProjectAssembly internal (fingerprint: string, data: Lazy<ProjectAssemblyDataResult>) =
+    /// Equal only when a referencing project would check the same against either: the file signatures' fingerprints
+    /// and the assembly-level attributes (InternalsVisibleTo, AutoOpen). Unequal for anything not describable.
+    member _.Fingerprint = fingerprint
+    /// Pickled when first read: a referencing project reads it only when the fingerprint has changed.
+    member internal _.Data = data.Value
 
 /// What a finish rendered and fingerprinted for one result.
 [<NoEquality; NoComparison>]
@@ -2020,6 +2035,111 @@ type DeclarationChecker =
             return ProjectContext state
         }
 
+    /// A project context in which each `-r:` whose path is a key of `references` is that project's in-memory assembly,
+    /// not the file at the path. Everything else is as CreateProject.
+    static member CreateProject(options: FSharpProjectOptions, references: IReadOnlyDictionary<string, ProjectAssembly>) : Async<ProjectContext> =
+        async {
+            let projectReferences =
+                [ for KeyValue(path, assembly) in references ->
+                      { new IProjectReference with
+                          member _.FileName = path
+                          member _.EvaluateRawContents() = async { return assembly.Data }
+                          member _.TryGetLogicalTimeStamp _ = Some DateTime.UtcNow } ]
+
+            let! state = initializeCompilerStateWith projectReferences options ignore
+            return ProjectContext state
+        }
+
+    /// The project's assembly from its files' results and signatures, as an incremental build gives one: `files` are
+    /// the implementation files' results and `signatures` every file's, in file order. Each signature must be what the
+    /// files after it were checked against: one holding an entity of another version of an earlier file would pickle
+    /// a reference to nothing. A project with type provider generated types has none: the file at the path is read
+    /// instead.
+    static member ProjectAssembly(ctx: ProjectContext, files: FileResult list, signatures: FileSignature list) : ProjectAssembly =
+        let state = ctx.State
+        let checks = ctx.Checks
+        let topAttrs = List.foldBack (fun (file: FileResult) acc -> CombineTopAttrs file.TopAttrs acc) files EmptyTopAttrs
+
+        let fingerprint =
+            use hash = System.Security.Cryptography.IncrementalHash.CreateHash System.Security.Cryptography.HashAlgorithmName.SHA256
+
+            let add (text: string) =
+                hash.AppendData(System.Text.Encoding.UTF8.GetBytes text)
+                hash.AppendData [| 0uy |]
+
+            for signature in signatures do
+                add signature.FileName
+                // A file nothing depended on takes its fingerprint here, reading compiled names given on first read
+                add (lock (checks.FileLock signature.FileName) (fun () -> signature.Fingerprint))
+
+            add (DeclarationCheck.signatureFingerprint (Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true)) topAttrs)
+            Convert.ToHexString(hash.GetHashAndReset())
+
+        let build () =
+            let _, logger = DeclarationCheck.newLoggers state
+            use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
+            use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
+            let tcState = (state.tcInitialState, signatures) ||> List.fold (fun tcState signature -> signature.Apply tcState)
+            let _, _, ccuContents = CheckClosedInputSetFinish([], tcState)
+            let generatedCcu = tcState.Ccu.CloneWithFinalizedContents ccuContents
+            let assemblyName = tcState.Ccu.AssemblyName
+            let tcConfig = state.tcConfig
+            let tcGlobals = state.tcGlobals
+            let mutable hasTypeProviderAssemblyAttrib = false
+
+            // As IncrementalBuild's finalize step
+            let ilAssemRef =
+                let publicKey =
+                    try
+                        let signingInfo = CreateILModule.ValidateKeySigningAttributes(tcConfig, tcGlobals, topAttrs)
+
+                        match CreateILModule.GetStrongNameSigner signingInfo with
+                        | None -> None
+                        | Some s -> Some(PublicKey.KeyAsToken s.PublicKey)
+                    with exn ->
+                        errorRecoveryNoRange exn
+                        None
+
+                let mutable locale = None
+                let mutable ver = None
+
+                for attr in topAttrs.assemblyAttrs do
+                    let flag = classifyAssemblyAttrib tcGlobals attr
+
+                    if hasFlag flag WellKnownAssemblyAttributes.AssemblyCultureAttribute then
+                        match attr with
+                        | Attrib(_, _, [ AttribStringArg s ], _, _, _, _) -> locale <- Some s
+                        | _ -> ()
+                    elif hasFlag flag WellKnownAssemblyAttributes.AssemblyVersionAttribute then
+                        match attr with
+                        | Attrib(_, _, [ AttribStringArg s ], _, _, _, _) -> ver <- (try Some(parseILVersion s) with _ -> None)
+                        | _ -> ()
+                    elif hasFlag flag WellKnownAssemblyAttributes.TypeProviderAssemblyAttribute then
+                        hasTypeProviderAssemblyAttrib <- true
+
+                let version =
+                    match ver with
+                    | None -> tcConfig.version.GetVersionInfo tcConfig.implicitIncludeDir
+                    | Some v -> v
+
+                ILAssemblyRef.Create(assemblyName, None, publicKey, false, Some version, locale)
+
+            if tcState.CreatesGeneratedProvidedTypes || hasTypeProviderAssemblyAttrib then
+                ProjectAssemblyDataResult.Unavailable true
+            else
+                let outfile = tcConfig.outputFile |> Option.defaultValue (assemblyName + ".dll")
+
+                // The pickle reads compiled names given on first read, so no check of a file runs meanwhile. No check
+                // waits for a second file's lock while holding one.
+                let rec holding (names: string list) : IRawFSharpAssemblyData =
+                    match names with
+                    | [] -> RawFSharpAssemblyDataBackedByLanguageService(tcConfig, tcGlobals, generatedCcu, outfile, topAttrs, assemblyName, ilAssemRef)
+                    | name :: rest -> lock (checks.FileLock name) (fun () -> holding rest)
+
+                ProjectAssemblyDataResult.Available(holding (signatures |> List.map _.FileName))
+
+        ProjectAssembly(fingerprint, Lazy<ProjectAssemblyDataResult>(build, LazyThreadSafetyMode.ExecutionAndPublication))
+
     static member Parse(ctx: ProjectContext, fileName: string, source: string) : FSharpParseFileResults =
         let state = ctx.State
         let parsingOptions = FSharpParsingOptions.FromTcConfig(state.tcConfig, state.projectOptions.SourceFiles, false)
@@ -2487,7 +2607,7 @@ type DeclarationChecker =
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
 
             // The fingerprint reads the compiled names of the file's values, which are given on first read
-            let signature =
+            let signature, topAttrs =
                 lock (ctx.Checks.FileLock parse.FileName) (fun () ->
                     let rootSigOpt = DeclarationCheck.enterImplFile state tcState input file
                     endPhase "setup"
@@ -2525,8 +2645,9 @@ type DeclarationChecker =
                             createsGeneratedProvidedTypes
                             moduleNamesDict
                             definitions
-                            fingerprint
-                    | None -> DeclarationCheck.failedFileSignature parse.FileName moduleNamesDict)
+                            fingerprint,
+                        topAttrs
+                    | None -> DeclarationCheck.failedFileSignature parse.FileName moduleNamesDict, EmptyTopAttrs)
 
             let diagnostics =
                 Array.append parse.Diagnostics (DeclarationCheck.diagnosticsWith state options parse.FileName capturing)
@@ -2546,7 +2667,7 @@ type DeclarationChecker =
                     LazyThreadSafetyMode.ExecutionAndPublication
                 )
 
-            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0)
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
@@ -3403,4 +3524,9 @@ type DeclarationChecker =
         start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None))
         let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)
         endPhase "sinks"
-        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused)
+        let topAttrs =
+            match tail with
+            | Some(topAttrs, _, _, _, _) -> topAttrs
+            | None -> EmptyTopAttrs
+
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs)

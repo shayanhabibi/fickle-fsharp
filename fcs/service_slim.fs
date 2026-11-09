@@ -973,7 +973,7 @@ module internal ParseAndCheck =
     // Cache to store current compiler state.
     // In the case of type provider invalidation,
     // compiler state needs to be reset to recognize TP changes.
-    let initializeCompilerState projectOptions reset = async {
+    let initializeCompilerStateWith (projectReferences: IProjectReference list) projectOptions reset = async {
         let tcConfig =
             let tcConfigB =
                 TcConfigBuilder.CreateNew(
@@ -988,6 +988,8 @@ module internal ParseAndCheck =
                     sdkDirOverride = None,
                     rangeForErrors = range0
                 )
+            // Before the -r: options are applied: each one takes the project reference of its path
+            tcConfigB.projectReferences <- projectReferences
             let sourceFiles = projectOptions.SourceFiles |> Array.toList
             let argv = projectOptions.OtherOptions |> Array.toList
             let _sourceFiles = ApplyCommandLineArgs(tcConfigB, sourceFiles, argv)
@@ -1027,6 +1029,8 @@ module internal ParseAndCheck =
             graphCheckCache = graphCheckCache
         }
     }
+
+    let initializeCompilerState projectOptions reset = initializeCompilerStateWith [] projectOptions reset
 
     let MakeProjectResults (projectFileName: string, parseResults: FSharpParseFileResults[], tcState: TcState, errors: FSharpDiagnostic[],
                             topAttrsOpt: TopAttribs option, tcImplFilesOpt: CheckedImplFile list option, compilerState) =
