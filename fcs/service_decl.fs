@@ -21,6 +21,7 @@ open FSharp.Compiler.CompilerConfig
 open FSharp.Compiler.CompilerDiagnostics
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.DiagnosticsLogger
+open FSharp.Compiler.EditorServices
 open FSharp.Compiler.GraphChecking
 open FSharp.Compiler.NameResolution
 open FSharp.Compiler.ParseAndCheckInputs
@@ -104,7 +105,8 @@ type ParsedDeclaration
         within: DeclarationKey option,
         siblings: SynModuleDecl list,
         depth: int,
-        isModuleHeader: bool
+        isModuleHeader: bool,
+        source: ISourceText
     ) =
     member _.Key = key
     /// The declaration's range; for a module header, from its start to the '=' after the module's name.
@@ -135,6 +137,8 @@ type ParsedDeclaration
     member internal _.IsModuleHeader = isModuleHeader
     /// The declarations of the enclosing module or namespace, this one included: a module's suffix reads their types
     member internal _.Siblings = siblings
+    /// The source text of the parse this declaration was split from.
+    member internal _.Source = source
 
 /// A scoped `before` was refused because the dependency snapshot it would be checked against is not current for the
 /// file: FileDependencies has not been given this parse with the latest parse of every earlier file. Checking again
@@ -422,7 +426,8 @@ type FileSignature
         moduleType: ModuleOrNamespaceType,
         asImplementation: (TcState -> TcState) option,
         failed: bool,
-        uses: (struct (Item * ItemOccurrence * range))[]
+        uses: (struct (Item * ItemOccurrence * range))[],
+        semanticClassification: SemanticClassificationItem[]
     ) =
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it: for an
     /// implementation file with a signature file, the signature file's. Unequal for anything not describable. A check
@@ -439,6 +444,8 @@ type FileSignature
     member internal _.Definitions = definitions
     /// What a signature file's check resolved, as a sink held it: nothing else of the sink is kept
     member internal _.Uses = uses
+    /// Semantic classification items captured during signature checking; empty for an implementation file's signature.
+    member _.SemanticClassification : SemanticClassificationItem[] = semanticClassification
     /// The module type the file adds to the checker state, for tests
     member internal _.ModuleType = moduleType
     /// For tests: every type variable or entity the signature's types use that it does not itself hold. Empty for a
@@ -854,7 +861,8 @@ type FileResult
         reused: int,
         topAttrs: TopAttribs,
         beforeRead: unit -> unit,
-        buildAgain: (unit -> FSharpCheckFileResults) voption
+        buildAgain: (unit -> FSharpCheckFileResults) voption,
+        classify: (range option -> SemanticClassificationItem[]) voption
     ) =
     member _.Diagnostics = diagnostics
     /// The assembly-level attributes the file's tail gave: its signature's fingerprint leaves them out when the file
@@ -888,6 +896,17 @@ type FileResult
         match buildAgain with
         | ValueSome build when not checkResults.IsValueCreated -> build ()
         | _ -> this.CheckResults
+    /// Semantic classifications for the checked file, filtered to `range` when given. FinishFile's merge its sinks
+    /// without building or retaining CheckResults; CheckFile's use CheckResultsNotKept unless CheckResults was already built.
+    member this.GetSemanticClassification(?range: range) : SemanticClassificationItem[] =
+        if checkResults.IsValueCreated then
+            checkResults.Value.GetSemanticClassification(range)
+        else
+            match classify with
+            | ValueSome f ->
+                beforeRead ()
+                f range
+            | ValueNone -> this.CheckResultsNotKept.GetSemanticClassification(range)
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
     /// refilter, leftovers, envAtEnd, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
     /// setup, tail (the check), definitions, fingerprint, render.
@@ -999,6 +1018,11 @@ module internal DeclarationCheck =
 
     /// The source each parse was made from, for hashing a declaration's text.
     let sources = ConditionalWeakTable<FSharpParseFileResults, ISourceText>()
+
+    let sourceOf (parse: FSharpParseFileResults) =
+        match sources.TryGetValue parse with
+        | true, s -> Some s
+        | _ -> None
 
     let textOfRange (source: ISourceText) (m: range) (docRanges: range list) =
         let sb = Text.StringBuilder()
@@ -1712,7 +1736,7 @@ module internal DeclarationCheck =
         let _, logger = newLoggersWith (warnOptionsOf parse)
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-        let sink = TcResultsSinkImpl(state.tcGlobals)
+        let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = sourceOf parse)
         checks.CountCheckResultsBuilt()
 
         let rootSigOpt, checkedFile =
@@ -2027,6 +2051,26 @@ module internal DeclarationCheck =
             |> Array.ofSeq
 
         resolutions, symbolUses, openDeclarations
+
+    /// Only what GetSemanticClassification reads of several sinks, in order: shifted name resolutions, related symbol
+    /// uses, and format specifier locations.
+    let mergeForClassification (sinks: TcResultsSinkImpl list) =
+        let all (pick: TcResolutions -> ResizeArray<'T>) =
+            ResizeArray(sinks |> Seq.collect (fun sink -> pick (sink.GetResolutions())))
+
+        let resolutions =
+            TcResolutions(
+                ResizeArray 0,
+                ResizeArray 0,
+                ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentItems),
+                ResizeArray 0,
+                all (fun r -> r.CapturedRelatedSymbolUses)
+            )
+
+        let formatSpecifierLocations =
+            sinks |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations()) |> Array.ofSeq
+
+        resolutions, formatSpecifierLocations
 
     /// The bindings of inline values in a declaration's typed tree, in order.
     let rec inlineBodies (contents: ModuleOrNamespaceContents) =
@@ -2608,7 +2652,7 @@ module internal DeclarationCheck =
 
             AddCreatesGeneratedProvidedTypes createsGeneratedProvidedTypes tcState
 
-        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None, false, [||])
+        FileSignature(fileName, apply, moduleNamesDict, definitions, fingerprint, implFileSig, None, false, [||], [||])
 
     /// What CheckOneInput's PartialResultOnError gives later files: the checker state as it was before the file.
     let failedFileSignature fileName moduleNamesDict =
@@ -2622,6 +2666,7 @@ module internal DeclarationCheck =
             Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
             None,
             true,
+            [||],
             [||]
         )
 
@@ -3093,7 +3138,7 @@ type DeclarationChecker =
                 let docRanges = if checkXmlDocs then [] else DeclarationCheck.docRangesOfDecl decl
                 let text = DeclarationCheck.textOfRange source range docRanges
                 let key = { ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }
-                ParsedDeclaration(key, decl, range, scopem, text, headerInputs, within, siblings, depth, isModuleHeader)
+                ParsedDeclaration(key, decl, range, scopem, text, headerInputs, within, siblings, depth, isModuleHeader, source)
 
             let rec split modulePath within depth (endm: range) (decls: SynModuleDecl list) =
                 let typeNames = DeclarationCheck.typeNamesIn decls
@@ -3202,10 +3247,10 @@ type DeclarationChecker =
                 use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
                 let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
                 let amap = state.tcImports.GetImportMap()
-                let sink = TcResultsSinkImpl(state.tcGlobals)
+                let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationCheck.sourceOf parse)
 
                 // The fingerprint reads the compiled names of the file's values, which are given on first read
-                let sigFileType, createsGeneratedProvidedTypes, fingerprint =
+                let sigFileType, createsGeneratedProvidedTypes, fingerprint, semanticClassification =
                     lock (ctx.Checks.FileLock parse.FileName) (fun () ->
                         ResetGeneratedNames(input, state)
 
@@ -3223,7 +3268,13 @@ type DeclarationChecker =
                                 file
                             |> Cancellable.runWithoutCancellation
 
-                        sigFileType, createsGeneratedProvidedTypes, DeclarationCheck.signatureFingerprint sigFileType EmptyTopAttrs)
+                        let semanticClassification =
+                            sink.GetResolutions().GetSemanticClassification(state.tcGlobals, amap, sink.GetFormatSpecifierLocations(), None)
+
+                        sigFileType,
+                        createsGeneratedProvidedTypes,
+                        DeclarationCheck.signatureFingerprint sigFileType EmptyTopAttrs,
+                        semanticClassification)
 
                 let qualNameOfFile = file.QualifiedName
                 let m = input.Range
@@ -3253,7 +3304,8 @@ type DeclarationChecker =
                     [| for chunk in sink.GetSymbolUses().AllUsesOfSymbols do
                            for u in chunk do
                                if u.ItemOccurrence <> ItemOccurrence.RelatedText then
-                                   struct (u.ItemWithInst.Item, u.ItemOccurrence, u.Range) |]
+                                   struct (u.ItemWithInst.Item, u.ItemOccurrence, u.Range) |],
+                    semanticClassification
                 )
 
     /// For tests: each access path of the entities, values, fields and union cases in the signature's module type, as
@@ -3296,7 +3348,7 @@ type DeclarationChecker =
             let _, logger = DeclarationCheck.newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
             use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-            let sink = TcResultsSinkImpl(state.tcGlobals)
+            let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationCheck.sourceOf parse)
 
             let rootSigOpt, cenv, scope =
                 lock (ctx.Checks.FileLock parse.FileName) (fun () ->
@@ -3549,7 +3601,7 @@ type DeclarationChecker =
             let build () = DeclarationCheck.buildCheckResults checks before moduleNamesBefore parse diagnostics
             let checkResults = Lazy<FSharpCheckFileResults>(build, LazyThreadSafetyMode.ExecutionAndPublication)
 
-            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore, ValueSome build)
+            FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore, ValueSome build, ValueNone)
 
     /// Checks one declaration in the environment after an earlier one, or the first. Each call has its own checker
     /// state and accumulator, so calls may come in any order, again, or at the same time (they take the file's check
@@ -3621,7 +3673,7 @@ type DeclarationChecker =
         // Cancellable.run hands ct to the cancellable computation; code outside it calls CheckAndThrow, which reads
         // the ambient token, and nothing else sets that one.
         use _ = FSharp.Compiler.Cancellable.UsingToken ct
-        let sink = TcResultsSinkImpl(state.tcGlobals)
+        let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = Some decl.Source)
         let cenv, _, _ = DeclarationCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
         let referenced = ResizeArray<Val>()
         cenv.recordValueReference <- fun v -> if v.IsModuleBinding then referenced.Add v
@@ -4380,7 +4432,7 @@ type DeclarationChecker =
         let capturing, logger = DeclarationCheck.newLoggersWith options
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-        let sink = TcResultsSinkImpl(state.tcGlobals)
+        let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationCheck.sourceOf parse)
         let cenv, envFile, moduleTyAcc = DeclarationCheck.newCheckerState state tcState start.RootSigOpt file sink
         start.Leftovers.Apply cenv
 
@@ -4632,4 +4684,10 @@ type DeclarationChecker =
             if Monitor.IsEntered(checks.FileLock fileName) && not (Monitor.IsEntered sync) then
                 invalidOp $"%s{fileName}: read while holding the file's check lock"
 
-        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead, ValueNone)
+        let classify (range: range option) =
+            lock sync (fun () ->
+                lock (checks.FileLock fileName) (fun () ->
+                    let resolutions, formatSpecifiers = DeclarationCheck.mergeForClassification sinks
+                    resolutions.GetSemanticClassification(state.tcGlobals, state.tcImports.GetImportMap(), formatSpecifiers, range)))
+
+        FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead, ValueNone, ValueSome classify)
