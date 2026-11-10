@@ -1059,12 +1059,24 @@ module internal SymbolHelpers =
     /// leave one out.
     let private ownersOfVal (g: TcGlobals) (scope: DocScope) (vref: ValRef) =
         match vref.MemberInfo, vref.TryDeclaringEntity with
-        | None, Parent parent ->
-            // A type's own `let` has a kind of its own: its type and a module of one name share a path
-            let kind = if parent.IsModuleOrNamespace then "V:" else "L:"
-            let path = kind + sourcePathOfEntity parent + "." + vref.LogicalName
+        | None, Parent parent when parent.IsModuleOrNamespace ->
+            let path = "V:" + sourcePathOfEntity parent + "." + vref.LogicalName
             Some(ownersAt path vref.Range vref.SigRange path)
-        | None, ParentNone -> None
+        | None, _ ->
+            // A local value, class let, or a value of the asking file
+            if String.Equals(vref.Range.FileName, scope.FileName, StringComparison.OrdinalIgnoreCase) then
+                if scope.Binds vref then
+                    let place = $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}"
+                    Some(ownersAt place vref.Range vref.SigRange place)
+                else
+                    Some(ownersAt "@?" vref.Range vref.SigRange "@?")
+            else
+                match vref.TryDeclaringEntity with
+                | Parent parent ->
+                    let kind = if parent.IsModuleOrNamespace then "V:" else "L:"
+                    let path = kind + sourcePathOfEntity parent + "." + vref.LogicalName
+                    Some(ownersAt path vref.Range vref.SigRange path)
+                | ParentNone -> None
         | Some _, declaring ->
             match memberTag vref with
             | None -> None

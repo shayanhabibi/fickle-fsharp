@@ -34,6 +34,7 @@ open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
 open FSharp.Compiler.TypedTreeBasics
 open FSharp.Compiler.TypedTreeOps
+open FSharp.Compiler.Xml
 
 type DeclarationKind =
     | Value
@@ -999,17 +1000,184 @@ module internal DeclarationCheck =
     /// The source each parse was made from, for hashing a declaration's text.
     let sources = ConditionalWeakTable<FSharpParseFileResults, ISourceText>()
 
-    let textOfRange (source: ISourceText) (m: range) =
+    let textOfRange (source: ISourceText) (m: range) (docRanges: range list) =
         let sb = Text.StringBuilder()
         let lastLine = min (m.EndLine - 1) (source.GetLineCount() - 1)
 
+        let isDocLine (line0: int) =
+            let line1 = line0 + 1
+            docRanges |> List.exists (fun dr -> dr.StartLine <= line1 && line1 <= dr.EndLine)
+
         for line in m.StartLine - 1 .. lastLine do
-            let text = source.GetLineString line
-            let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
-            let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
-            sb.Append(text, first, max 0 (last - first)).Append('\n') |> ignore
+            if isDocLine line then
+                sb.Append('\n') |> ignore
+            else
+                let text = source.GetLineString line
+                let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
+                let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
+                sb.Append(text, first, max 0 (last - first)).Append('\n') |> ignore
 
         sb.ToString()
+
+    let docRangesOfDecl (decl: SynModuleDecl) : range list =
+        let docRanges = ResizeArray<range>()
+
+        let addDoc (doc: PreXmlDoc) =
+            if not doc.IsEmpty then
+                let m = doc.Range
+                if not (Position.posEq m.Start m.End) then
+                    docRanges.Add m
+
+        let rec walkField (SynField(xmlDoc = doc)) =
+            addDoc doc
+
+        and walkMember (m: SynMemberDefn) =
+            match m with
+            | SynMemberDefn.Member(memberDefn = b) -> walkBinding b
+            | SynMemberDefn.GetSetMember(memberDefnForGet = getOpt; memberDefnForSet = setOpt) ->
+                getOpt |> Option.iter walkBinding
+                setOpt |> Option.iter walkBinding
+            | SynMemberDefn.ImplicitCtor(xmlDoc = doc) -> addDoc doc
+            | SynMemberDefn.AbstractSlot(slotSig = SynValSig(xmlDoc = doc)) -> addDoc doc
+            | SynMemberDefn.AutoProperty(xmlDoc = doc) -> addDoc doc
+            | SynMemberDefn.Interface(members = Some ms) -> ms |> List.iter walkMember
+            | SynMemberDefn.ValField(fieldInfo = f) -> walkField f
+            | SynMemberDefn.LetBindings(bindings = bs) -> bs |> List.iter walkBinding
+            | SynMemberDefn.NestedType(typeDefn = t) -> walkTypeDefn t
+            | _ -> ()
+
+        and walkTypeDefn (SynTypeDefn(typeInfo = SynComponentInfo(xmlDoc = doc); typeRepr = repr; members = ms; implicitConstructor = ctor)) =
+            addDoc doc
+            ctor |> Option.iter walkMember
+            match repr with
+            | SynTypeDefnRepr.ObjectModel(members = oms) -> oms |> List.iter walkMember
+            | SynTypeDefnRepr.Simple(simpleRepr = s) ->
+                match s with
+                | SynTypeDefnSimpleRepr.Union(unionCases = cases) ->
+                    for SynUnionCase(xmlDoc = cdoc; caseType = ctype) in cases do
+                        addDoc cdoc
+                        match ctype with
+                        | SynUnionCaseKind.Fields cfields -> cfields |> List.iter walkField
+                        | _ -> ()
+                | SynTypeDefnSimpleRepr.Record(recordFieldsAndSpreads = rfs) ->
+                    for f in rfs do
+                        match f with
+                        | SynFieldOrSpread.Field field -> walkField field
+                        | _ -> ()
+                | SynTypeDefnSimpleRepr.Enum(cases = ecases) ->
+                    for SynEnumCase(xmlDoc = edoc) in ecases do
+                        addDoc edoc
+                | _ -> ()
+            | _ -> ()
+            ms |> List.iter walkMember
+
+        and walkBinding (SynBinding(xmlDoc = doc; expr = expr)) =
+            addDoc doc
+            walkExpr expr
+
+        and walkExpr (expr: SynExpr) =
+            match expr with
+            | SynExpr.Paren(expr = e)
+            | SynExpr.Quote(quotedExpr = e)
+            | SynExpr.Typed(expr = e)
+            | SynExpr.ArrayOrListComputed(expr = e)
+            | SynExpr.ComputationExpr(expr = e)
+            | SynExpr.Do(expr = e)
+            | SynExpr.Assert(expr = e)
+            | SynExpr.AddressOf(expr = e)
+            | SynExpr.InferredDowncast(expr = e)
+            | SynExpr.InferredUpcast(expr = e)
+            | SynExpr.DotGet(expr = e)
+            | SynExpr.YieldOrReturn(expr = e)
+            | SynExpr.YieldOrReturnFrom(expr = e)
+            | SynExpr.DoBang(expr = e)
+            | SynExpr.Downcast(expr = e)
+            | SynExpr.Upcast(expr = e)
+            | SynExpr.TypeTest(expr = e)
+            | SynExpr.Lazy(expr = e)
+            | SynExpr.TraitCall(argExpr = e)
+            | SynExpr.IndexFromEnd(expr = e)
+            | SynExpr.Lambda(body = e) -> walkExpr e
+            | SynExpr.Tuple(exprs = es)
+            | SynExpr.ArrayOrList(exprs = es) -> es |> List.iter walkExpr
+            | SynExpr.Sequential(expr1 = e1; expr2 = e2)
+            | SynExpr.App(funcExpr = e1; argExpr = e2)
+            | SynExpr.TryFinally(tryExpr = e1; finallyExpr = e2)
+            | SynExpr.While(whileExpr = e1; doExpr = e2)
+            | SynExpr.DotSet(targetExpr = e1; rhsExpr = e2)
+            | SynExpr.Set(targetExpr = e1; rhsExpr = e2) ->
+                walkExpr e1
+                walkExpr e2
+            | SynExpr.IfThenElse(ifExpr = g; thenExpr = t; elseExpr = eOpt) ->
+                walkExpr g
+                walkExpr t
+                eOpt |> Option.iter walkExpr
+            | SynExpr.LetOrUse synLetOrUse ->
+                synLetOrUse.Bindings |> List.iter walkBinding
+                walkExpr synLetOrUse.Body
+            | SynExpr.Match(expr = e; clauses = cs)
+            | SynExpr.MatchBang(expr = e; clauses = cs) ->
+                walkExpr e
+                for SynMatchClause(whenExpr = wOpt; resultExpr = r) in cs do
+                    wOpt |> Option.iter walkExpr
+                    walkExpr r
+            | SynExpr.TryWith(tryExpr = t; withCases = cs) ->
+                walkExpr t
+                for SynMatchClause(whenExpr = wOpt; resultExpr = r) in cs do
+                    wOpt |> Option.iter walkExpr
+                    walkExpr r
+            | SynExpr.For(identBody = b; toBody = t) ->
+                walkExpr b
+                walkExpr t
+            | SynExpr.ForEach(enumExpr = e; bodyExpr = b) ->
+                walkExpr e
+                walkExpr b
+            | SynExpr.Record(copyInfo = copyOpt; recordFields = rfs) ->
+                copyOpt |> Option.iter (fst >> walkExpr)
+                for rf in rfs do
+                    match rf with
+                    | SynExprRecordFieldOrSpread.Field(SynExprRecordField(expr = eOpt), _) -> eOpt |> Option.iter walkExpr
+                    | SynExprRecordFieldOrSpread.Spread(SynExprSpread(expr = e), _) -> walkExpr e
+            | SynExpr.AnonRecd(copyInfo = copyOpt; recordFields = rfs) ->
+                copyOpt |> Option.iter (fst >> walkExpr)
+                for rf in rfs do
+                    match rf with
+                    | SynExprAnonRecordFieldOrSpread.Field(SynExprAnonRecordField(expr = e), _) -> walkExpr e
+                    | SynExprAnonRecordFieldOrSpread.Spread(SynExprSpread(expr = e), _) -> walkExpr e
+            | SynExpr.ObjExpr(bindings = bs; members = ms; argOptions = aOpt) ->
+                aOpt |> Option.iter (fst >> walkExpr)
+                bs |> List.iter walkBinding
+                ms |> List.iter walkMember
+            | SynExpr.DotIndexedGet(objectExpr = o; indexArgs = a) ->
+                walkExpr o
+                walkExpr a
+            | SynExpr.DotIndexedSet(objectExpr = o; indexArgs = a; valueExpr = v) ->
+                walkExpr o
+                walkExpr a
+                walkExpr v
+            | SynExpr.IndexRange(expr1 = e1; expr2 = e2) ->
+                e1 |> Option.iter walkExpr
+                e2 |> Option.iter walkExpr
+            | _ -> ()
+
+        let rec walkDecl (d: SynModuleDecl) =
+            match d with
+            | SynModuleDecl.Let(bindings = bs) -> bs |> List.iter walkBinding
+            | SynModuleDecl.Types(typeDefns = ts) -> ts |> List.iter walkTypeDefn
+            | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(xmlDoc = doc); decls = ds) ->
+                addDoc doc
+                ds |> List.iter walkDecl
+            | SynModuleDecl.Exception(exnDefn = SynExceptionDefn(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(xmlDoc = doc)); members = ms)) ->
+                addDoc doc
+                ms |> List.iter walkMember
+            | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(xmlDoc = doc; decls = ds)) ->
+                addDoc doc
+                ds |> List.iter walkDecl
+            | SynModuleDecl.Expr(expr = e) -> walkExpr e
+            | _ -> ()
+
+        walkDecl decl
+        List.ofSeq docRanges
 
     let longIdentText (ids: Ident list) =
         ids |> List.map (fun id -> id.idText) |> String.concat "."
@@ -2841,12 +3009,15 @@ type DeclarationChecker =
                 | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be split: its declarations' text comes from the source it recorded."
 
             let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
+            let warnOptions = DeclarationCheck.warnOptionsOf parse
+            let checkXmlDocs = warnOptions.CheckXmlDocs
 
             let declaration modulePath within siblings depth (decl: SynModuleDecl) (range: range) scopem headerInputs isModuleHeader =
                 let name, kind = DeclarationCheck.nameAndKind decl
                 let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
                 seen[(modulePath, name, kind)] <- ordinal + 1
-                let text = DeclarationCheck.textOfRange source range
+                let docRanges = if checkXmlDocs then [] else DeclarationCheck.docRangesOfDecl decl
+                let text = DeclarationCheck.textOfRange source range docRanges
                 let key = { ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }
                 ParsedDeclaration(key, decl, range, scopem, text, headerInputs, within, siblings, depth, isModuleHeader)
 

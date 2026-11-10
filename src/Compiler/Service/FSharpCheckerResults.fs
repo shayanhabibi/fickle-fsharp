@@ -399,6 +399,35 @@ type internal TypeCheckInfo
     let ncenv = NameResolver(g, amap, infoReader, FakeInstantiationGenerator)
     let cenv = SymbolEnv(g, thisCcu, Some ccuSigForFile, tcImports, amap, infoReader)
 
+    // The values this check defines: where each binding of it ends and the names it binds there, and the
+    // values a binding makes at their own place
+    let bindings =
+        lazy
+            (let bound = System.Collections.Generic.HashSet<struct (int * int * string)>()
+             let values = System.Collections.Generic.HashSet<struct (Stamp * int * int)>()
+
+             let add (r: range) (v: ValRef) =
+                 bound.Add(struct (r.EndLine, r.EndColumn, v.LogicalName)) |> ignore
+
+                 if Position.posEq v.Range.Start r.Start then
+                     values.Add(struct (v.Stamp, r.StartLine, r.StartColumn)) |> ignore
+
+             for uses in sSymbolUses.AllUsesOfSymbols do
+                 for u in uses do
+                     if u.ItemOccurrence = ItemOccurrence.Binding then
+                         match u.ItemWithInst.Item with
+                         | Item.Value v -> add u.Range v
+                         | Item.MethodGroup(_, minfos, _)
+                         | Item.CtorGroup(_, minfos) ->
+                             for m in minfos do
+                                 m.ArbitraryValRef |> Option.iter (add u.Range)
+                         | Item.Property(info = pinfos) ->
+                             for pi in pinfos do
+                                 pi.ArbitraryValRef |> Option.iter (add u.Range)
+                         | _ -> ()
+
+             struct (bound, values))
+
     /// Find the most precise naming environment for the given line and column
     let GetBestEnvForPos cursorPos =
 
@@ -2570,35 +2599,6 @@ type internal TypeCheckInfo
                         | Item.ImplicitOp(_, { contents = Some(TraitConstraintSln.FSMethSln(vref = vref)) }) -> Item.Value vref
                         | Item.SetterArg(_, item) -> shown item
                         | item -> item
-
-                    // The values this check defines: where each binding of it ends and the names it binds there, and the
-                    // values a binding makes at their own place
-                    let bindings =
-                        lazy
-                            (let bound = System.Collections.Generic.HashSet<struct (int * int * string)>()
-                             let values = System.Collections.Generic.HashSet<struct (Stamp * int * int)>()
-
-                             let add (r: range) (v: ValRef) =
-                                 bound.Add(struct (r.EndLine, r.EndColumn, v.LogicalName)) |> ignore
-
-                                 if Position.posEq v.Range.Start r.Start then
-                                     values.Add(struct (v.Stamp, r.StartLine, r.StartColumn)) |> ignore
-
-                             for uses in sSymbolUses.AllUsesOfSymbols do
-                                 for u in uses do
-                                     if u.ItemOccurrence = ItemOccurrence.Binding then
-                                         match u.ItemWithInst.Item with
-                                         | Item.Value v -> add u.Range v
-                                         | Item.MethodGroup(_, minfos, _)
-                                         | Item.CtorGroup(_, minfos) ->
-                                             for m in minfos do
-                                                 m.ArbitraryValRef |> Option.iter (add u.Range)
-                                         | Item.Property(info = pinfos) ->
-                                             for pi in pinfos do
-                                                 pi.ArbitraryValRef |> Option.iter (add u.Range)
-                                         | _ -> ()
-
-                             struct (bound, values))
 
                     let scope =
                         DocScope(
