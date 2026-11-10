@@ -1010,6 +1010,9 @@ module internal SymbolHelpers =
 
         /// Whether the check still defines a value of its own file: a declaration checked again leaves its old values in
         /// the module's type, which a kept declaration's siblings would count
+        /// The file the check is of
+        member _.FileName = fileName
+
         member _.IsCurrent(v: ValRef) =
             not (String.Equals(v.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase))
             || defined.Value.Contains(struct (v.Range.EndLine, v.Range.EndColumn, v.LogicalName))
@@ -1084,10 +1087,22 @@ module internal SymbolHelpers =
 
                 let alike = siblings |> List.filter (fun v -> memberTag v = Some tag && (Position.posEq v.Range.Start vref.Range.Start || scope.IsCurrent v))
                 let ordinal = placeOf (alike |> List.map _.Range) vref.Range
+
+                // An extension in the asking file: its place among the module's extensions depends on other blocks, which
+                // a kept block counted as they were when it was checked. Its name's place in this check is its own, and is
+                // in the parse the check is of.
+                let ownPlace =
+                    match declaring with
+                    | Parent p when not (tyconRefEq g p apparent) && String.Equals(vref.Range.FileName, scope.FileName, StringComparison.OrdinalIgnoreCase) ->
+                        Some $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}"
+                    | _ -> None
                 // The signature's declarations that the alike members conformed to
                 let signatureOrdinal = placeOf (alike |> List.map _.SigRange) vref.SigRange
                 let path = "M:" + typePath + "." + tag + "#"
-                Some(ownersAt (path + string ordinal) vref.Range vref.SigRange (path + string signatureOrdinal))
+
+                match ownPlace with
+                | Some place -> Some(ownersAt place vref.Range vref.SigRange (path + string signatureOrdinal))
+                | None -> Some(ownersAt (path + string ordinal) vref.Range vref.SigRange (path + string signatureOrdinal))
 
     let private ownersOfMethInfo g scope (minfo: MethInfo) =
         match minfo with
