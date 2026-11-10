@@ -1004,18 +1004,49 @@ module internal DeclarationCheck =
         let sb = Text.StringBuilder()
         let lastLine = min (m.EndLine - 1) (source.GetLineCount() - 1)
 
-        let isDocLine (line0: int) =
-            let line1 = line0 + 1
-            docRanges |> List.exists (fun dr -> dr.StartLine <= line1 && line1 <= dr.EndLine)
+        let lineDocSpans (line1: int) (first: int) (last: int) =
+            let spans = ResizeArray<int * int>()
+            for dr in docRanges do
+                if dr.StartLine <= line1 && line1 <= dr.EndLine then
+                    let s = if dr.StartLine = line1 then dr.StartColumn else 0
+                    let e = if dr.EndLine = line1 then dr.EndColumn else System.Int32.MaxValue
+                    let c0 = max first (min last s)
+                    let c1 = max first (min last e)
+                    if c0 < c1 then
+                        spans.Add(c0, c1)
+            if spans.Count = 0 then
+                [| (first, last) |], false
+            else
+                spans.Sort(fun (a, _) (b, _) -> compare a b)
+                let nonDocs = ResizeArray<int * int>()
+                let mutable cur = first
+                for (s, e) in spans do
+                    if s > cur then
+                        nonDocs.Add(cur, s)
+                    cur <- max cur e
+                if cur < last then
+                    nonDocs.Add(cur, last)
+                nonDocs.ToArray(), true
 
         for line in m.StartLine - 1 .. lastLine do
-            if isDocLine line then
-                sb.Append('\n') |> ignore
-            else
-                let text = source.GetLineString line
-                let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
-                let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
+            let line1 = line + 1
+            let text = source.GetLineString line
+            let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
+            let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
+            let nonDocs, hasDoc = lineDocSpans line1 first last
+            if not hasDoc then
                 sb.Append(text, first, max 0 (last - first)).Append('\n') |> ignore
+            else
+                let lineSb = Text.StringBuilder()
+                for (c0, c1) in nonDocs do
+                    if c0 < c1 && c0 < text.Length then
+                        let len = min (c1 - c0) (text.Length - c0)
+                        lineSb.Append(text, c0, len) |> ignore
+                let nonDocText = lineSb.ToString()
+                if System.String.IsNullOrWhiteSpace nonDocText then
+                    sb.Append('\n') |> ignore
+                else
+                    sb.Append(nonDocText).Append('\n') |> ignore
 
         sb.ToString()
 
@@ -1158,6 +1189,42 @@ module internal DeclarationCheck =
             | SynExpr.IndexRange(expr1 = e1; expr2 = e2) ->
                 e1 |> Option.iter walkExpr
                 e2 |> Option.iter walkExpr
+            | SynExpr.MatchLambda(matchClauses = cs) ->
+                for SynMatchClause(whenExpr = wOpt; resultExpr = r) in cs do
+                    wOpt |> Option.iter walkExpr
+                    walkExpr r
+            | SynExpr.TypeApp(expr = e)
+            | SynExpr.New(expr = e)
+            | SynExpr.DotLambda(expr = e)
+            | SynExpr.DebugPoint(innerExpr = e)
+            | SynExpr.Fixed(expr = e)
+            | SynExpr.LongIdentSet(expr = e)
+            | SynExpr.FromParseError(expr = e)
+            | SynExpr.DiscardAfterMissingQualificationAfterDot(expr = e)
+            | SynExpr.LibraryOnlyUnionCaseFieldGet(expr = e) -> walkExpr e
+            | SynExpr.WhileBang(whileExpr = e1; doExpr = e2)
+            | SynExpr.Dynamic(funcExpr = e1; argExpr = e2)
+            | SynExpr.JoinIn(lhsExpr = e1; rhsExpr = e2)
+            | SynExpr.NamedIndexedPropertySet(expr1 = e1; expr2 = e2)
+            | SynExpr.LibraryOnlyStaticOptimization(expr = e1; optimizedExpr = e2)
+            | SynExpr.LibraryOnlyUnionCaseFieldSet(expr = e1; rhsExpr = e2) ->
+                walkExpr e1
+                walkExpr e2
+            | SynExpr.SequentialOrImplicitYield(expr1 = e1; expr2 = e2; ifNotStmt = e3)
+            | SynExpr.DotNamedIndexedPropertySet(targetExpr = e1; argExpr = e2; rhsExpr = e3) ->
+                walkExpr e1
+                walkExpr e2
+                walkExpr e3
+            | SynExpr.LibraryOnlyILAssembly(args = es) -> es |> List.iter walkExpr
+            | SynExpr.InterpolatedString(contents = parts) ->
+                for part in parts do
+                    match part with
+                    | SynInterpolatedStringPart.FillExpr(fillExpr = e; formatting = f) ->
+                        walkExpr e
+                        match f with
+                        | SynInterpolationFormatting.DotNet(alignment = Some a) -> walkExpr a
+                        | _ -> ()
+                    | _ -> ()
             | _ -> ()
 
         let rec walkDecl (d: SynModuleDecl) =
@@ -1167,8 +1234,9 @@ module internal DeclarationCheck =
             | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(xmlDoc = doc); decls = ds) ->
                 addDoc doc
                 ds |> List.iter walkDecl
-            | SynModuleDecl.Exception(exnDefn = SynExceptionDefn(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(xmlDoc = doc)); members = ms)) ->
-                addDoc doc
+            | SynModuleDecl.Exception(exnDefn = SynExceptionDefn(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(xmlDoc = caseDoc); xmlDoc = reprDoc); members = ms)) ->
+                addDoc reprDoc
+                addDoc caseDoc
                 ms |> List.iter walkMember
             | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(xmlDoc = doc; decls = ds)) ->
                 addDoc doc
@@ -1185,12 +1253,18 @@ module internal DeclarationCheck =
     let rec patNames (pat: SynPat) =
         match pat with
         | SynPat.Named(ident = SynIdent(id, _)) -> [ id.idText ]
-        | SynPat.LongIdent(longDotId = SynLongIdent(id = ids)) -> [ (List.last ids).idText ]
+        | SynPat.LongIdent(longDotId = SynLongIdent(id = ids)) when not ids.IsEmpty -> [ (List.last ids).idText ]
         | SynPat.Typed(pat = pat)
         | SynPat.Paren(pat = pat)
         | SynPat.Attrib(pat = pat)
         | SynPat.As(rhsPat = pat) -> patNames pat
-        | SynPat.Tuple(elementPats = pats) -> List.collect patNames pats
+        | SynPat.ListCons(lhsPat = l; rhsPat = r)
+        | SynPat.Or(lhsPat = l; rhsPat = r) -> patNames l @ patNames r
+        | SynPat.Tuple(elementPats = pats)
+        | SynPat.ArrayOrList(elementPats = pats)
+        | SynPat.Ands(pats = pats) -> List.collect patNames pats
+        | SynPat.Record(fieldPats = fps) -> fps |> List.collect (fun (NamePatPairField(pat = p)) -> patNames p)
+        | SynPat.OptionalVal(ident = id) -> [ id.idText ]
         | SynPat.Wild _ -> [ "_" ]
         | _ -> []
 

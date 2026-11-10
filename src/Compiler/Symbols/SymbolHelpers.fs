@@ -1065,11 +1065,14 @@ module internal SymbolHelpers =
         | None, _ ->
             // A local value, class let, or a value of the asking file
             if String.Equals(vref.Range.FileName, scope.FileName, StringComparison.OrdinalIgnoreCase) then
-                if scope.Binds vref then
-                    let place = $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}"
-                    Some(ownersAt place vref.Range vref.SigRange place)
+                if not vref.Deref.IsParameter && not vref.IsMemberThisVal && not vref.IsCtorThisVal && not vref.IsBaseVal && not vref.IsCompilerGenerated then
+                    if scope.Binds vref then
+                        let place = $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}"
+                        Some(ownersAt place vref.Range vref.SigRange place)
+                    else
+                        Some(ownersAt "@?" vref.Range vref.SigRange "@?")
                 else
-                    Some(ownersAt "@?" vref.Range vref.SigRange "@?")
+                    None
             else
                 match vref.TryDeclaringEntity with
                 | Parent parent ->
