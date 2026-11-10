@@ -186,8 +186,7 @@ module ToolTipParts =
     let private shown (ToolTipText elements) =
         let doc (d: FSharp.Compiler.Symbols.FSharpXmlDoc) =
             match d with
-            | FSharp.Compiler.Symbols.FSharpXmlDoc.FromXmlText x -> "text " + String.Join("
-", x.GetElaboratedXmlLines())
+            | FSharp.Compiler.Symbols.FSharpXmlDoc.FromXmlText x -> "text " + String.Join("\n", x.GetElaboratedXmlLines())
             | FSharp.Compiler.Symbols.FSharpXmlDoc.FromXmlFile(dll, sig') -> "file " + dll + " " + sig'
             | FSharp.Compiler.Symbols.FSharpXmlDoc.None -> "none"
 
@@ -202,8 +201,7 @@ module ToolTipParts =
                               String.concat ";" (i.TypeMapping |> List.map _.Text)
                               defaultArg i.ParamName ""
                               (match i.Remarks with Some r -> r.Text | None -> "") ] ]
-                  |> String.concat "
-"
+                  |> String.concat "\n"
               | ToolTipElement.CompositionError err -> "error " + err
               | ToolTipElement.None -> "nothing" ]
 

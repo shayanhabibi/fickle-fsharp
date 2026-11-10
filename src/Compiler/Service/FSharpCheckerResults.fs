@@ -2571,7 +2571,31 @@ type internal TypeCheckInfo
                         | Item.SetterArg(_, item) -> shown item
                         | item -> item
 
-                    let scope = DocScope()
+                    // The values this check defines: where each binding of it ends, and the names it binds there
+                    let defined =
+                        lazy
+                            (let bound = System.Collections.Generic.HashSet<struct (int * int * string)>()
+
+                             let add (r: range) (v: ValRef) =
+                                 bound.Add(struct (r.EndLine, r.EndColumn, v.LogicalName)) |> ignore
+
+                             for uses in sSymbolUses.AllUsesOfSymbols do
+                                 for u in uses do
+                                     if u.ItemOccurrence = ItemOccurrence.Binding then
+                                         match u.ItemWithInst.Item with
+                                         | Item.Value v -> add u.Range v
+                                         | Item.MethodGroup(_, minfos, _)
+                                         | Item.CtorGroup(_, minfos) ->
+                                             for m in minfos do
+                                                 m.ArbitraryValRef |> Option.iter (add u.Range)
+                                         | Item.Property(info = pinfos) ->
+                                             for pi in pinfos do
+                                                 pi.ArbitraryValRef |> Option.iter (add u.Range)
+                                         | _ -> ()
+
+                             bound)
+
+                    let scope = DocScope(Some ccuSigForFile, mainInputFileName, defined)
 
                     let parts =
                         items

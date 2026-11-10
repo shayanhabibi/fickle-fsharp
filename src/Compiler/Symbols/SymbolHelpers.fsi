@@ -107,7 +107,10 @@ module internal SymbolHelpers =
     /// What the doc sources of one tooltip share: each type's members, scanned once
     [<Sealed>]
     type DocScope =
-        new: unit -> DocScope
+        /// `signature`: the check's signature, in which a declaring module is found as it is now
+        new:
+            signature: ModuleOrNamespaceType option * fileName: string * defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>> ->
+                DocScope
 
     /// Where GetXmlCommentForItem's documentation is read from. None when that isn't known.
     val GetDocSourceOfItem: infoReader: InfoReader -> scope: DocScope -> m: range -> item: Item -> FSharpDocSource option

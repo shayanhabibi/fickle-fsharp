@@ -1005,8 +1005,28 @@ module internal SymbolHelpers =
 
     /// The members of a type, or a module's extensions of it, once per tooltip
     [<Sealed>]
-    type DocScope() =
-        member val Members = System.Collections.Generic.Dictionary<struct (Stamp * Stamp), ValRef list>()
+    type DocScope(signature: ModuleOrNamespaceType option, fileName: string, defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>>) =
+        member val Members = System.Collections.Generic.Dictionary<struct (Stamp * string), ValRef list>()
+
+        /// Whether the check still defines a value of its own file: a declaration checked again leaves its old values in
+        /// the module's type, which a kept declaration's siblings would count
+        member _.IsCurrent(v: ValRef) =
+            not (String.Equals(v.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase))
+            || defined.Value.Contains(struct (v.Range.EndLine, v.Range.EndColumn, v.LogicalName))
+
+        /// A method group's implicit inherit targets, which every overload's source shares
+        member val Inherits = System.Collections.Generic.Dictionary<obj, (string * XmlDoc * DocTarget) list>(HashIdentity.Reference)
+
+        /// The module of `p`'s path in the check's signature: what the file declares now, where a kept declaration's own
+        /// module can still hold what a declaration checked again since no longer declares
+        member _.CurrentModule(p: TyconRef) =
+            match signature with
+            | None -> None
+            | Some root ->
+                (Some root, (p.CompilationPath.AccessPath |> List.map fst) @ [ p.LogicalName ])
+                ||> List.fold (fun mty name ->
+                    mty |> Option.bind (fun (m: ModuleOrNamespaceType) ->
+                        m.AllEntitiesByLogicalMangledName.TryFind name |> Option.map _.ModuleOrNamespaceType))
 
     /// The place of a declaration at `at` among `places` in its file, by position
     let private placeOf (places: range list) (at: range) =
@@ -1025,7 +1045,9 @@ module internal SymbolHelpers =
     let private ownersOfVal (g: TcGlobals) (scope: DocScope) (vref: ValRef) =
         match vref.MemberInfo, vref.TryDeclaringEntity with
         | None, Parent parent ->
-            let path = "V:" + sourcePathOfEntity parent + "." + vref.LogicalName
+            // A type's own `let` has a kind of its own: its type and a module of one name share a path
+            let kind = if parent.IsModuleOrNamespace then "V:" else "L:"
+            let path = kind + sourcePathOfEntity parent + "." + vref.LogicalName
             Some(ownersAt path vref.Range vref.SigRange path)
         | None, ParentNone -> None
         | Some _, declaring ->
@@ -1037,14 +1059,20 @@ module internal SymbolHelpers =
                 let typePath, key, scan =
                     match declaring with
                     | Parent p when not (tyconRefEq g p apparent) ->
+                        // An extension is placed among the module's extensions of types of its type's name and arity, as
+                        // the parse names them (`type N1.Thing with` and `type N2.Thing with` are both `Thing`), in what
+                        // the module declares now
+                        let name = sourceNameOfEntity apparent
+
                         let scan () =
-                            p.ModuleOrNamespaceType.AllValsAndMembers
+                            defaultArg (scope.CurrentModule p) p.ModuleOrNamespaceType
+                            |> _.AllValsAndMembers
                             |> Seq.map mkLocalValRef
-                            |> Seq.filter (fun v -> v.IsMember && tyconRefEq g v.MemberApparentEntity apparent)
+                            |> Seq.filter (fun v -> v.IsMember && v.IsExtensionMember && sourceNameOfEntity v.MemberApparentEntity = name)
                             |> List.ofSeq
 
-                        sourcePathOfEntity p + "." + sourceNameOfEntity apparent, struct (p.Stamp, apparent.Stamp), scan
-                    | _ -> sourcePathOfEntity apparent, struct (apparent.Stamp, apparent.Stamp), (fun () -> apparent.MembersOfFSharpTyconSorted)
+                        sourcePathOfEntity p + "." + name, struct (p.Stamp, name), scan
+                    | _ -> sourcePathOfEntity apparent, struct (apparent.Stamp, ""), (fun () -> apparent.MembersOfFSharpTyconSorted)
 
                 let siblings =
                     match scope.Members.TryGetValue key with
@@ -1054,7 +1082,7 @@ module internal SymbolHelpers =
                         scope.Members[key] <- s
                         s
 
-                let alike = siblings |> List.filter (fun v -> memberTag v = Some tag)
+                let alike = siblings |> List.filter (fun v -> memberTag v = Some tag && (Position.posEq v.Range.Start vref.Range.Start || scope.IsCurrent v))
                 let ordinal = placeOf (alike |> List.map _.Range) vref.Range
                 // The signature's declarations that the alike members conformed to
                 let signatureOrdinal = placeOf (alike |> List.map _.SigRange) vref.SigRange
@@ -1067,7 +1095,7 @@ module internal SymbolHelpers =
         // Compiled or provided: the doc the check has is the doc
         | _ -> None
 
-    let private makeDocSource (infoReader: InfoReader) scope m d (owners: FSharpDocOwner list option) (stale: XmlDoc) (fallback: FSharpXmlDoc) =
+    let private makeDocSource (infoReader: InfoReader) (scope: DocScope) m d (owners: FSharpDocOwner list option) (stale: XmlDoc) (fallback: FSharpXmlDoc) =
         match owners with
         | None -> None
         | Some owners ->
@@ -1076,8 +1104,25 @@ module internal SymbolHelpers =
             // As far as FCS's own walk would get: a candidate that throws ends it, and those before it stay
             let inherits = ResizeArray()
 
+            // Once per item: a group's overloads share their head's targets
+            let candidates =
+                match scope.Inherits.TryGetValue(box d) with
+                | true, c -> c
+                | _ ->
+                    let found = ResizeArray()
+
+                    try
+                        for c in implicitInheritCandidates infoReader m d do
+                            found.Add c
+                    with _ ->
+                        ()
+
+                    let c = List.ofSeq found
+                    scope.Inherits[box d] <- c
+                    c
+
             try
-                for cref, xmlDoc, target in implicitInheritCandidates infoReader m d do
+                for cref, xmlDoc, target in candidates do
                     let owners =
                         match target with
                         | DocTarget.Entity tcref -> ownersOfEntity tcref
