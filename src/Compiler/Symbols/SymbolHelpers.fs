@@ -1005,17 +1005,29 @@ module internal SymbolHelpers =
 
     /// The members of a type, or a module's extensions of it, once per tooltip
     [<Sealed>]
-    type DocScope(signature: ModuleOrNamespaceType option, fileName: string, defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>>) =
+    type DocScope
+        (
+            signature: ModuleOrNamespaceType option,
+            fileName: string,
+            defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>>,
+            bound: Lazy<System.Collections.Generic.HashSet<struct (Stamp * int * int)>>
+        ) =
         member val Members = System.Collections.Generic.Dictionary<struct (Stamp * string), ValRef list>()
 
-        /// Whether the check still defines a value of its own file: a declaration checked again leaves its old values in
-        /// the module's type, which a kept declaration's siblings would count
         /// The file the check is of
         member _.FileName = fileName
 
+        /// Whether the check still defines a value of its own file: a declaration checked again leaves its old values in
+        /// the module's type, which a kept declaration's siblings would count
         member _.IsCurrent(v: ValRef) =
             not (String.Equals(v.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase))
             || defined.Value.Contains(struct (v.Range.EndLine, v.Range.EndColumn, v.LogicalName))
+
+        /// Whether a binding of this check makes the value where its range starts, not a kept declaration still referring
+        /// to the value a declaration checked again since had: those are the values whose places are in the check's parse.
+        /// By place as well as stamp: a value checked again can keep its stamp.
+        member _.Binds(v: ValRef) =
+            bound.Value.Contains(struct (v.Stamp, v.Range.StartLine, v.Range.StartColumn))
 
         /// A method group's implicit inherit targets, which every overload's source shares
         member val Inherits = System.Collections.Generic.Dictionary<obj, (string * XmlDoc * DocTarget) list>(HashIdentity.Reference)
@@ -1090,11 +1102,13 @@ module internal SymbolHelpers =
 
                 // An extension in the asking file: its place among the module's extensions depends on other blocks, which
                 // a kept block counted as they were when it was checked. Its name's place in this check is its own, and is
-                // in the parse the check is of.
+                // in the parse the check is of, when a binding of the check makes it. A kept declaration can refer to the
+                // value an extension had before its block was checked again, whose place is the old one: that is `@?`,
+                // which no parse has, and which the caller answers by checking the referring declaration again.
                 let ownPlace =
                     match declaring with
                     | Parent p when not (tyconRefEq g p apparent) && String.Equals(vref.Range.FileName, scope.FileName, StringComparison.OrdinalIgnoreCase) ->
-                        Some $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}"
+                        if scope.Binds vref then Some $"@%d{vref.Range.StartLine},%d{vref.Range.StartColumn}" else Some "@?"
                     | _ -> None
                 // The signature's declarations that the alike members conformed to
                 let signatureOrdinal = placeOf (alike |> List.map _.SigRange) vref.SigRange

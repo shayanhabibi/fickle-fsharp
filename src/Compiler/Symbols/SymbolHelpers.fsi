@@ -109,7 +109,10 @@ module internal SymbolHelpers =
     type DocScope =
         /// `signature`: the check's signature, in which a declaring module is found as it is now
         new:
-            signature: ModuleOrNamespaceType option * fileName: string * defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>> ->
+            signature: ModuleOrNamespaceType option *
+            fileName: string *
+            defined: Lazy<System.Collections.Generic.HashSet<struct (int * int * string)>> *
+            bound: Lazy<System.Collections.Generic.HashSet<struct (Stamp * int * int)>> ->
                 DocScope
 
     /// Where GetXmlCommentForItem's documentation is read from. None when that isn't known.

@@ -2571,13 +2571,18 @@ type internal TypeCheckInfo
                         | Item.SetterArg(_, item) -> shown item
                         | item -> item
 
-                    // The values this check defines: where each binding of it ends, and the names it binds there
-                    let defined =
+                    // The values this check defines: where each binding of it ends and the names it binds there, and the
+                    // values a binding makes at their own place
+                    let bindings =
                         lazy
                             (let bound = System.Collections.Generic.HashSet<struct (int * int * string)>()
+                             let values = System.Collections.Generic.HashSet<struct (Stamp * int * int)>()
 
                              let add (r: range) (v: ValRef) =
                                  bound.Add(struct (r.EndLine, r.EndColumn, v.LogicalName)) |> ignore
+
+                                 if Position.posEq v.Range.Start r.Start then
+                                     values.Add(struct (v.Stamp, r.StartLine, r.StartColumn)) |> ignore
 
                              for uses in sSymbolUses.AllUsesOfSymbols do
                                  for u in uses do
@@ -2593,9 +2598,15 @@ type internal TypeCheckInfo
                                                  pi.ArbitraryValRef |> Option.iter (add u.Range)
                                          | _ -> ()
 
-                             bound)
+                             struct (bound, values))
 
-                    let scope = DocScope(Some ccuSigForFile, mainInputFileName, defined)
+                    let scope =
+                        DocScope(
+                            Some ccuSigForFile,
+                            mainInputFileName,
+                            lazy (let struct (b, _) = bindings.Value in b),
+                            lazy (let struct (_, v) = bindings.Value in v)
+                        )
 
                     let parts =
                         items
