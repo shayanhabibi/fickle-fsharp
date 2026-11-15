@@ -484,6 +484,4 @@ type internal ScopesNow =
         fileEnd: pos *
         current: (unit -> (range * range)[]) -> ScopesNow
 
-    member Of: sink: TcResultsSinkImpl -> m: range -> range
-
-    member Of: sink: TcResultsSinkImpl -> m: range -> range
+    member Of: sink: TcResultsSinkImpl * m: range -> range
