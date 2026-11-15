@@ -627,6 +627,8 @@
     <Compile Include="Service\Declarations\DeclarationStep.fs" />
     <Compile Include="Service\Declarations\DeclarationFinish.fs" />
     <Compile Include="Service\Declarations\DeclarationChecker.fs" />
+    <Compile Include="Service\FSharpProjectChecker.fsi" />
+    <Compile Include="Service\FSharpProjectChecker.fs" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fsi" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fs" />
     <Compile Include="Service\ServiceStructure.fsi" />
