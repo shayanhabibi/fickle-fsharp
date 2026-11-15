@@ -620,6 +620,8 @@
     <Compile Include="Service\FSharpWorkspaceState.fs" />
     <Compile Include="Service\FSharpWorkspaceQuery.fs" />
     <Compile Include="Service\FSharpWorkspace.fs" />
+    <Compile Include="Service\Declarations\DeclarationShift.fsi" />
+    <Compile Include="Service\Declarations\DeclarationShift.fs" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fsi" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fs" />
     <Compile Include="Service\ServiceStructure.fsi" />
