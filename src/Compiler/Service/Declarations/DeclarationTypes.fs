@@ -1109,7 +1109,7 @@ type internal ScopesNow
 
              d)
 
-    member _.Of (sink: TcResultsSinkImpl) (m: range) : range =
+    member _.Of(sink: TcResultsSinkImpl, m: range) : range =
         if obj.ReferenceEquals(sink, setup) then
             if FSharp.Compiler.Text.Position.posEq m.End setupEnd then
                 mkFileIndexRange m.FileIndex m.Start fileEnd
