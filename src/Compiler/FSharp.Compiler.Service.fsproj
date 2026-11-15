@@ -622,6 +622,14 @@
     <Compile Include="Service\FSharpWorkspace.fs" />
     <Compile Include="Service\Declarations\DeclarationShift.fsi" />
     <Compile Include="Service\Declarations\DeclarationShift.fs" />
+    <Compile Include="Service\Declarations\DeclarationTypes.fsi" />
+    <Compile Include="Service\Declarations\DeclarationTypes.fs" />
+    <Compile Include="Service\Declarations\DeclarationSyntax.fsi" />
+    <Compile Include="Service\Declarations\DeclarationSyntax.fs" />
+    <Compile Include="Service\Declarations\DeclarationSymbolKeys.fsi" />
+    <Compile Include="Service\Declarations\DeclarationSymbolKeys.fs" />
+    <Compile Include="Service\Declarations\DeclarationProjectCheck.fsi" />
+    <Compile Include="Service\Declarations\DeclarationProjectCheck.fs" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fsi" />
     <Compile Include="Service\ServiceInterfaceStubGenerator.fs" />
     <Compile Include="Service\ServiceStructure.fsi" />
