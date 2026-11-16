@@ -963,7 +963,12 @@ module internal SymbolHelpers =
               yield { FileName = signature.FileName; Path = signaturePath } ]
 
     /// The declarations of a source file: what is compiled, or provided, has no `///` of its own there
-    let private isSourceEntity (tcref: TyconRef) = not (tcref.IsILTycon || tcref.IsProvided)
+    let private isSourceEntity (tcref: TyconRef) =
+#if !NO_TYPEPROVIDERS
+        not (tcref.IsILTycon || tcref.IsProvided)
+#else
+        not tcref.IsILTycon
+#endif
 
     let private ownersOfEntity (tcref: TyconRef) =
         if not (isSourceEntity tcref) then None

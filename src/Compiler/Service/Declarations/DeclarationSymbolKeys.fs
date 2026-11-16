@@ -33,7 +33,9 @@ let private typesText (cenv: SymbolEnv) (own: Typar list) (types: TType list) =
 
     let rec text (t: FSharpType) =
         let t = t.StripAbbreviations()
-        let arguments (separator: string) = t.GenericArguments |> Seq.map text |> String.concat separator
+
+        let arguments (separator: string) =
+            t.GenericArguments |> Seq.map text |> String.concat separator
 
         if t.IsGenericParameter then
             let name = t.GenericParameter.Name
@@ -48,7 +50,11 @@ let private typesText (cenv: SymbolEnv) (own: Typar list) (types: TType list) =
         elif t.IsTupleType then
             "(" + arguments (if t.IsStructTupleType then "#" else "*") + ")"
         elif t.IsAnonRecordType then
-            "{" + String.concat "," t.AnonRecordTypeDetails.SortedFieldNames + ":" + arguments "," + "}"
+            "{"
+            + String.concat "," t.AnonRecordTypeDetails.SortedFieldNames
+            + ":"
+            + arguments ","
+            + "}"
         elif t.HasTypeDefinition then
             entityPath t.TypeDefinition + "<" + arguments "," + ">"
         else
@@ -75,14 +81,19 @@ let private ofVal (cenv: SymbolEnv) (assembly: string) (v: ValRef) =
     // A union's `IsCase` isn't marked as generated, and is declared at its case's name
     | Some _ when
         v.MemberApparentEntity.IsUnionTycon
-        && v.MemberApparentEntity.UnionCasesArray |> Array.exists (fun c -> Range.equals c.Range v.Range)
+        && v.MemberApparentEntity.UnionCasesArray
+           |> Array.exists (fun c -> Range.equals c.Range v.Range)
         ->
-        let case = v.MemberApparentEntity.UnionCasesArray |> Array.find (fun c -> Range.equals c.Range v.Range)
+        let case =
+            v.MemberApparentEntity.UnionCasesArray
+            |> Array.find (fun c -> Range.equals c.Range v.Range)
+
         $"%s{assembly}|case|%s{entityPath (FSharpEntity(cenv, v.MemberApparentEntity))}|%s{case.DisplayName}"
     // What the compiler generated has no definition of its own: its location is its type's, as is a union's `Tag`'s
     | Some _ when
         v.IsCompilerGenerated
-        || (v.MemberApparentEntity.IsUnionTycon && Range.equals v.Range v.MemberApparentEntity.Range)
+        || (v.MemberApparentEntity.IsUnionTycon
+            && Range.equals v.Range v.MemberApparentEntity.Range)
         ->
         ofEntity assembly (FSharpEntity(cenv, v.MemberApparentEntity))
     | Some info ->
@@ -102,7 +113,11 @@ let private ofVal (cenv: SymbolEnv) (assembly: string) (v: ValRef) =
             |> List.sort
             |> String.concat ","
 
-        let role = if info.MemberFlags.IsDispatchSlot then "slot" else implements
+        let role =
+            if info.MemberFlags.IsDispatchSlot then
+                "slot"
+            else
+                implements
 
         let start (kind: string) (name: string) =
             $"%s{assembly}|%s{kind}|%s{parent}|%s{apparent}|%s{name}|%b{v.IsInstanceMember}|%d{v.Typars.Length}|%s{role}"
@@ -111,11 +126,16 @@ let private ofVal (cenv: SymbolEnv) (assembly: string) (v: ValRef) =
         | SynMemberKind.PropertyGet -> start propertyKind v.PropertyName + "|" + types arguments
         // What it sets comes last: the index before that is what tells a property's overloads apart
         | SynMemberKind.PropertySet ->
-            start propertyKind v.PropertyName + "|" + types (List.take (arguments.Length - 1) arguments)
+            start propertyKind v.PropertyName
+            + "|"
+            + types (List.take (arguments.Length - 1) arguments)
         | _ ->
             // Conversions overload on what they return
             let compared =
-                if v.LogicalName = "op_Explicit" || v.LogicalName = "op_Implicit" then [ v.Type ] else arguments
+                if v.LogicalName = "op_Explicit" || v.LogicalName = "op_Implicit" then
+                    [ v.Type ]
+                else
+                    arguments
 
             start "member" v.LogicalName + "|" + types compared
 
@@ -164,7 +184,10 @@ let private ofSymbol (symbol: FSharpSymbol) : string option =
         None
 
 let private withoutSetter (key: string) =
-    if key.EndsWith setterSuffix then key.Substring(0, key.Length - setterSuffix.Length) else key
+    if key.EndsWith setterSuffix then
+        key.Substring(0, key.Length - setterSuffix.Length)
+    else
+        key
 
 /// Whether a definition's key is what `key` asks for: a property's accessors are one definition
 let private defines (key: string) (symbol: FSharpSymbol) =
@@ -192,7 +215,10 @@ let private conformsTo (key: string) (symbol: FSharpSymbol) =
 /// doesn't compile has them, and nothing current says which of them is meant.
 let private locationOf (key: string) (definitions: FSharpSymbol list) : range option =
     let wanted (v: FSharpMemberOrFunctionOrValue) =
-        if key.EndsWith setterSuffix then v.IsPropertySetterMethod else v.IsPropertyGetterMethod
+        if key.EndsWith setterSuffix then
+            v.IsPropertySetterMethod
+        else
+            v.IsPropertyGetterMethod
 
     let accessorFirst =
         definitions
@@ -231,9 +257,17 @@ let rec private definedIn (cenv: SymbolEnv) (m: ModuleOrNamespaceType) : seq<FSh
 
 let symbolKey (symbol: FSharpSymbol) : string option = ofSymbol symbol
 
-let signatureLocation (ctx: ProjectContext) (signature: FileSignature) (key: string) (conformed: bool) (ct: CancellationToken) : range option =
+let signatureLocation
+    (ctx: ProjectContext)
+    (signature: FileSignature)
+    (key: string)
+    (conformed: bool)
+    (ct: CancellationToken)
+    : range option =
     let state = ctx.State
-    let cenv = SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
+
+    let cenv =
+        SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
 
     let defined =
         definedIn cenv signature.ModuleType
@@ -248,7 +282,9 @@ let signatureLocation (ctx: ProjectContext) (signature: FileSignature) (key: str
 
 let signatureUses (ctx: ProjectContext) (signature: FileSignature) : (struct (range * bool * FSharpSymbol))[] =
     let state = ctx.State
-    let cenv = SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
+
+    let cenv =
+        SymbolEnv(state.tcGlobals, state.tcInitialState.Ccu, Some signature.ModuleType, state.tcImports)
 
     signature.Uses
     |> Array.map (fun (struct (item, occurrence, m)) -> struct (m, (occurrence = ItemOccurrence.Binding), FSharpSymbol.Create(cenv, item)))

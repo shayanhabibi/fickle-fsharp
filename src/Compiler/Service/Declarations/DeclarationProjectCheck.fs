@@ -58,7 +58,8 @@ let newLoggersWith (diagnosticsOptions: FSharpDiagnosticOptions) =
     let capturing = CompilationDiagnosticLogger("TypeCheckFile", diagnosticsOptions)
     capturing, RawDiagnostics(GetDiagnosticsLoggerFilteringByScopedNowarn(diagnosticsOptions, capturing))
 
-let newLoggers (state: CompilerState) = newLoggersWith state.tcConfig.diagnosticsOptions
+let newLoggers (state: CompilerState) =
+    newLoggersWith state.tcConfig.diagnosticsOptions
 
 let diagnosticsWith (state: CompilerState) (diagnosticsOptions: FSharpDiagnosticOptions) fileName (capturing: CompilationDiagnosticLogger) =
     DiagnosticHelpers.CreateDiagnostics(
@@ -78,7 +79,8 @@ let diagnosticsOf (state: CompilerState) fileName (capturing: CompilationDiagnos
 /// keeps a diagnostic by the file of its range as reported, then applies #line directives to it: one in generated
 /// code mapped to its source, such as pars.fs to pars.fsy, would otherwise be reported in that other file.
 let projectDiagnostics (ctx: ProjectContext) (diagnostics: FSharpDiagnostic[]) =
-    diagnostics |> Array.filter (fun diagnostic -> ctx.IsSourceFile diagnostic.FileName)
+    diagnostics
+    |> Array.filter (fun diagnostic -> ctx.IsSourceFile diagnostic.FileName)
 
 /// Diagnostics as reported, filtered by these options (a parse's copy, with its #nowarn scopes), not yet
 /// rendered: their text shows the types as they are when diagnosticsWith renders them.
@@ -97,7 +99,11 @@ let refiltered diagnosticsOptions (raw: PhasedDiagnostic[]) =
 ///
 /// For a setup from part of the earlier files, gives the module-name dictionary the file is deduplicated against,
 /// as checking every earlier file gives it: the files in `before` alone would miss the names of the others.
-let private checkBefore (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpParseFileResults) : (ModuleNamesDict * HashSet<string>) option =
+let private checkBefore
+    (ctx: ProjectContext)
+    (before: FileSignature list)
+    (parse: FSharpParseFileResults)
+    : (ModuleNamesDict * HashSet<string>) option =
     match ctx.IndexOf parse.FileName with
     | None -> None
     | Some idx ->
@@ -129,9 +135,13 @@ let private checkBefore (ctx: ProjectContext) (before: FileSignature list) (pars
 
             match ctx.Dependencies with
             | Some snapshot when isCurrent snapshot ->
-                let present = HashSet<string>(before |> Seq.map _.FileName, StringComparer.OrdinalIgnoreCase)
+                let present =
+                    HashSet<string>(before |> Seq.map _.FileName, StringComparer.OrdinalIgnoreCase)
 
-                match snapshot.Dependencies[idx] |> Array.tryFind (fun dep -> not (present.Contains snapshot.Parses[dep].FileName)) with
+                match
+                    snapshot.Dependencies[idx]
+                    |> Array.tryFind (fun dep -> not (present.Contains snapshot.Parses[dep].FileName))
+                with
                 | Some missing ->
                     raise (
                         ArgumentException(
@@ -169,23 +179,28 @@ let private stateBefore (checks: ProjectChecks) (before: FileSignature list) (ma
     let present =
         HashSet<string>(before |> Seq.map (fun signature -> signature.FileName), StringComparer.OrdinalIgnoreCase)
 
-    let implementationOf (signatureFile: string) = signatureFile.Substring(0, signatureFile.Length - 1)
+    let implementationOf (signatureFile: string) =
+        signatureFile.Substring(0, signatureFile.Length - 1)
 
     let artificial =
-        [ for signature in before do
-              match signature.AsImplementation, matched with
-              | Some asImplementation, Some matched when
-                  matched.Contains signature.FileName
-                  && not (present.Contains(implementationOf signature.FileName))
-                  && checks.IsBefore(implementationOf signature.FileName, fileName)
-                  ->
-                  yield checks.IndexOf(implementationOf signature.FileName), signature.ArtificialKey, asImplementation
-              | _ -> () ]
+        [
+            for signature in before do
+                match signature.AsImplementation, matched with
+                | Some asImplementation, Some matched when
+                    matched.Contains signature.FileName
+                    && not (present.Contains(implementationOf signature.FileName))
+                    && checks.IsBefore(implementationOf signature.FileName, fileName)
+                    ->
+                    yield checks.IndexOf(implementationOf signature.FileName), signature.ArtificialKey, asImplementation
+                | _ -> ()
+        ]
 
     // In file order, each step where its file is: the environments layer what they hold in the order a check of
     // every earlier file adds it (AutoOpen modules and extension members shadow by it)
     let steps =
-        [ for signature in before -> checks.IndexOf signature.FileName, (signature :> obj), (fun tcState -> signature.Apply tcState) ]
+        [
+            for signature in before -> checks.IndexOf signature.FileName, (signature :> obj), (fun tcState -> signature.Apply tcState)
+        ]
         @ artificial
         |> List.sortBy (fun (index, _, _) -> index)
 
@@ -208,10 +223,20 @@ let private stateBefore (checks: ProjectChecks) (before: FileSignature list) (ma
 
 /// The checker state after `before` and the implementation file to check in it, as BeginFile and CheckFile set
 /// them up.
-let private implFileState (checks: ProjectChecks) (before: FileSignature list) (scoped: (ModuleNamesDict * HashSet<string>) option) (parse: FSharpParseFileResults) =
-    let tcState, chainModuleNames = stateBefore checks before (Option.map snd scoped) parse.FileName
-    let moduleNamesDict = scoped |> Option.map fst |> Option.defaultWith chainModuleNames.Force
-    let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+let private implFileState
+    (checks: ProjectChecks)
+    (before: FileSignature list)
+    (scoped: (ModuleNamesDict * HashSet<string>) option)
+    (parse: FSharpParseFileResults)
+    =
+    let tcState, chainModuleNames =
+        stateBefore checks before (Option.map snd scoped) parse.FileName
+
+    let moduleNamesDict =
+        scoped |> Option.map fst |> Option.defaultWith chainModuleNames.Force
+
+    let input, moduleNamesDict =
+        DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
     match input with
     | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Expected an implementation file."
@@ -239,7 +264,12 @@ let private conditionalDefines (state: CompilerState) =
 /// every file set up from the signature. Only a check of the file's latest parse writes them; one of an older
 /// text leaves them, so they are the latest text's once it has been checked, whatever other checks of the file
 /// run and in whatever order. Run under the file's check lock.
-let leavingSignatureRanges (checks: ProjectChecks) (parse: FSharpParseFileResults) (rootSigOpt: ModuleOrNamespaceType option) (check: unit -> 'T) : 'T =
+let leavingSignatureRanges
+    (checks: ProjectChecks)
+    (parse: FSharpParseFileResults)
+    (rootSigOpt: ModuleOrNamespaceType option)
+    (check: unit -> 'T)
+    : 'T =
     let latest =
         match checks.LatestParse parse.FileName with
         | Some latest -> obj.ReferenceEquals(latest, parse)
@@ -261,11 +291,18 @@ let leavingSignatureRanges (checks: ProjectChecks) (parse: FSharpParseFileResult
 /// a check of the file resets. Queries on the results, the implementation file's included, then read given names.
 let compiledNamesOf (state: CompilerState) (resolutions: TcResolutions) (implFileOpt: CheckedImplFile option) =
     let globalState = state.tcGlobals.CompilerGlobalState
-    let read (vref: ValRef) = if vref.IsLocalRef then vref.Deref.CompiledName globalState |> ignore
+
+    let read (vref: ValRef) =
+        if vref.IsLocalRef then
+            vref.Deref.CompiledName globalState |> ignore
 
     match implFileOpt with
     | Some implFile ->
-        let folder = { ExprFolder0 with valBindingSiteIntercept = fun () (_, v: Val) -> v.CompiledName globalState |> ignore }
+        let folder =
+            { ExprFolder0 with
+                valBindingSiteIntercept = fun () (_, v: Val) -> v.CompiledName globalState |> ignore
+            }
+
         FoldImplFile folder () implFile
     | None -> ()
 
@@ -282,8 +319,17 @@ let compiledNamesOf (state: CompilerState) (resolutions: TcResolutions) (implFil
 
 /// CheckOneImplFile on an implementation file set up by implFileState and enterImplFile, recovering from an error as
 /// CheckOneInput does, under the ambient logger.
-let private checkImplFile (state: CompilerState) (tcState: TcState) rootSigOpt file (parse: FSharpParseFileResults) (logger: DiagnosticsLogger) sink =
-    let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
+let private checkImplFile
+    (state: CompilerState)
+    (tcState: TcState)
+    rootSigOpt
+    file
+    (parse: FSharpParseFileResults)
+    (logger: DiagnosticsLogger)
+    sink
+    =
+    let checkForErrors () =
+        parse.ParseHadErrors || logger.ErrorCount > 0
 
     try
         CheckOneImplFile(
@@ -316,7 +362,10 @@ let private buildCheckResults (checks: ProjectChecks) before moduleNamesBefore (
     let _, logger = newLoggersWith (DeclarationSyntax.warnOptionsOf parse)
     use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
     use _ = Cancellable.UsingToken CancellationToken.None
-    let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
+
+    let sink =
+        TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
+
     checks.CountCheckResultsBuilt()
 
     let rootSigOpt, checkedFile =
@@ -349,10 +398,7 @@ let private buildCheckResults (checks: ProjectChecks) before moduleNamesBefore (
 
             ccuSigForFile, ownSigForFile, tcEnvAtEnd, Some implFile
         | None ->
-            tcState.CcuSig,
-            Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true),
-            tcState.TcEnvFromSignatures,
-            None
+            tcState.CcuSig, Construct.NewEmptyModuleOrNamespaceType(ModuleOrNamespaceKind.Namespace true), tcState.TcEnvFromSignatures, None
 
     let scope =
         TypeCheckInfo(
@@ -406,10 +452,12 @@ let rec stampsOf (mty: ModuleOrNamespaceType) =
 
 /// Records the declaration as the definition of what its delta publishes.
 let addDefinitions (definitions: Map<Stamp, DeclarationRef>) (declaration: DeclarationRef) (delta: ModuleOrNamespaceType) =
-    (definitions, stampsOf delta) ||> Seq.fold (fun acc stamp -> Map.add stamp declaration acc)
+    (definitions, stampsOf delta)
+    ||> Seq.fold (fun acc stamp -> Map.add stamp declaration acc)
 
 let private definitionsBefore (before: FileSignature list) =
-    (Map.empty, before) ||> List.fold (fun acc signature -> Map.foldBack Map.add signature.Definitions acc)
+    (Map.empty, before)
+    ||> List.fold (fun acc signature -> Map.foldBack Map.add signature.Definitions acc)
 
 /// What a signature file declares: its declarations are not checked one at a time, so the file stands for them.
 let private signatureDefinitions fileName (sigType: ModuleOrNamespaceType) =
@@ -421,9 +469,14 @@ let private signatureDefinitions fileName (sigType: ModuleOrNamespaceType) =
 let rec copiedDefinitions (own: Map<Stamp, DeclarationRef>) (contents: ModuleOrNamespaceType) (copy: ModuleOrNamespaceType) acc =
     let pairs (originals: seq<'T>) (copies: seq<'T>) (name: 'T -> string) =
         let originals, copies = Array.ofSeq originals, Array.ofSeq copies
-        let names (items: 'T[]) = items |> Array.map name |> String.concat ", "
 
-        if originals.Length <> copies.Length || Array.exists2 (fun o c -> name o <> name c) originals copies then
+        let names (items: 'T[]) =
+            items |> Array.map name |> String.concat ", "
+
+        if
+            originals.Length <> copies.Length
+            || Array.exists2 (fun o c -> name o <> name c) originals copies
+        then
             invalidOp $"The inferred signature is not a copy of the file's contents: [%s{names originals}] against [%s{names copies}]."
 
         Array.zip originals copies
@@ -488,18 +541,24 @@ let createProject (options: FSharpProjectOptions) : Async<ProjectContext> =
 
 /// A project context in which each `-r:` whose path is a key of `references` is that project's in-memory assembly,
 /// not the file at the path. Everything else is as CreateProject.
-let createProjectWithReferences (options: FSharpProjectOptions) (references: IReadOnlyDictionary<string, ProjectAssembly>) : Async<ProjectContext> =
+let createProjectWithReferences
+    (options: FSharpProjectOptions)
+    (references: IReadOnlyDictionary<string, ProjectAssembly>)
+    : Async<ProjectContext> =
     async {
         // Here, where the caller sees a failure: the imports turn one into a missing reference, in no logger
         for assembly in references.Values do
             assembly.Data |> ignore
 
         let projectReferences =
-            [ for KeyValue(path, assembly) in references ->
-                  { new IProjectReference with
-                      member _.FileName = path
-                      member _.EvaluateRawContents() = async { return assembly.Data }
-                      member _.TryGetLogicalTimeStamp _ = Some DateTime.UtcNow } ]
+            [
+                for KeyValue(path, assembly) in references ->
+                    { new IProjectReference with
+                        member _.FileName = path
+                        member _.EvaluateRawContents() = async { return assembly.Data }
+                        member _.TryGetLogicalTimeStamp _ = Some DateTime.UtcNow
+                    }
+            ]
 
         let! state = initializeCompilerStateWith projectReferences options ignore
         return ProjectContext state
@@ -517,7 +576,9 @@ let failingProjectAssembly (message: string) : ProjectAssembly =
 let projectAssembly (ctx: ProjectContext) (files: FileResult list) (signatures: FileSignature list) : ProjectAssembly =
     let state = ctx.State
     let checks = ctx.Checks
-    let topAttrs = List.foldBack (fun (file: FileResult) acc -> CombineTopAttrs file.TopAttrs acc) files EmptyTopAttrs
+
+    let topAttrs =
+        List.foldBack (fun (file: FileResult) acc -> CombineTopAttrs file.TopAttrs acc) files EmptyTopAttrs
 
     let fingerprint =
         use hash = IncrementalHash.CreateHash HashAlgorithmName.SHA256
@@ -538,7 +599,11 @@ let projectAssembly (ctx: ProjectContext) (files: FileResult list) (signatures: 
         let _, logger = newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = Cancellable.UsingToken CancellationToken.None
-        let tcState = (state.tcInitialState, signatures) ||> List.fold (fun tcState signature -> signature.Apply tcState)
+
+        let tcState =
+            (state.tcInitialState, signatures)
+            ||> List.fold (fun tcState signature -> signature.Apply tcState)
+
         let _, _, ccuContents = CheckClosedInputSetFinish([], tcState)
         let generatedCcu = tcState.Ccu.CloneWithFinalizedContents ccuContents
         let assemblyName = tcState.Ccu.AssemblyName
@@ -550,7 +615,8 @@ let projectAssembly (ctx: ProjectContext) (files: FileResult list) (signatures: 
         let ilAssemRef =
             let publicKey =
                 try
-                    let signingInfo = CreateILModule.ValidateKeySigningAttributes(tcConfig, tcGlobals, topAttrs)
+                    let signingInfo =
+                        CreateILModule.ValidateKeySigningAttributes(tcConfig, tcGlobals, topAttrs)
 
                     match CreateILModule.GetStrongNameSigner signingInfo with
                     | None -> None
@@ -571,7 +637,12 @@ let projectAssembly (ctx: ProjectContext) (files: FileResult list) (signatures: 
                     | _ -> ()
                 elif hasFlag flag WellKnownAssemblyAttributes.AssemblyVersionAttribute then
                     match attr with
-                    | Attrib(_, _, [ AttribStringArg s ], _, _, _, _) -> ver <- (try Some(parseILVersion s) with _ -> None)
+                    | Attrib(_, _, [ AttribStringArg s ], _, _, _, _) ->
+                        ver <-
+                            (try
+                                Some(parseILVersion s)
+                             with _ ->
+                                 None)
                     | _ -> ()
                 elif hasFlag flag WellKnownAssemblyAttributes.TypeProviderAssemblyAttribute then
                     hasTypeProviderAssemblyAttrib <- true
@@ -592,7 +663,16 @@ let projectAssembly (ctx: ProjectContext) (files: FileResult list) (signatures: 
             // waits for a second file's lock while holding one.
             let rec holding (names: string list) : IRawFSharpAssemblyData =
                 match names with
-                | [] -> RawFSharpAssemblyDataBackedByLanguageService(tcConfig, tcGlobals, generatedCcu, outfile, topAttrs, assemblyName, ilAssemRef)
+                | [] ->
+                    RawFSharpAssemblyDataBackedByLanguageService(
+                        tcConfig,
+                        tcGlobals,
+                        generatedCcu,
+                        outfile,
+                        topAttrs,
+                        assemblyName,
+                        ilAssemRef
+                    )
                 | name :: rest -> lock (checks.FileLock name) (fun () -> holding rest)
 
             ProjectAssemblyDataResult.Available(holding (signatures |> List.map _.FileName))
@@ -606,18 +686,29 @@ let checkSignatureFile (ctx: ProjectContext) (before: FileSignature list) (parse
     | ParsedInput.ImplFile _ -> invalidArg (nameof parse) "Expected a signature file."
     | ParsedInput.SigFile _ ->
         let moduleNamesBefore = checkBefore ctx before parse
-        let tcState, chainModuleNames = stateBefore ctx.Checks before (Option.map snd moduleNamesBefore) parse.FileName
-        let moduleNamesDict = moduleNamesBefore |> Option.map fst |> Option.defaultWith chainModuleNames.Force
-        let input, moduleNamesDict = DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
+
+        let tcState, chainModuleNames =
+            stateBefore ctx.Checks before (Option.map snd moduleNamesBefore) parse.FileName
+
+        let moduleNamesDict =
+            moduleNamesBefore |> Option.map fst |> Option.defaultWith chainModuleNames.Force
+
+        let input, moduleNamesDict =
+            DeduplicateParsedInputModuleName moduleNamesDict parse.ParseTree
 
         match input with
         | ParsedInput.ImplFile _ -> invalidOp "unreachable"
         | ParsedInput.SigFile file ->
             let _, logger = newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
-            let checkForErrors () = parse.ParseHadErrors || logger.ErrorCount > 0
+
+            let checkForErrors () =
+                parse.ParseHadErrors || logger.ErrorCount > 0
+
             let amap = state.tcImports.GetImportMap()
-            let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
+
+            let sink =
+                TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
 
             // The fingerprint reads the compiled names of the file's values, which are given on first read
             let sigFileType, createsGeneratedProvidedTypes, fingerprint, semanticClassification =
@@ -641,16 +732,13 @@ let checkSignatureFile (ctx: ProjectContext) (before: FileSignature list) (parse
                     let semanticClassification =
                         sink.GetResolutions().GetSemanticClassification(state.tcGlobals, amap, sink.GetFormatSpecifierLocations(), None)
 
-                    sigFileType,
-                    createsGeneratedProvidedTypes,
-                    signatureFingerprint sigFileType EmptyTopAttrs,
-                    semanticClassification)
+                    sigFileType, createsGeneratedProvidedTypes, signatureFingerprint sigFileType EmptyTopAttrs, semanticClassification)
 
             let qualNameOfFile = file.QualifiedName
             let m = input.Range
 
             let apply =
-                AddSignatureFileToTcState (state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
+                AddSignatureFileToTcState(state.tcGlobals, amap, m, qualNameOfFile, sigFileType, createsGeneratedProvidedTypes)
 
             // As AddSignatureResultToTcImplEnv, which graph mode runs for an ArtificialImplFile node
             let asImplementation (tcState: TcState) =
@@ -671,10 +759,12 @@ let checkSignatureFile (ctx: ProjectContext) (before: FileSignature list) (parse
                 sigFileType,
                 Some asImplementation,
                 false,
-                [| for chunk in sink.GetSymbolUses().AllUsesOfSymbols do
-                       for u in chunk do
-                           if u.ItemOccurrence <> ItemOccurrence.RelatedText then
-                               struct (u.ItemWithInst.Item, u.ItemOccurrence, u.Range) |],
+                [|
+                    for chunk in sink.GetSymbolUses().AllUsesOfSymbols do
+                        for u in chunk do
+                            if u.ItemOccurrence <> ItemOccurrence.RelatedText then
+                                struct (u.ItemWithInst.Item, u.ItemOccurrence, u.Range)
+                |],
                 semanticClassification
             )
 
@@ -705,7 +795,10 @@ let accessPathTexts (signature: FileSignature) : (string * string)[] =
                 walk e.ModuleOrNamespaceType
 
     walk signature.ModuleType
-    [| for path in paths -> SignatureFingerprint.accessPathText path, sprintf "%A" path.AccessPath |]
+
+    [|
+        for path in paths -> SignatureFingerprint.accessPathText path, sprintf "%A" path.AccessPath
+    |]
 
 let beginFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpParseFileResults) : FileStart * DeclarationEnvironment =
     let state = ctx.State
@@ -714,11 +807,16 @@ let beginFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpP
     | ParsedInput.SigFile _ -> invalidArg (nameof parse) "Only implementation files are checked one declaration at a time."
     | ParsedInput.ImplFile _ ->
         let moduleNamesBefore = checkBefore ctx before parse
-        let tcState, moduleNamesDict, input, file = implFileState ctx.Checks before moduleNamesBefore parse
+
+        let tcState, moduleNamesDict, input, file =
+            implFileState ctx.Checks before moduleNamesBefore parse
+
         let _, logger = newLoggers state
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = Cancellable.UsingToken CancellationToken.None
-        let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
+
+        let sink =
+            TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
 
         let rootSigOpt, cenv, scope =
             lock (ctx.Checks.FileLock parse.FileName) (fun () ->
@@ -741,7 +839,9 @@ let beginFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpP
                 logger.Diagnostics
             )
 
-        let env0 = DeclarationEnvironment(scope.Env, scope.Parent, scope.TypeNames, [], definitionsBefore before)
+        let env0 =
+            DeclarationEnvironment(scope.Env, scope.Parent, scope.TypeNames, [], definitionsBefore before)
+
         start.EnvAtStart <- env0
         start, env0
 
@@ -777,7 +877,10 @@ let checkFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpP
         let moduleNamesBefore = checkBefore ctx before parse
         DeclarationSyntax.refuseUnlessCurrentDirectives parse
         let options = DeclarationSyntax.warnOptionsOf parse
-        let tcState, moduleNamesDict, input, file = implFileState ctx.Checks before moduleNamesBefore parse
+
+        let tcState, moduleNamesDict, input, file =
+            implFileState ctx.Checks before moduleNamesBefore parse
+
         let capturing, logger = newLoggersWith options
         use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
         use _ = Cancellable.UsingToken CancellationToken.None
@@ -803,7 +906,9 @@ let checkFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpP
                         | None -> signatureDefinitions parse.FileName implFile.Signature
 
                     endPhase "definitions"
-                    let describe () = implFingerprint rootSigOpt implFile.Signature topAttrs
+
+                    let describe () =
+                        implFingerprint rootSigOpt implFile.Signature topAttrs
 
                     let fp =
                         if defaultArg fingerprint true then
@@ -837,7 +942,22 @@ let checkFile (ctx: ProjectContext) (before: FileSignature list) (parse: FSharpP
         // the context, which reaches every parse of the project
         let checks = ctx.Checks
 
-        let build () = buildCheckResults checks before moduleNamesBefore parse diagnostics
-        let checkResults = Lazy<FSharpCheckFileResults>(build, LazyThreadSafetyMode.ExecutionAndPublication)
+        let build () =
+            buildCheckResults checks before moduleNamesBefore parse diagnostics
 
-        FileResult(diagnostics, Dictionary<DeclarationKey, string>(HashIdentity.Structural), signature, checkResults, phaseTicks, phaseAllocated, 0, topAttrs, ignore, ValueSome build, ValueNone)
+        let checkResults =
+            Lazy<FSharpCheckFileResults>(build, LazyThreadSafetyMode.ExecutionAndPublication)
+
+        FileResult(
+            diagnostics,
+            Dictionary<DeclarationKey, string>(HashIdentity.Structural),
+            signature,
+            checkResults,
+            phaseTicks,
+            phaseAllocated,
+            0,
+            topAttrs,
+            ignore,
+            ValueSome build,
+            ValueNone
+        )

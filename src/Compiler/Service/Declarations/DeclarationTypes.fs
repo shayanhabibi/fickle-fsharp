@@ -48,45 +48,53 @@ type DeclarationKind =
     | Augmentation
 
 type DeclarationKey =
-    { /// The file's module or namespace, then the nested modules the declaration is in
-      ModulePath: string list
-      Name: string
-      Kind: DeclarationKind
-      /// The number of earlier declarations of the file with the same module path, name and kind
-      Ordinal: int }
+    {
+        /// The file's module or namespace, then the nested modules the declaration is in
+        ModulePath: string list
+        Name: string
+        Kind: DeclarationKind
+        /// The number of earlier declarations of the file with the same module path, name and kind
+        Ordinal: int
+    }
 
 /// A declaration of the project that a typed use resolves to: the declaration with Key in File. Key is None for what a
 /// signature file declares, which is checked whole: a use of it depends on that file's text.
-type DeclarationRef = { File: string; Key: DeclarationKey option }
+type DeclarationRef =
+    {
+        File: string
+        Key: DeclarationKey option
+    }
 
 /// The names a declaration defines and uses, from its syntax. A use can resolve to a definition through any of the
 /// lists: Defines holds every kind of name, so a dependency on a name is a dependency on every declaration defining it.
 type DeclarationContent =
-    { /// Values, types, union cases, record fields, members, custom operation names and modules, including those
-      /// inside a nested module or namespace fragment the declaration holds whole
-      Defines: string[]
-      /// Names resolved in the environment: unqualified identifiers, every segment of qualified ones, types, attributes
-      /// (with and without the Attribute suffix) and opened modules. Locally bound names are included.
-      Uses: string[]
-      /// Names after a dot and members constructs call implicitly (computation expression builders, enumerators,
-      /// indexers, trait calls): each may be a member or extension of any type
-      MemberUses: string[]
-      /// Record labels and union cases, including names after a dot, which can be record fields
-      FieldOrCaseUses: string[]
-      /// Something resolves to a name the syntax does not show, such as the `?` operator: the declaration depends on
-      /// every earlier declaration
-      HasUnresolvable: bool
-      /// Every later declaration depends on this one: open, an [&lt;AutoOpen&gt;] module, a module abbreviation,
-      /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
-      /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
-      /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
-      AffectsAllLater: bool
-      /// The names, as written, of the types the declaration augments (`type T with ...`; a group `type A with ... and
-      /// B with ...` augments both), sorted; empty for anything else. Checking an intrinsic augmentation adds its
-      /// members to T's entity, which T's result holds, so T's declaration and its augmentations re-check together,
-      /// T first, whenever any of them re-checks: re-checking T gives a new entity, which only the augmentations
-      /// checked after it extend.
-      Augments: string[] }
+    {
+        /// Values, types, union cases, record fields, members, custom operation names and modules, including those
+        /// inside a nested module or namespace fragment the declaration holds whole
+        Defines: string[]
+        /// Names resolved in the environment: unqualified identifiers, every segment of qualified ones, types, attributes
+        /// (with and without the Attribute suffix) and opened modules. Locally bound names are included.
+        Uses: string[]
+        /// Names after a dot and members constructs call implicitly (computation expression builders, enumerators,
+        /// indexers, trait calls): each may be a member or extension of any type
+        MemberUses: string[]
+        /// Record labels and union cases, including names after a dot, which can be record fields
+        FieldOrCaseUses: string[]
+        /// Something resolves to a name the syntax does not show, such as the `?` operator: the declaration depends on
+        /// every earlier declaration
+        HasUnresolvable: bool
+        /// Every later declaration depends on this one: open, an [&lt;AutoOpen&gt;] module, a module abbreviation,
+        /// a module-level do, an attribute declaration, a hash directive, or a custom operation whose name is unknown.
+        /// #nowarn and #warnon are not declarations: lexing turns them into warning scopes by position, and FinishFile
+        /// filters every declaration's diagnostics with the scopes of the parse it is given, so they need no dependency.
+        AffectsAllLater: bool
+        /// The names, as written, of the types the declaration augments (`type T with ...`; a group `type A with ... and
+        /// B with ...` augments both), sorted; empty for anything else. Checking an intrinsic augmentation adds its
+        /// members to T's entity, which T's result holds, so T's declaration and its augmentations re-check together,
+        /// T first, whenever any of them re-checks: re-checking T gives a new entity, which only the augmentations
+        /// checked after it extend.
+        Augments: string[]
+    }
 
 /// A top-level declaration of an implementation file, or a declaration of a non-recursive nested module, or the
 /// header of such a module (its attributes and name, which the module's declarations are checked inside).
@@ -123,9 +131,12 @@ type ParsedDeclaration
     /// a new entity, the parent of its declarations' values, so every declaration under it must be checked again:
     /// an edge from the header to them with no fingerprint cutoff.
     member _.Within = within
+
     /// Whether checking this declaration reads the same syntax as checking the other: same Text and HeaderInputs.
     member _.IsUnchangedFrom(other: ParsedDeclaration) =
-        String.Equals(text, other.Text, StringComparison.Ordinal) && String.Equals(headerInputs, other.HeaderInputs, StringComparison.Ordinal)
+        String.Equals(text, other.Text, StringComparison.Ordinal)
+        && String.Equals(headerInputs, other.HeaderInputs, StringComparison.Ordinal)
+
     /// The whole declaration; for a module header, the whole module.
     member internal _.Syntax = decl
     /// The range the declaration's definitions are in scope for, as TcModuleOrNamespaceElementsNonMutRec gives it.
@@ -165,15 +176,19 @@ module internal CompilerStateInit =
     let suggestNamesForErrors = true
     let captureIdentifiersWhenParsing = false
 
-    let initializeCompilerStateWith (projectReferences: IProjectReference list) (projectOptions: FSharpProjectOptions) reset =
+    let initializeCompilerStateWith
+        (projectReferences: IProjectReference list)
+        (projectOptions: FSharpProjectOptions)
+        (reset: unit -> unit)
+        =
         async {
             let tcConfig =
                 let tcConfigB =
                     TcConfigBuilder.CreateNew(
-                        SimulatedMSBuildReferenceResolver.getResolver(),
+                        SimulatedMSBuildReferenceResolver.getResolver (),
                         defaultFSharpBinariesDir = FSharpCheckerResultsSettings.defaultFSharpBinariesDir,
                         reduceMemoryUsage = ReduceMemoryFlag.Yes,
-                        implicitIncludeDir = !! Path.GetDirectoryName(projectOptions.ProjectFileName),
+                        implicitIncludeDir = !!Path.GetDirectoryName(projectOptions.ProjectFileName),
                         isInteractive = false,
                         isInvalidationSupported = true,
                         defaultCopyFSharpCore = CopyFSharpCoreFlag.No,
@@ -193,18 +208,25 @@ module internal CompilerStateInit =
             let dependencyProvider = new DependencyProvider()
             let! tcGlobals, tcImports = TcImports.BuildTcImports(tcConfigP, dependencyProvider)
 
+#if !NO_TYPEPROVIDERS
             // Handle type provider invalidation by resetting compiler state
             tcImports.GetCcusExcludingBase()
             |> Seq.iter (fun ccu -> ccu.Deref.InvalidateEvent.Add(fun _ -> reset ()))
+#else
+            ignore reset
+#endif
 
             // The name the build gives the assembly (<AssemblyName>, by -o:): InternalsVisibleTo reads it, and references resolve by it
             let assemblyName =
                 match tcConfig.outputFile with
-                | Some(output: string) -> !! Path.GetFileNameWithoutExtension(output)
-                | None -> !! Path.GetFileNameWithoutExtension(projectOptions.ProjectFileName)
+                | Some(output: string) -> !!Path.GetFileNameWithoutExtension(output)
+                | None -> !!Path.GetFileNameWithoutExtension(projectOptions.ProjectFileName)
 
-            let tcInitial, openDecls0 = GetInitialTcEnv(assemblyName, rangeStartup, tcConfig, tcImports, tcGlobals)
-            let tcInitialState = GetInitialTcState(rangeStartup, assemblyName, tcConfig, tcGlobals, tcImports, tcInitial, openDecls0)
+            let tcInitial, openDecls0 =
+                GetInitialTcEnv(assemblyName, rangeStartup, tcConfig, tcImports, tcGlobals)
+
+            let tcInitialState =
+                GetInitialTcState(rangeStartup, assemblyName, tcConfig, tcGlobals, tcImports, tcInitial, openDecls0)
 
             return
                 {
@@ -228,14 +250,16 @@ module internal CompilerStateInit =
 /// What FileDependencies computed from one parse of every file of the project.
 [<NoEquality; NoComparison>]
 type internal DependencySnapshot =
-    { Parses: FSharpParseFileResults[]
-      Dependencies: int[][]
-      /// The module-name dictionary each file is deduplicated against: every earlier file's entries, as checking the
-      /// whole project gives them
-      ModuleNamesBefore: ModuleNamesDict[]
-      /// The signature files whose implementation file has the same qualified name, both deduplicated: checking the
-      /// implementation file gives it that signature, so a setup can stand the signature in for it
-      MatchedSignatures: HashSet<string> }
+    {
+        Parses: FSharpParseFileResults[]
+        Dependencies: int[][]
+        /// The module-name dictionary each file is deduplicated against: every earlier file's entries, as checking the
+        /// whole project gives them
+        ModuleNamesBefore: ModuleNamesDict[]
+        /// The signature files whose implementation file has the same qualified name, both deduplicated: checking the
+        /// implementation file gives it that signature, so a setup can stand the signature in for it
+        MatchedSignatures: HashSet<string>
+    }
 
 /// A checker state some setup reached: the initial state, with the steps on the path to it applied in order. The state
 /// after one more step is kept while the step's key (the FileSignature it applies) is alive.
@@ -252,14 +276,21 @@ type internal SetupNode(state: TcState) =
 /// compiler state, a lock per file, the setups reached, and the test counter.
 [<Sealed>]
 type internal ProjectChecks(state: CompilerState) =
-    let fileLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
-    let latestParses = System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
+    let fileLocks =
+        System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+
+    let latestParses =
+        System.Collections.Concurrent.ConcurrentDictionary<string, FSharpParseFileResults>(StringComparer.OrdinalIgnoreCase)
+
     let setupRoot = SetupNode state.tcInitialState
     let mutable checkResultsBuilt = 0
 
     let fileIndexes =
         let indexes = Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-        state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+
+        state.projectOptions.SourceFiles
+        |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+
         indexes
 
     member _.State = state
@@ -282,7 +313,8 @@ type internal ProjectChecks(state: CompilerState) =
     /// Held from resetting a file's compiler-generated-name counters through the check that generates its names:
     /// the counters are the project's, by file, so two checks of one file must not interleave there. Checks of
     /// different files do not wait for each other.
-    member _.FileLock(fileName: string) = fileLocks.GetOrAdd(fileName, fun _ -> obj ())
+    member _.FileLock(fileName: string) =
+        fileLocks.GetOrAdd(fileName, fun _ -> obj ())
 
     /// The latest parse Parse made of each file, set while the file's parse lock is held.
     member _.SetLatestParse(parse: FSharpParseFileResults) = latestParses[parse.FileName] <- parse
@@ -300,13 +332,18 @@ type internal ProjectChecks(state: CompilerState) =
 /// A project's options, references and initial checking state.
 [<Sealed>]
 type ProjectContext internal (state: CompilerState) =
-    let parseLocks = System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
+    let parseLocks =
+        System.Collections.Concurrent.ConcurrentDictionary<string, obj>(StringComparer.OrdinalIgnoreCase)
     // Exactly as ErrorsByFile matches a diagnostic's file against the project's files
-    let sourceFiles = HashSet<string>(state.projectOptions.SourceFiles, StringComparer.Ordinal)
+    let sourceFiles =
+        HashSet<string>(state.projectOptions.SourceFiles, StringComparer.Ordinal)
 
     let fileIndexes =
         let indexes = Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-        state.projectOptions.SourceFiles |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+
+        state.projectOptions.SourceFiles
+        |> Array.iteri (fun idx fileName -> indexes[fileName] <- idx)
+
         indexes
 
     let mutable dependencies: DependencySnapshot option = None
@@ -334,7 +371,9 @@ type ProjectContext internal (state: CompilerState) =
 
     /// Held while a file is parsed and its #nowarn scopes, which the parse records in the project's options, are
     /// copied: parses of one file serialize, parses of different files do not.
-    member internal _.ParseLock(fileName: string) = parseLocks.GetOrAdd(fileName, fun _ -> obj ())
+    member internal _.ParseLock(fileName: string) =
+        parseLocks.GetOrAdd(fileName, fun _ -> obj ())
+
     member internal _.IsSourceFile(fileName: string) = sourceFiles.Contains fileName
 
     member internal _.IndexOf(fileName: string) =
@@ -404,13 +443,18 @@ module internal SignatureScope =
             | Measure.One _ -> ()
 
         and typar where scope (tp: Typar) =
-            if tp.Rigidity = TyparRigidity.Rigid && not (scope |> List.exists (fun s -> obj.ReferenceEquals(s, tp))) then
+            if
+                tp.Rigidity = TyparRigidity.Rigid
+                && not (scope |> List.exists (fun s -> obj.ReferenceEquals(s, tp)))
+            then
                 problems.Add $"%s{where}: %s{tp.DisplayName}#%d{tp.Stamp} is out of scope"
 
         and entity where (tcref: TyconRef) =
-            if tcref.IsLocalRef
-               && String.Equals(tcref.Deref.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase)
-               && not (own.Contains tcref.Deref.Stamp) then
+            if
+                tcref.IsLocalRef
+                && String.Equals(tcref.Deref.Range.FileName, fileName, StringComparison.OrdinalIgnoreCase)
+                && not (own.Contains tcref.Deref.Stamp)
+            then
                 problems.Add $"%s{where}: %s{tcref.DisplayName}#%d{tcref.Deref.Stamp} is not the signature's own"
 
         and binders where scope (tps: Typar list) =
@@ -477,13 +521,15 @@ module internal SignatureScope =
     /// The type parameters of every value, in the order the signature holds them
     let typarNames (mty: ModuleOrNamespaceType) : string[] =
         let rec walk (m: ModuleOrNamespaceType) =
-            [ for v in m.AllValsAndMembers do
-                  for tp in v.Typars do
-                      yield $"%s{v.LogicalName}: %s{tp.DisplayName}"
+            [
+                for v in m.AllValsAndMembers do
+                    for tp in v.Typars do
+                        yield $"%s{v.LogicalName}: %s{tp.DisplayName}"
 
-              for e in m.AllEntities do
-                  if e.IsModuleOrNamespace then
-                      yield! walk e.ModuleOrNamespaceType ]
+                for e in m.AllEntities do
+                    if e.IsModuleOrNamespace then
+                        yield! walk e.ModuleOrNamespaceType
+            ]
 
         Array.ofList (walk mty)
 
@@ -519,12 +565,15 @@ type FileSignature
     /// What a signature file's check resolved, as a sink held it: nothing else of the sink is kept
     member internal _.Uses = uses
     /// Semantic classification items captured during signature checking; empty for an implementation file's signature.
-    member _.SemanticClassification : SemanticClassificationItem[] = semanticClassification
+    member _.SemanticClassification: SemanticClassificationItem[] = semanticClassification
     /// The module type the file adds to the checker state, for tests
     member internal _.ModuleType = moduleType
+
     /// For tests: every type variable or entity the signature's types use that it does not itself hold. Empty for a
     /// sound signature, as no print can tell.
-    member _.OutOfScope() = SignatureScope.outOfScope fileName moduleType
+    member _.OutOfScope() =
+        SignatureScope.outOfScope fileName moduleType
+
     /// For tests: the names of the type parameters of the signature's values.
     member _.TyparNames() = SignatureScope.typarNames moduleType
     /// For a signature file: what graph-mode checking's ArtificialImplFile node does, adding the signature's contents
@@ -558,17 +607,19 @@ type internal RawDiagnostics(next: DiagnosticsLogger) =
 /// A non-recursive nested module whose declarations are checked one at a time.
 [<NoEquality; NoComparison>]
 type internal ModuleFrame =
-    { /// None when setting up the module failed, which skips its declarations
-      Entity: ModuleOrNamespace option
-      /// The module declaration's scope in its parent, and its range
-      ScopeRange: range
-      Range: range
-      /// The environment, parent and type names the module's header was checked in
-      OuterEnv: TcEnv
-      OuterParent: ParentRef
-      OuterTypeNames: Set<string>
-      /// What the module's declarations checked so far left, latest first
-      Checked: CheckedDeclaration list }
+    {
+        /// None when setting up the module failed, which skips its declarations
+        Entity: ModuleOrNamespace option
+        /// The module declaration's scope in its parent, and its range
+        ScopeRange: range
+        Range: range
+        /// The environment, parent and type names the module's header was checked in
+        OuterEnv: TcEnv
+        OuterParent: ParentRef
+        OuterTypeNames: Set<string>
+        /// What the module's declarations checked so far left, latest first
+        Checked: CheckedDeclaration list
+    }
 
 /// The environment a declaration is checked in.
 [<Sealed>]
@@ -624,7 +675,9 @@ type internal Leftovers
 
             try
                 try
-                    use _ = UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+                    use _ =
+                        UseTransformedDiagnosticsLogger(fun next -> DeclarationShift.ShiftingLogger(next, s.Diagnostic))
+
                     check ()
                 with e ->
                     match s.Exn e with
@@ -889,7 +942,8 @@ type DeclarationResult
         delta.AllEntities
         |> Seq.exists (fun entity ->
             not entity.IsTypeAbbrev
-            || typedUses |> Array.exists (fun r -> r.Key <> Some declaration.Key && r.File = start.Parse.FileName))
+            || typedUses
+               |> Array.exists (fun r -> r.Key <> Some declaration.Key && r.File = start.Parse.FileName))
 
     /// The inference variables that made this result DependsOnLaterDeclarations, as the check left them: every one that
     /// is open is one of these, and it is empty exactly when the result does not depend on later declarations.
@@ -898,7 +952,8 @@ type DeclarationResult
     /// `OpenTypars`, each with where it comes from. For diagnosing why a result depends on later declarations.
     member _.DescribeOpenTypars() =
         openTypars
-        |> Array.map (fun tp -> $"%s{tp.DisplayName}#%d{tp.Stamp} at %s{tp.Range.FileName}(%d{tp.Range.StartLine},%d{tp.Range.StartColumn}) solved=%b{tp.IsSolved} rigidity=%A{tp.Rigidity}")
+        |> Array.map (fun tp ->
+            $"%s{tp.DisplayName}#%d{tp.Stamp} at %s{tp.Range.FileName}(%d{tp.Range.StartLine},%d{tp.Range.StartColumn}) solved=%b{tp.IsSolved} rigidity=%A{tp.Rigidity}")
 
     /// Whether the check left an inference variable nothing has solved anywhere in what it checked, bodies included.
     /// The finish's defaults solve such a variable, or not when an earlier default in the file fails, so what the
@@ -927,6 +982,7 @@ type DeclarationResult
     member internal _.ShiftedTo
         with get () = shiftedTo
         and set (r: DeclarationResult | null) = shiftedTo <- r
+
     member internal _.CheckTypedUses = typedUses
 
     /// Each entity and value of the project the check's TypedUses went through, with the declaration defining it. A kept
@@ -939,7 +995,13 @@ type DeclarationResult
     member internal _.References = references
     member internal _.Start = start
     member internal _.Declaration = declaration
-    member internal _.Ref = { File = start.Parse.FileName; Key = Some declaration.Key }
+
+    member internal _.Ref =
+        {
+            File = start.Parse.FileName
+            Key = Some declaration.Key
+        }
+
     /// What the check reported, before filtering
     member internal _.RawDiagnostics = rawDiagnostics
     /// The environment at the end of the enclosing scope if this is its last declaration.
@@ -961,7 +1023,8 @@ type DeclarationResult
     /// For tests.
     member _.IsSameDelta(other: DeclarationResult) =
         let same (mine: seq<'T>) (theirs: seq<'T>) =
-            Seq.length mine = Seq.length theirs && Seq.forall2 (fun a b -> obj.ReferenceEquals(a, b)) mine theirs
+            Seq.length mine = Seq.length theirs
+            && Seq.forall2 (fun a b -> obj.ReferenceEquals(a, b)) mine theirs
 
         same delta.AllValsAndMembers other.Delta.AllValsAndMembers
         && same delta.AllEntities other.Delta.AllEntities
@@ -991,6 +1054,7 @@ type FileResult
     /// FinishFile's is the previous finish's object, on the same FileStart, when every final fingerprint and the
     /// file's own fingerprint are unchanged from it.
     member _.Signature = signature
+
     /// Built on first read, holding the file's check lock. CheckFile's are built by checking the file again with a
     /// sink in the setup it was checked in; that build raises InvalidOperationException, then and on every later
     /// read, when the file's line directives are no longer those of the parse it checked: a newer parse of another
@@ -1008,12 +1072,14 @@ type FileResult
             beforeRead ()
 
         checkResults.Value
+
     /// As CheckResults, for a reader that copies out what it needs: CheckFile's are checked again for this read and not
     /// kept, so this result goes on holding only its inputs, unless CheckResults was read first. FinishFile's are CheckResults.
     member this.CheckResultsNotKept =
         match buildAgain with
         | ValueSome build when not checkResults.IsValueCreated -> build ()
         | _ -> this.CheckResults
+
     /// Semantic classifications for the checked file, filtered to `range` when given. FinishFile's merge its sinks
     /// without building or retaining CheckResults; CheckFile's use CheckResultsNotKept unless CheckResults was already built.
     member this.GetSemanticClassification(?range: range) : SemanticClassificationItem[] =
@@ -1025,6 +1091,7 @@ type FileResult
                 beforeRead ()
                 f range
             | ValueNone -> this.CheckResultsNotKept.GetSemanticClassification(range)
+
     /// Stopwatch ticks of each part of the finish, in source order: wait (the locks and undoing the last finish),
     /// refilter, leftovers, envAtEnd, assemble, replay, tail, typedUses, render, fingerprints, signature, sinks. CheckFile's:
     /// setup, tail (the check), definitions, fingerprint, render.
@@ -1043,6 +1110,7 @@ type ProjectAssembly internal (fingerprint: string, data: Lazy<ProjectAssemblyDa
     member _.Fingerprint = fingerprint
     /// Pickled when first read: a referencing project reads it only when the fingerprint has changed.
     member internal _.Data = data.Value
+
     /// Whether a referencing project reads the file at the path instead: a project with type provider generated types.
     /// Pickles the assembly. Such a project is as of its last build.
     member _.ReadsFileOnDisk =
@@ -1053,11 +1121,13 @@ type ProjectAssembly internal (fingerprint: string, data: Lazy<ProjectAssemblyDa
 /// What a finish rendered and fingerprinted for one result.
 [<NoEquality; NoComparison>]
 type internal FinishShare =
-    { Fingerprint: string
-      Diagnostics: FSharpDiagnostic[]
-      ErrorCount: int
-      /// The line the declaration started on: a shifted result reuses the diagnostics only when it has none
-      Line: int }
+    {
+        Fingerprint: string
+        Diagnostics: FSharpDiagnostic[]
+        ErrorCount: int
+        /// The line the declaration started on: a shifted result reuses the diagnostics only when it has none
+        Line: int
+    }
 
 /// What the latest finish of a FileStart computed that the next finish of it may reuse: per result given to it, by
 /// its ShareKey (a shifted result has its check's), for the options and line directives it rendered with; and its
@@ -1089,16 +1159,13 @@ type internal FinishShares
 /// Scope ranges as the current text gives them, by the sink that captured them. `rows` holds each declaration's sink, range
 /// and scope range when it was checked; `current` gives each declaration's range and scope range in the current text.
 type internal ScopesNow
-    (
-        setup: TcResultsSinkImpl,
-        setupEnd: pos,
-        rows: (TcResultsSinkImpl * range * range)[],
-        fileEnd: pos,
-        current: unit -> (range * range)[]
-    ) =
+    (setup: TcResultsSinkImpl, setupEnd: pos, rows: (TcResultsSinkImpl * range * range)[], fileEnd: pos, current: unit -> (range * range)[])
+    =
     let moved =
         lazy
-            (let d = Dictionary<TcResultsSinkImpl, struct (range * range * range * range)>(HashIdentity.Reference)
+            (let d =
+                Dictionary<TcResultsSinkImpl, struct (range * range * range * range)>(HashIdentity.Reference)
+
              let now = current ()
 
              if now.Length = rows.Length then

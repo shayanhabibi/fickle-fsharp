@@ -13,9 +13,6 @@ val answeringDeclarations:
         struct (int[] * int * bool)
 
 val viewResults:
-    start: FileStart ->
-    results: DeclarationResult[] ->
-    parse: FSharpParseFileResults ->
-        FSharpCheckFileResults
+    start: FileStart -> results: DeclarationResult[] -> parse: FSharpParseFileResults -> FSharpCheckFileResults
 
 val finishFile: start: FileStart -> results: DeclarationResult[] -> parse: FSharpParseFileResults -> FileResult

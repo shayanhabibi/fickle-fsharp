@@ -11,8 +11,7 @@ open FSharp.Compiler.Text
 [<AbstractClass; Sealed>]
 type DeclarationChecker =
 
-    static member SymbolKey(symbol: FSharpSymbol) : string option =
-        DeclarationSymbolKeys.symbolKey symbol
+    static member SymbolKey(symbol: FSharpSymbol) : string option = DeclarationSymbolKeys.symbolKey symbol
 
     static member SignatureLocation
         (ctx: ProjectContext, signature: FileSignature, key: string, conformed: bool, ct: CancellationToken)
@@ -28,7 +27,9 @@ type DeclarationChecker =
     static member CreateProject(options: FSharpProjectOptions) : Async<ProjectContext> =
         DeclarationProjectCheck.createProject options
 
-    static member CreateProject(options: FSharpProjectOptions, references: IReadOnlyDictionary<string, ProjectAssembly>) : Async<ProjectContext> =
+    static member CreateProject
+        (options: FSharpProjectOptions, references: IReadOnlyDictionary<string, ProjectAssembly>)
+        : Async<ProjectContext> =
         DeclarationProjectCheck.createProjectWithReferences options references
 
     static member FailingProjectAssembly(message: string) : ProjectAssembly =
@@ -43,11 +44,9 @@ type DeclarationChecker =
     static member CountDeclarations(parse: FSharpParseFileResults) : int =
         DeclarationSyntax.countDeclarations parse
 
-    static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] =
-        DeclarationSyntax.split parse
+    static member Split(parse: FSharpParseFileResults) : ParsedDeclaration[] = DeclarationSyntax.split parse
 
-    static member Content(decl: ParsedDeclaration) : DeclarationContent =
-        DeclarationSyntax.content decl
+    static member Content(decl: ParsedDeclaration) : DeclarationContent = DeclarationSyntax.content decl
 
     static member CheckSignatureFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileSignature =
         DeclarationProjectCheck.checkSignatureFile ctx before parse
@@ -55,7 +54,9 @@ type DeclarationChecker =
     static member AccessPathTexts(signature: FileSignature) : (string * string)[] =
         DeclarationProjectCheck.accessPathTexts signature
 
-    static member BeginFile(ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults) : FileStart * DeclarationEnvironment =
+    static member BeginFile
+        (ctx: ProjectContext, before: FileSignature list, parse: FSharpParseFileResults)
+        : FileStart * DeclarationEnvironment =
         DeclarationProjectCheck.beginFile ctx before parse
 
     static member FileDependencies(ctx: ProjectContext, parses: FSharpParseFileResults[]) : int[][] =
@@ -78,11 +79,9 @@ type DeclarationChecker =
     static member WindowOpen(start: FileStart, results: DeclarationResult[], ct: CancellationToken) : bool =
         DeclarationStep.windowOpen start results ct
 
-    static member PrintsNow(start: FileStart, results: DeclarationResult[]) : string[] =
-        DeclarationStep.printsNow start results
+    static member PrintsNow(start: FileStart, results: DeclarationResult[]) : string[] = DeclarationStep.printsNow start results
 
-    static member Shift(result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption =
-        DeclarationStep.shift result decl
+    static member Shift(result: DeclarationResult, decl: ParsedDeclaration) : DeclarationResult voption = DeclarationStep.shift result decl
 
     static member ExtendEnv(envBefore: DeclarationEnvironment, result: DeclarationResult) : DeclarationEnvironment =
         DeclarationStep.extendEnv envBefore result

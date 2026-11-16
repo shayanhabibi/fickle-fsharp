@@ -50,10 +50,8 @@ type DeclarationKey =
 /// A declaration of the project that a typed use resolves to: the declaration with Key in File.
 /// Key is None for what a signature file declares, which is checked whole: a use of it depends on that file's text.
 type DeclarationRef =
-    {
-        File: string
-        Key: DeclarationKey option
-    }
+    { File: string
+      Key: DeclarationKey option }
 
 /// The names a declaration defines and uses, from its syntax.
 type DeclarationContent =
@@ -90,7 +88,8 @@ type ParsedDeclaration =
         siblings: SynModuleDecl list *
         depth: int *
         isModuleHeader: bool *
-        source: ISourceText -> ParsedDeclaration
+        source: ISourceText ->
+            ParsedDeclaration
 
     member Key: DeclarationKey
     /// The declaration's range; for a module header, from its start to the '=' after the module's name.
@@ -123,32 +122,33 @@ type SupersededLineDirectivesException =
     new: message: string -> SupersededLineDirectivesException
 
 type internal CompilerState =
-    {
-        tcConfig: TcConfig
-        tcGlobals: TcGlobals
-        tcImports: TcImports
-        tcInitialState: TcState
-        projectOptions: FSharpProjectOptions
-    }
+    { tcConfig: TcConfig
+      tcGlobals: TcGlobals
+      tcImports: TcImports
+      tcInitialState: TcState
+      projectOptions: FSharpProjectOptions }
 
 [<AutoOpen>]
 module internal CompilerStateInit =
     val userOpName: string
     val suggestNamesForErrors: bool
     val captureIdentifiersWhenParsing: bool
+
     val initializeCompilerStateWith:
-        projectReferences: IProjectReference list -> projectOptions: FSharpProjectOptions -> reset: (unit -> unit) -> Async<CompilerState>
+        projectReferences: IProjectReference list ->
+        projectOptions: FSharpProjectOptions ->
+        reset: (unit -> unit) ->
+            Async<CompilerState>
+
     val initializeCompilerState: projectOptions: FSharpProjectOptions -> reset: (unit -> unit) -> Async<CompilerState>
     val ResetGeneratedNames: input: ParsedInput * compilerState: CompilerState -> unit
 
 [<NoEquality; NoComparison>]
 type internal DependencySnapshot =
-    {
-        Parses: FSharpParseFileResults[]
-        Dependencies: int[][]
-        ModuleNamesBefore: ModuleNamesDict[]
-        MatchedSignatures: HashSet<string>
-    }
+    { Parses: FSharpParseFileResults[]
+      Dependencies: int[][]
+      ModuleNamesBefore: ModuleNamesDict[]
+      MatchedSignatures: HashSet<string> }
 
 [<Sealed>]
 type internal SetupNode =
@@ -206,7 +206,8 @@ type FileSignature =
         asImplementation: (TcState -> TcState) option *
         failed: bool *
         uses: (struct (Item * ItemOccurrence * range))[] *
-        semanticClassification: SemanticClassificationItem[] -> FileSignature
+        semanticClassification: SemanticClassificationItem[] ->
+            FileSignature
 
     /// What the files after this one see of it, as the file-level SignatureFingerprint describes it.
     member Fingerprint: string
@@ -229,7 +230,8 @@ type FileSignature =
     member Failed: bool
     member internal ArtificialKey: obj
 
-type internal CheckedDeclaration = ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
+type internal CheckedDeclaration =
+    ModuleOrNamespaceContents list * (unit -> unit) list * (AttributeTargets * Attrib) list
 
 type internal RawDiagnostics =
     inherit DiagnosticsLogger
@@ -238,15 +240,13 @@ type internal RawDiagnostics =
 
 [<NoEquality; NoComparison>]
 type internal ModuleFrame =
-    {
-        Entity: ModuleOrNamespace option
-        ScopeRange: range
-        Range: range
-        OuterEnv: TcEnv
-        OuterParent: ParentRef
-        OuterTypeNames: Set<string>
-        Checked: CheckedDeclaration list
-    }
+    { Entity: ModuleOrNamespace option
+      ScopeRange: range
+      Range: range
+      OuterEnv: TcEnv
+      OuterParent: ParentRef
+      OuterTypeNames: Set<string>
+      Checked: CheckedDeclaration list }
 
 /// The environment a declaration is checked in.
 [<Sealed>]
@@ -256,7 +256,8 @@ type DeclarationEnvironment =
         parent: ParentRef *
         typeNames: Set<string> *
         frames: ModuleFrame list *
-        definitions: Map<Stamp, DeclarationRef> -> DeclarationEnvironment
+        definitions: Map<Stamp, DeclarationRef> ->
+            DeclarationEnvironment
 
     member internal Env: TcEnv
     member internal Parent: ParentRef
@@ -286,7 +287,8 @@ type internal Leftovers =
         deferredUnionNullnessChecks: (TType * range) list *
         createsGeneratedProvidedTypes: bool *
         namedDebugPoints: KeyValuePair<NamedDebugPointKey, range>[] *
-        moved: struct (int * range * pos * int) voption -> Leftovers
+        moved: struct (int * range * pos * int) voption ->
+            Leftovers
 
     static member Of: cenv: TcFileState -> Leftovers
     member Apply: into: TcFileState -> unit
@@ -313,7 +315,8 @@ type FileStart =
         scopeContents: ModuleOrNamespaceType *
         sink: TcResultsSinkImpl *
         leftovers: Leftovers *
-        rawDiagnostics: PhasedDiagnostic[] -> FileStart
+        rawDiagnostics: PhasedDiagnostic[] ->
+            FileStart
 
     member internal Context: ProjectContext
     member internal Augmented: AugmentedTypes
@@ -361,7 +364,8 @@ type DeclarationResult =
         heldDefinitions: (Stamp * DeclarationRef)[] *
         references: (DeclarationRef * string list * string)[] *
         shareKey: obj *
-        capturedScope: range -> DeclarationResult
+        capturedScope: range ->
+            DeclarationResult
 
     member Key: DeclarationKey
     member internal ShareKey: obj
@@ -420,7 +424,8 @@ type FileResult =
         topAttrs: TopAttribs *
         beforeRead: (unit -> unit) *
         buildAgain: (unit -> FSharpCheckFileResults) voption *
-        classify: (range option -> SemanticClassificationItem[]) voption -> FileResult
+        classify: (range option -> SemanticClassificationItem[]) voption ->
+            FileResult
 
     member Diagnostics: FSharpDiagnostic[]
     member internal TopAttrs: TopAttribs
@@ -448,12 +453,10 @@ type ProjectAssembly =
 
 [<NoEquality; NoComparison>]
 type internal FinishShare =
-    {
-        Fingerprint: string
-        Diagnostics: FSharpDiagnostic[]
-        ErrorCount: int
-        Line: int
-    }
+    { Fingerprint: string
+      Diagnostics: FSharpDiagnostic[]
+      ErrorCount: int
+      Line: int }
 
 [<Sealed>]
 type internal FinishShares =
@@ -465,7 +468,8 @@ type internal FinishShares =
         fingerprints: string[] *
         signature: FileSignature option *
         envs: (obj * DeclarationEnvironment)[] *
-        exits: TcResultsSinkImpl[] -> FinishShares
+        exits: TcResultsSinkImpl[] ->
+            FinishShares
 
     member Options: FSharpDiagnosticOptions
     member Directives: (int * (int * int)) list
@@ -482,6 +486,7 @@ type internal ScopesNow =
         setupEnd: pos *
         rows: (TcResultsSinkImpl * range * range)[] *
         fileEnd: pos *
-        current: (unit -> (range * range)[]) -> ScopesNow
+        current: (unit -> (range * range)[]) ->
+            ScopesNow
 
     member Of: sink: TcResultsSinkImpl * m: range -> range

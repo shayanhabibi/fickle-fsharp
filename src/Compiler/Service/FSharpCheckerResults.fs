@@ -2589,14 +2589,18 @@ type internal TypeCheckInfo
                 | Some(items, denv, _, m) ->
                     let items =
                         match items with
-                        | [ { Kind = CompletionItemKind.Property } as prop; { Kind = CompletionItemKind.Field }; { Kind = CompletionItemKind.Field } ] ->
-                            [ prop ]
+                        | [ { Kind = CompletionItemKind.Property } as prop
+                            { Kind = CompletionItemKind.Field }
+                            { Kind = CompletionItemKind.Field } ] -> [ prop ]
                         | _ -> items
 
                     // The item FormatItemDescriptionToToolTipElement describes: a group gives one element per overload
                     let rec shown item =
                         match item with
-                        | Item.ImplicitOp(_, { contents = Some(TraitConstraintSln.FSMethSln(vref = vref)) }) -> Item.Value vref
+                        | Item.ImplicitOp(_,
+                                          {
+                                              contents = Some(TraitConstraintSln.FSMethSln(vref = vref))
+                                          }) -> Item.Value vref
                         | Item.SetterArg(_, item) -> shown item
                         | item -> item
 
@@ -2612,7 +2616,9 @@ type internal TypeCheckInfo
                         items
                         |> List.map (fun x ->
                             let symbol = Some(FSharpSymbol.Create(cenv, x.Item))
-                            let element = FormatStructuredDescriptionOfItem false infoReader tcAccessRights m denv x.ItemWithInst symbol width
+
+                            let element =
+                                FormatStructuredDescriptionOfItem false infoReader tcAccessRights m denv x.ItemWithInst symbol width
 
                             match element with
                             | ToolTipElement.Group data ->
@@ -2628,13 +2634,18 @@ type internal TypeCheckInfo
                                     | Item.CtorGroup(_, minfos)
                                     | Item.MethodGroup(_, minfos, _) as group when minfos.Length = data.Length ->
                                         minfos
-                                        |> List.map (fun minfo -> guarded (fun () -> GetDocSourceOfMethInfoItem infoReader scope m group minfo false))
+                                        |> List.map (fun minfo ->
+                                            guarded (fun () -> GetDocSourceOfMethInfoItem infoReader scope m group minfo false))
                                     | _ when data.Length = 1 -> [ guarded (fun () -> GetDocSourceOfItem infoReader scope m x.Item) ]
                                     | _ -> data |> List.map (fun _ -> None)
 
                                 let data =
                                     List.zip data sources
-                                    |> List.map (fun (d, source) -> if source.IsSome then { d with XmlDoc = FSharpXmlDoc.None } else d)
+                                    |> List.map (fun (d, source) ->
+                                        if source.IsSome then
+                                            { d with XmlDoc = FSharpXmlDoc.None }
+                                        else
+                                            d)
 
                                 ToolTipElement.Group data, sources
                             | element -> element, [])

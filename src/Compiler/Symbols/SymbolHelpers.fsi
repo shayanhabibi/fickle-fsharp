@@ -116,11 +116,18 @@ module internal SymbolHelpers =
                 DocScope
 
     /// Where GetXmlCommentForItem's documentation is read from. None when that isn't known.
-    val GetDocSourceOfItem: infoReader: InfoReader -> scope: DocScope -> m: range -> item: Item -> FSharpDocSource option
+    val GetDocSourceOfItem:
+        infoReader: InfoReader -> scope: DocScope -> m: range -> item: Item -> FSharpDocSource option
 
     /// Where GetXmlCommentForMethInfoItem's documentation is read from, `loaded` from an XML file when GetXmlDocFromLoader
     /// is applied to it
     val GetDocSourceOfMethInfoItem:
-        infoReader: InfoReader -> scope: DocScope -> m: range -> d: Item -> minfo: MethInfo -> loaded: bool -> FSharpDocSource option
+        infoReader: InfoReader ->
+        scope: DocScope ->
+        m: range ->
+        d: Item ->
+        minfo: MethInfo ->
+        loaded: bool ->
+            FSharpDocSource option
 
     val FormatTyparMapping: denv: DisplayEnv -> prettyTyparInst: TyparInstantiation -> Layout list

@@ -39,8 +39,8 @@ val applyDefaults:
     g: TcGlobals ->
     scratch: (unit -> TcFileState) ->
     defaults: ModuleOrNamespaceContents * Attribs ->
-    env: TcEnv ->
-        unit
+        env: TcEnv ->
+            unit
 
 val moduleValuesOf: mty: ModuleOrNamespaceType -> seq<Val>
 

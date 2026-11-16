@@ -27,15 +27,22 @@ val diagnosticsWith:
     capturing: CompilationDiagnosticLogger ->
         FSharpDiagnostic[]
 
-val diagnosticsOf: state: CompilerState -> fileName: string -> capturing: CompilationDiagnosticLogger -> FSharpDiagnostic[]
+val diagnosticsOf:
+    state: CompilerState -> fileName: string -> capturing: CompilationDiagnosticLogger -> FSharpDiagnostic[]
 
 val projectDiagnostics: ctx: ProjectContext -> diagnostics: FSharpDiagnostic[] -> FSharpDiagnostic[]
 
 val refiltered: diagnosticsOptions: FSharpDiagnosticOptions -> raw: PhasedDiagnostic[] -> CompilationDiagnosticLogger
 
-val implFingerprint: rootSigOpt: ModuleOrNamespaceType option -> implFileSig: ModuleOrNamespaceType -> topAttrs: TopAttribs -> string
+val implFingerprint:
+    rootSigOpt: ModuleOrNamespaceType option -> implFileSig: ModuleOrNamespaceType -> topAttrs: TopAttribs -> string
 
-val leavingSignatureRanges: checks: ProjectChecks -> parse: FSharpParseFileResults -> rootSigOpt: ModuleOrNamespaceType option -> check: (unit -> 'T) -> 'T
+val leavingSignatureRanges:
+    checks: ProjectChecks ->
+    parse: FSharpParseFileResults ->
+    rootSigOpt: ModuleOrNamespaceType option ->
+    check: (unit -> 'T) ->
+        'T
 
 val compiledNamesOf: state: CompilerState -> resolutions: TcResolutions -> implFileOpt: CheckedImplFile option -> unit
 
@@ -49,7 +56,11 @@ val newCheckerState:
 
 val stampsOf: mty: ModuleOrNamespaceType -> seq<Stamp>
 
-val addDefinitions: definitions: Map<Stamp, DeclarationRef> -> declaration: DeclarationRef -> delta: ModuleOrNamespaceType -> Map<Stamp, DeclarationRef>
+val addDefinitions:
+    definitions: Map<Stamp, DeclarationRef> ->
+    declaration: DeclarationRef ->
+    delta: ModuleOrNamespaceType ->
+        Map<Stamp, DeclarationRef>
 
 val copiedDefinitions:
     own: Map<Stamp, DeclarationRef> ->
@@ -73,16 +84,27 @@ val failedFileSignature: fileName: string -> moduleNamesDict: ModuleNamesDict ->
 
 val createProject: options: FSharpProjectOptions -> Async<ProjectContext>
 
-val createProjectWithReferences: options: FSharpProjectOptions -> references: IReadOnlyDictionary<string, ProjectAssembly> -> Async<ProjectContext>
+val createProjectWithReferences:
+    options: FSharpProjectOptions -> references: IReadOnlyDictionary<string, ProjectAssembly> -> Async<ProjectContext>
 
 val failingProjectAssembly: message: string -> ProjectAssembly
 
 val projectAssembly: ctx: ProjectContext -> files: FileResult list -> signatures: FileSignature list -> ProjectAssembly
 
-val checkSignatureFile: ctx: ProjectContext -> before: FileSignature list -> parse: FSharpParseFileResults -> FileSignature
+val checkSignatureFile:
+    ctx: ProjectContext -> before: FileSignature list -> parse: FSharpParseFileResults -> FileSignature
 
 val accessPathTexts: signature: FileSignature -> (string * string)[]
 
-val beginFile: ctx: ProjectContext -> before: FileSignature list -> parse: FSharpParseFileResults -> FileStart * DeclarationEnvironment
+val beginFile:
+    ctx: ProjectContext ->
+    before: FileSignature list ->
+    parse: FSharpParseFileResults ->
+        FileStart * DeclarationEnvironment
 
-val checkFile: ctx: ProjectContext -> before: FileSignature list -> parse: FSharpParseFileResults -> fingerprint: bool option -> FileResult
+val checkFile:
+    ctx: ProjectContext ->
+    before: FileSignature list ->
+    parse: FSharpParseFileResults ->
+    fingerprint: bool option ->
+        FileResult

@@ -19,22 +19,29 @@ type DeclarationChecker =
     static member SymbolKey: symbol: FSharpSymbol -> string option
 
     /// The range in a signature file of what `key` names, read from this check of it.
-    static member SignatureLocation: ctx: ProjectContext * signature: FileSignature * key: string * conformed: bool * ct: CancellationToken -> range option
+    static member SignatureLocation:
+        ctx: ProjectContext * signature: FileSignature * key: string * conformed: bool * ct: CancellationToken ->
+            range option
 
     /// What a signature file's check resolved: each range, whether it defines, and the symbol.
-    static member SignatureUses: ctx: ProjectContext * signature: FileSignature -> (struct (range * bool * FSharpSymbol))[]
+    static member SignatureUses:
+        ctx: ProjectContext * signature: FileSignature -> (struct (range * bool * FSharpSymbol))[]
 
     /// The location of the definition of what `key` names in a file's check results.
-    static member DefinitionLocation: check: FSharpCheckFileResults * key: string * ct: CancellationToken -> range option
+    static member DefinitionLocation:
+        check: FSharpCheckFileResults * key: string * ct: CancellationToken -> range option
 
     static member CreateProject: options: FSharpProjectOptions -> Async<ProjectContext>
 
     /// A project context in which each `-r:` whose path is a key of `references` is that project's in-memory assembly.
-    static member CreateProject: options: FSharpProjectOptions * references: IReadOnlyDictionary<string, ProjectAssembly> -> Async<ProjectContext>
+    static member CreateProject:
+        options: FSharpProjectOptions * references: IReadOnlyDictionary<string, ProjectAssembly> ->
+            Async<ProjectContext>
 
     static member FailingProjectAssembly: message: string -> ProjectAssembly
 
-    static member ProjectAssembly: ctx: ProjectContext * files: FileResult list * signatures: FileSignature list -> ProjectAssembly
+    static member ProjectAssembly:
+        ctx: ProjectContext * files: FileResult list * signatures: FileSignature list -> ProjectAssembly
 
     static member Parse: ctx: ProjectContext * fileName: string * source: string -> FSharpParseFileResults
 
@@ -44,19 +51,26 @@ type DeclarationChecker =
 
     static member Content: decl: ParsedDeclaration -> DeclarationContent
 
-    static member CheckSignatureFile: ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults -> FileSignature
+    static member CheckSignatureFile:
+        ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults -> FileSignature
 
     static member AccessPathTexts: signature: FileSignature -> (string * string)[]
 
-    static member BeginFile: ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults -> FileStart * DeclarationEnvironment
+    static member BeginFile:
+        ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults ->
+            FileStart * DeclarationEnvironment
 
     static member FileDependencies: ctx: ProjectContext * parses: FSharpParseFileResults[] -> int[][]
 
-    static member CheckFile: ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults * ?fingerprint: bool -> FileResult
+    static member CheckFile:
+        ctx: ProjectContext * before: FileSignature list * parse: FSharpParseFileResults * ?fingerprint: bool ->
+            FileResult
 
     static member AfterUndoHook: (string -> unit) with get, set
 
-    static member CheckDeclaration: start: FileStart * envBefore: DeclarationEnvironment * decl: ParsedDeclaration * ct: CancellationToken -> DeclarationResult
+    static member CheckDeclaration:
+        start: FileStart * envBefore: DeclarationEnvironment * decl: ParsedDeclaration * ct: CancellationToken ->
+            DeclarationResult
 
     static member WindowOpen: start: FileStart * results: DeclarationResult[] * ct: CancellationToken -> bool
 
@@ -66,12 +80,19 @@ type DeclarationChecker =
 
     static member ExtendEnv: envBefore: DeclarationEnvironment * result: DeclarationResult -> DeclarationEnvironment
 
-    static member ExtendEnvAdHoc: envBefore: DeclarationEnvironment * result: DeclarationResult -> DeclarationEnvironment
+    static member ExtendEnvAdHoc:
+        envBefore: DeclarationEnvironment * result: DeclarationResult -> DeclarationEnvironment
 
-    static member CheckDeclarationAdHoc: start: FileStart * envBefore: DeclarationEnvironment * decl: ParsedDeclaration * ct: CancellationToken -> DeclarationResult
+    static member CheckDeclarationAdHoc:
+        start: FileStart * envBefore: DeclarationEnvironment * decl: ParsedDeclaration * ct: CancellationToken ->
+            DeclarationResult
 
-    static member AnsweringDeclarations: start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults * line: int * column: int -> struct (int[] * int * bool)
+    static member AnsweringDeclarations:
+        start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults * line: int * column: int ->
+            struct (int[] * int * bool)
 
-    static member ViewResults: start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults -> FSharpCheckFileResults
+    static member ViewResults:
+        start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults -> FSharpCheckFileResults
 
-    static member FinishFile: start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults -> FileResult
+    static member FinishFile:
+        start: FileStart * results: DeclarationResult[] * parse: FSharpParseFileResults -> FileResult

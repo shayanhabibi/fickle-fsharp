@@ -9,7 +9,13 @@ open FSharp.Compiler.Text
 
 val symbolKey: symbol: FSharpSymbol -> string option
 
-val signatureLocation: ctx: ProjectContext -> signature: FileSignature -> key: string -> conformed: bool -> ct: CancellationToken -> range option
+val signatureLocation:
+    ctx: ProjectContext ->
+    signature: FileSignature ->
+    key: string ->
+    conformed: bool ->
+    ct: CancellationToken ->
+        range option
 
 val signatureUses: ctx: ProjectContext -> signature: FileSignature -> (struct (range * bool * FSharpSymbol))[]
 

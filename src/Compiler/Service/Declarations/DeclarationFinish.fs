@@ -36,11 +36,13 @@ open FSharp.Compiler.TypedTreeOps
 /// A module or namespace being built from results at finish.
 [<NoEquality; NoComparison>]
 type private Level =
-    { /// None for the file's scope
-      Frame: ModuleFrame option
-      mutable Contents: ModuleOrNamespaceType
-      Checked: ResizeArray<CheckedDeclaration>
-      mutable EnvAtEnd: TcEnv }
+    {
+        /// None for the file's scope
+        Frame: ModuleFrame option
+        mutable Contents: ModuleOrNamespaceType
+        Checked: ResizeArray<CheckedDeclaration>
+        mutable EnvAtEnd: TcEnv
+    }
 
 /// Builds the scope's contents, checked declarations and environment at its end from the results in order,
 /// finishing each nested module after its declarations, as checking the file whole does.
@@ -52,10 +54,12 @@ let private assemble
     (exits: TcResultsSinkImpl[])
     =
     let root =
-        { Frame = None
-          Contents = scopeContents
-          Checked = ResizeArray()
-          EnvAtEnd = scopeEnv }
+        {
+            Frame = None
+            Contents = scopeContents
+            Checked = ResizeArray()
+            EnvAtEnd = scopeEnv
+        }
 
     let levels = Stack<Level>()
     levels.Push root
@@ -68,10 +72,21 @@ let private assemble
 
         match level.Frame with
         | Some({ Entity = Some entity } as frame) ->
-            let outerEnv = { frame.OuterEnv with eModuleOrNamespaceTypeAccumulator = ref parent.Contents }
+            let outerEnv =
+                { frame.OuterEnv with
+                    eModuleOrNamespaceTypeAccumulator = ref parent.Contents
+                }
 
             let checkedDecl, _, envAtEnd =
-                ExitNestedModuleDeclarations cenv frame.ScopeRange outerEnv frame.Range entity level.Contents (List.ofSeq level.Checked) level.EnvAtEnd
+                ExitNestedModuleDeclarations
+                    cenv
+                    frame.ScopeRange
+                    outerEnv
+                    frame.Range
+                    entity
+                    level.Contents
+                    (List.ofSeq level.Checked)
+                    level.EnvAtEnd
 
             parent.Contents <- outerEnv.eModuleOrNamespaceTypeAccumulator.Value
             parent.Checked.Add checkedDecl
@@ -95,10 +110,12 @@ let private assemble
                 | None -> ModuleOrNamespaceKind.ModuleOrType
 
             levels.Push
-                { Frame = Some frame
-                  Contents = Construct.NewEmptyModuleOrNamespaceType kind
-                  Checked = ResizeArray()
-                  EnvAtEnd = frame.OuterEnv }
+                {
+                    Frame = Some frame
+                    Contents = Construct.NewEmptyModuleOrNamespaceType kind
+                    Checked = ResizeArray()
+                    EnvAtEnd = frame.OuterEnv
+                }
         | InModules _ ->
             let level = levels.Peek()
             level.Contents <- DeclarationStep.mergeDelta level.Contents result.Delta result.DeltaCombines
@@ -131,17 +148,23 @@ let private mergeSinks (g: TcGlobals) (scopes: ScopesNow) (sinks: TcResultsSinkI
             ResizeArray(
                 sinks
                 |> Seq.collect (fun sink ->
-                    sink.GetResolutions().CapturedEnvs |> Seq.map (fun (m, nenv, ad) -> scopes.Of(sink, m), nenv, ad))
+                    sink.GetResolutions().CapturedEnvs
+                    |> Seq.map (fun (m, nenv, ad) -> scopes.Of(sink, m), nenv, ad))
             ),
             all (fun r -> r.CapturedExpressionTypings),
             // What a shifted declaration copied from others, as it is now (DeclarationShift.currentItems)
-            ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentItems),
+            ResizeArray(
+                all (fun r -> r.CapturedNameResolutions)
+                |> Seq.map DeclarationShift.currentItems
+            ),
             all (fun r -> r.CapturedMethodGroupResolutions),
             all (fun r -> r.CapturedRelatedSymbolUses)
         )
 
     let formatSpecifierLocations =
-        sinks |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations()) |> Array.ofSeq
+        sinks
+        |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations())
+        |> Array.ofSeq
 
     let symbolUses =
         TcSymbolUses(g, resolutions.CapturedNameResolutions, resolutions.CapturedRelatedSymbolUses, formatSpecifierLocations)
@@ -164,13 +187,18 @@ let private mergeForClassification (sinks: TcResultsSinkImpl list) =
         TcResolutions(
             ResizeArray 0,
             ResizeArray 0,
-            ResizeArray(all (fun r -> r.CapturedNameResolutions) |> Seq.map DeclarationShift.currentItems),
+            ResizeArray(
+                all (fun r -> r.CapturedNameResolutions)
+                |> Seq.map DeclarationShift.currentItems
+            ),
             ResizeArray 0,
             all (fun r -> r.CapturedRelatedSymbolUses)
         )
 
     let formatSpecifierLocations =
-        sinks |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations()) |> Array.ofSeq
+        sinks
+        |> Seq.collect (fun sink -> sink.GetFormatSpecifierLocations())
+        |> Array.ofSeq
 
     resolutions, formatSpecifierLocations
 
@@ -200,13 +228,24 @@ let private conformFile
     try
         try
             use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
-            let implSpec = wrapModuleOrNamespaceType qualNameOfFile.Id (compPathOfCcu ccu) implTy
+
+            let implSpec =
+                wrapModuleOrNamespaceType qualNameOfFile.Id (compPathOfCcu ccu) implTy
 
             if SignatureConformance.CheckNamesOfModuleOrNamespace denv infoReader (mkLocalTyconRef implSpec) rootSig then
-                let remapInfo, _ = ComputeRemappingFromInferredSignatureToExplicitSignature g implTy rootSig
-                let aenv = { TypeEquivEnv.EmptyWithNullChecks g with EquivTycons = TyconRefMap.OfList remapInfo.RepackagedEntities }
+                let remapInfo, _ =
+                    ComputeRemappingFromInferredSignatureToExplicitSignature g implTy rootSig
 
-                SignatureConformance.Checker(g, amap, denv, remapInfo, true).CheckSignature aenv infoReader (mkLocalModuleRef implSpec) rootSig
+                let aenv =
+                    { TypeEquivEnv.EmptyWithNullChecks g with
+                        EquivTycons = TyconRefMap.OfList remapInfo.RepackagedEntities
+                    }
+
+                SignatureConformance.Checker(g, amap, denv, remapInfo, true).CheckSignature
+                    aenv
+                    infoReader
+                    (mkLocalModuleRef implSpec)
+                    rootSig
                 |> ignore
         with RecoverableException _ ->
             ()
@@ -265,13 +304,15 @@ let private exitSinks (g: TcGlobals) (results: DeclarationResult[]) =
 
 /// The sinks of a file's check as a full check reports to them: leaving a module, then the next declaration.
 let private inOrder (setup: TcResultsSinkImpl) (results: DeclarationResult[]) (exits: TcResultsSinkImpl[]) =
-    [ yield setup
+    [
+        yield setup
 
-      for i in 0 .. results.Length - 1 do
-          yield exits[i]
-          yield results[i].Sink
+        for i in 0 .. results.Length - 1 do
+            yield exits[i]
+            yield results[i].Sink
 
-      yield exits[results.Length] ]
+        yield exits[results.Length]
+    ]
 
 /// The environment after `results`, folded from BeginFile's with ExtendEnv, and the environment after each. The
 /// results at the start of `known` keep theirs: a shifted result has its check's ShareKey and holds what it holds. A
@@ -290,7 +331,11 @@ let private assembleEnvAtEnd
     for i in 0 .. results.Length - 1 do
         let result = results[i]
 
-        if reusing && i < known.Length && obj.ReferenceEquals(fst known[i], result.ShareKey) then
+        if
+            reusing
+            && i < known.Length
+            && obj.ReferenceEquals(fst known[i], result.ShareKey)
+        then
             env <- snd known[i]
         else
             reusing <- false
@@ -304,7 +349,9 @@ let private assembleEnvAtEnd
         envs[i] <- result.ShareKey, env
 
     match exits with
-    | ValueSome exits -> DeclarationStep.exitModulesInto exits[results.Length] start.Context.State start env 0 |> ignore
+    | ValueSome exits ->
+        DeclarationStep.exitModulesInto exits[results.Length] start.Context.State start env 0
+        |> ignore
     | ValueNone -> ()
 
     let atEnd =
@@ -344,16 +391,20 @@ let answeringDeclarations
         | _ -> exitSinks start.Context.State.tcGlobals results
 
     let captured =
-        [| let of' (i: int) (sink: TcResultsSinkImpl) =
-               [| for (m, nenv, _) in sink.GetResolutions().CapturedEnvs -> i, scopes.Of(sink, m), nenv |]
+        [|
+            let of' (i: int) (sink: TcResultsSinkImpl) =
+                [|
+                    for (m, nenv, _) in sink.GetResolutions().CapturedEnvs -> i, scopes.Of(sink, m), nenv
+                |]
 
-           yield! of' setup start.Sink
+            yield! of' setup start.Sink
 
-           for i in 0 .. results.Length - 1 do
-               yield! of' (exitBase + i) exits[i]
-               yield! of' i results[i].Sink
+            for i in 0 .. results.Length - 1 do
+                yield! of' (exitBase + i) exits[i]
+                yield! of' i results[i].Sink
 
-           yield! of' (exitBase + results.Length) exits[results.Length] |]
+            yield! of' (exitBase + results.Length) exits[results.Length]
+        |]
 
     let mutable around = ValueNone
 
@@ -377,23 +428,35 @@ let answeringDeclarations
                 | ValueSome(_, right: range) when
                     not (
                         FSharp.Compiler.Text.Position.posGt m.End right.End
-                        || (FSharp.Compiler.Text.Position.posEq m.End right.End && FSharp.Compiler.Text.Position.posGt m.Start right.Start)
+                        || (FSharp.Compiler.Text.Position.posEq m.End right.End
+                            && FSharp.Compiler.Text.Position.posGt m.Start right.Start)
                     )
                     ->
                     ()
                 | _ -> before <- ValueSome(i, m)
 
     let found =
-        [ match around with
-          | ValueSome(i, _) -> yield i
-          | ValueNone -> ()
+        [
+            match around with
+            | ValueSome(i, _) -> yield i
+            | ValueNone -> ()
 
-          match before with
-          | ValueSome(i, _) -> yield i
-          | ValueNone -> () ]
+            match before with
+            | ValueSome(i, _) -> yield i
+            | ValueNone -> ()
+        ]
 
-    let rows = found |> List.filter (fun i -> i >= 0 && i < exitBase) |> List.distinct |> Array.ofList
-    let exit = found |> List.filter (fun i -> i >= exitBase) |> List.fold (fun acc i -> max acc (i - exitBase)) -1
+    let rows =
+        found
+        |> List.filter (fun i -> i >= 0 && i < exitBase)
+        |> List.distinct
+        |> Array.ofList
+
+    let exit =
+        found
+        |> List.filter (fun i -> i >= exitBase)
+        |> List.fold (fun acc i -> max acc (i - exitBase)) -1
+
     struct (rows, exit, found.IsEmpty)
 
 let viewResults (start: FileStart) (results: DeclarationResult[]) (parse: FSharpParseFileResults) : FSharpCheckFileResults =
@@ -408,7 +471,12 @@ let viewResults (start: FileStart) (results: DeclarationResult[]) (parse: FSharp
             // As a full check's queries see them, after the file's defaults: these results are this view's alone
             let scratch () =
                 let scratch, _, _ =
-                    DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+                    DeclarationProjectCheck.newCheckerState
+                        state
+                        start.TcState
+                        start.RootSigOpt
+                        start.File
+                        (TcResultsSinkImpl state.tcGlobals)
 
                 scratch
 
@@ -418,10 +486,12 @@ let viewResults (start: FileStart) (results: DeclarationResult[]) (parse: FSharp
                     DeclarationStep.applyDefaults state.tcGlobals scratch (TMDefs contents, List.map snd attribs) result.EnvAfter.Env
 
             let modules =
-                [ for result in results do
-                      match result.Nesting with
-                      | ModuleHeader(_, { Entity = Some entity }) -> entity
-                      | _ -> () ]
+                [
+                    for result in results do
+                        match result.Nesting with
+                        | ModuleHeader(_, { Entity = Some entity }) -> entity
+                        | _ -> ()
+                ]
 
             // The whole fold: what the finish's leaving a module reported holds names as they were at the module's header
             let exits = exitSinks state.tcGlobals results
@@ -491,7 +561,11 @@ let private finish
 
     let known =
         match last with
-        | Some last when DeclarationSyntax.sameWarnOptions last.Options options && last.Directives = directives -> Some last.Shares
+        | Some last when
+            DeclarationSyntax.sameWarnOptions last.Options options
+            && last.Directives = directives
+            ->
+            Some last.Shares
         | _ -> None
 
     let shares =
@@ -507,7 +581,8 @@ let private finish
 
     // With the parse's #nowarn scopes, which an added or removed #nowarn changes without changing any declaration.
     // Rendered after the tail, as a full check renders them, so their types show what the defaults solved.
-    let startDiagnostics = DeclarationProjectCheck.refiltered options start.RawDiagnostics
+    let startDiagnostics =
+        DeclarationProjectCheck.refiltered options start.RawDiagnostics
 
     let refilteredResults =
         Array.map2
@@ -524,14 +599,21 @@ let private finish
         | _, ValueSome capturing -> capturing.ErrorCount
         | ValueNone, ValueNone -> 0
 
-    let earlierErrors = startDiagnostics.ErrorCount + Array.sum (Array.init results.Length errorCountOf)
+    let earlierErrors =
+        startDiagnostics.ErrorCount + Array.sum (Array.init results.Length errorCountOf)
+
     endPhase "refilter"
 
     let capturing, logger = DeclarationProjectCheck.newLoggersWith options
     use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
     use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
-    let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
-    let cenv, envFile, moduleTyAcc = DeclarationProjectCheck.newCheckerState state tcState start.RootSigOpt file sink
+
+    let sink =
+        TcResultsSinkImpl(state.tcGlobals, ?sourceText = DeclarationSyntax.sourceOf parse)
+
+    let cenv, envFile, moduleTyAcc =
+        DeclarationProjectCheck.newCheckerState state tcState start.RootSigOpt file sink
+
     start.Leftovers.Apply cenv
 
     for result in results do
@@ -543,7 +625,13 @@ let private finish
 
     // Before the assembly below, which gives the modules their types: replaying leaves modules too
     let envAtEndNow, envs =
-        assembleEnvAtEnd start results (match last with Some last -> last.Envs | None -> [||]) ValueNone
+        assembleEnvAtEnd
+            start
+            results
+            (match last with
+             | Some last -> last.Envs
+             | None -> [||])
+            ValueNone
 
     endPhase "envAtEnd"
 
@@ -551,7 +639,10 @@ let private finish
         assemble cenv start.ScopeContents start.Scope.Env results exits
 
     endPhase "assemble"
-    let checkForErrors () = parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
+
+    let checkForErrors () =
+        parse.ParseHadErrors || earlierErrors > 0 || logger.ErrorCount > 0
+
     replayReferences start.Parse.FileName results
     endPhase "replay"
 
@@ -569,7 +660,14 @@ let private finish
             DeclarationProjectCheck.leavingSignatureRanges start.Context.Checks parse start.RootSigOpt (fun () ->
                 try
                     let fileContents =
-                        ExitImplFileDeclarations cenv envFile tcState.ImplicitOpenDeclarations start.Scope scopeContents compiledDefs envAtEnd
+                        ExitImplFileDeclarations
+                            cenv
+                            envFile
+                            tcState.ImplicitOpenDeclarations
+                            start.Scope
+                            scopeContents
+                            compiledDefs
+                            envAtEnd
 
                     Some(CheckImplFileTail cenv checkForErrors tcState.TcEnvFromImpls start.RootSigOpt file moduleTyAcc fileContents)
                 with RecoverableException exn ->
@@ -598,10 +696,12 @@ let private finish
 
     let diagnostics =
         Array.concat
-            [ yield parse.Diagnostics
-              yield DeclarationProjectCheck.diagnosticsWith state options parse.FileName startDiagnostics
-              yield! rendered
-              yield DeclarationProjectCheck.diagnosticsWith state options parse.FileName capturing ]
+            [
+                yield parse.Diagnostics
+                yield DeclarationProjectCheck.diagnosticsWith state options parse.FileName startDiagnostics
+                yield! rendered
+                yield DeclarationProjectCheck.diagnosticsWith state options parse.FileName capturing
+            ]
         |> DeclarationProjectCheck.projectDiagnostics start.Context
 
     endPhase "render"
@@ -616,7 +716,10 @@ let private finish
             | ValueSome share -> share.Fingerprint
             | ValueNone ->
                 let result = results[i]
-                DeclarationStep.finishedFingerprint result.AtCheck (DeclarationStep.fingerprintOf result.Delta result.Checked result.SlotsAtCheck))
+
+                DeclarationStep.finishedFingerprint
+                    result.AtCheck
+                    (DeclarationStep.fingerprintOf result.Delta result.Checked result.SlotsAtCheck))
 
     let fingerprints = Dictionary<DeclarationKey, string>(HashIdentity.Structural)
 
@@ -629,17 +732,25 @@ let private finish
     let signature, ownSigForFile, tcEnvAtEnd, implFileOpt =
         match tail with
         | Some(topAttrs, implFile, _, createsGeneratedProvidedTypes, ownSigForFile) ->
-            let fingerprint = DeclarationProjectCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs
+            let fingerprint =
+                DeclarationProjectCheck.implFingerprint start.RootSigOpt implFile.Signature topAttrs
+
             let describable (print: string) = not (print.StartsWith "?")
 
             let unchanged =
-                match last |> Option.bind (fun last -> last.Signature |> Option.map (fun s -> last, s)) with
+                match
+                    last
+                    |> Option.bind (fun last -> last.Signature |> Option.map (fun s -> last, s))
+                with
                 | Some(last, previous) when
                     not createsGeneratedProvidedTypes
                     && describable fingerprint
                     && String.Equals(previous.Fingerprint, fingerprint, StringComparison.Ordinal)
                     && last.Keys = keys
-                    && Array.forall2 (fun (a: string) b -> describable a && String.Equals(a, b, StringComparison.Ordinal)) last.Fingerprints finalPrints
+                    && Array.forall2
+                        (fun (a: string) b -> describable a && String.Equals(a, b, StringComparison.Ordinal))
+                        last.Fingerprints
+                        finalPrints
                     ->
                     Some previous
                 | _ -> None
@@ -653,7 +764,10 @@ let private finish
                         match start.RootSigOpt with
                         | Some _ -> Map.empty
                         | None ->
-                            let own = (Map.empty, results) ||> Array.fold (fun acc result -> DeclarationProjectCheck.addDefinitions acc result.Ref result.Delta)
+                            let own =
+                                (Map.empty, results)
+                                ||> Array.fold (fun acc result -> DeclarationProjectCheck.addDefinitions acc result.Ref result.Delta)
+
                             DeclarationProjectCheck.copiedDefinitions own moduleTyAcc.Value implFile.Signature Map.empty
 
                     DeclarationProjectCheck.implFileSignature
@@ -731,7 +845,9 @@ let private finish
                             | later -> later.AddRange log
                         | _ -> ()
 
-                        let resolutions, symbolUses, openDeclarations = mergeSinks state.tcGlobals scopes sinks
+                        let resolutions, symbolUses, openDeclarations =
+                            mergeSinks state.tcGlobals scopes sinks
+
                         DeclarationProjectCheck.compiledNamesOf state resolutions implFileOpt
 
                         let scope =
@@ -762,14 +878,22 @@ let private finish
 
     // A fingerprint that is not describable counts as changed every time, so it is taken again
     for i in 0 .. results.Length - 1 do
-        if not results[i].DependsOnLaterDeclarations && not results[i].LeavesUnsolved && not (finalPrints[i].StartsWith "?") then
+        if
+            not results[i].DependsOnLaterDeclarations
+            && not results[i].LeavesUnsolved
+            && not (finalPrints[i].StartsWith "?")
+        then
             kept[results[i].ShareKey] <-
-                { Fingerprint = finalPrints[i]
-                  Diagnostics = rendered[i]
-                  ErrorCount = errorCountOf i
-                  Line = results[i].Declaration.Range.StartLine }
+                {
+                    Fingerprint = finalPrints[i]
+                    Diagnostics = rendered[i]
+                    ErrorCount = errorCountOf i
+                    Line = results[i].Declaration.Range.StartLine
+                }
 
-    start.LastShares <- FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None), envs, exits)
+    start.LastShares <-
+        FinishShares(options, directives, kept, keys, finalPrints, (if tail.IsSome then Some signature else None), envs, exits)
+
     let reused = shares |> Array.sumBy (fun share -> if share.IsSome then 1 else 0)
     endPhase "sinks"
 
@@ -789,7 +913,19 @@ let private finish
                 let resolutions, formatSpecifiers = mergeForClassification sinks
                 resolutions.GetSemanticClassification(state.tcGlobals, state.tcImports.GetImportMap(), formatSpecifiers, range)))
 
-    FileResult(diagnostics, fingerprints, signature, checkResults, phaseTicks, phaseAllocated, reused, topAttrs, beforeRead, ValueNone, ValueSome classify)
+    FileResult(
+        diagnostics,
+        fingerprints,
+        signature,
+        checkResults,
+        phaseTicks,
+        phaseAllocated,
+        reused,
+        topAttrs,
+        beforeRead,
+        ValueNone,
+        ValueSome classify
+    )
 
 let finishFile (start: FileStart) (results: DeclarationResult[]) (parse: FSharpParseFileResults) : FileResult =
     if not (String.Equals(parse.FileName, start.Parse.FileName, StringComparison.OrdinalIgnoreCase)) then

@@ -36,8 +36,13 @@ open FSharp.Compiler.TypedTreeOps
 let private contribution (before: ModuleOrNamespaceType) (after: ModuleOrNamespaceType) =
     let oldVals = HashSet<Val>(before.AllValsAndMembers, HashIdentity.Reference)
     let oldEntities = HashSet<Entity>(before.AllEntities, HashIdentity.Reference)
-    let vals = after.AllValsAndMembers |> Seq.filter (oldVals.Contains >> not) |> List.ofSeq
-    let entities = after.AllEntities |> Seq.filter (oldEntities.Contains >> not) |> List.ofSeq
+
+    let vals =
+        after.AllValsAndMembers |> Seq.filter (oldVals.Contains >> not) |> List.ofSeq
+
+    let entities =
+        after.AllEntities |> Seq.filter (oldEntities.Contains >> not) |> List.ofSeq
+
     Construct.NewModuleOrNamespaceType after.ModuleOrNamespaceKind entities vals
 
 /// Whether a declaration publishes into the file's contents by combining: a fragment in a namespace does, at its
@@ -47,7 +52,12 @@ let combinesIntoFile (decl: SynModuleDecl) =
     match decl with
     | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = longId; kind = kind)) ->
         // The enclosing namespace path, as EnterNamespaceFragment computes it
-        let path = if kind.IsModule then List.truncate (max 0 (longId.Length - 1)) longId else longId
+        let path =
+            if kind.IsModule then
+                List.truncate (max 0 (longId.Length - 1)) longId
+            else
+                longId
+
         not path.IsEmpty
     | _ -> false
 
@@ -57,31 +67,30 @@ let mergeDelta (acc: ModuleOrNamespaceType) (delta: ModuleOrNamespaceType) (comb
     if combines then
         CombineCcuContentFragments [ acc; delta ]
     else
-        let acc = (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
+        let acc =
+            (acc, delta.AllEntities) ||> Seq.fold (fun acc entity -> acc.AddEntity entity)
+
         (acc, delta.AllValsAndMembers) ||> Seq.fold (fun acc v -> acc.AddVal v)
 
 /// The environment after leaving nested modules until the environment is in only `depth` of them, as the first
 /// declaration after a module is checked in. FinishFile finishes the modules again and reports what that finds,
 /// so what this reports is dropped. It gives each module its contents so far as its type, as FinishFile does.
-let exitModulesInto
-    (exits: TcResultsSinkImpl)
-    (state: CompilerState)
-    (start: FileStart)
-    (envBefore: DeclarationEnvironment)
-    (depth: int)
-    =
+let exitModulesInto (exits: TcResultsSinkImpl) (state: CompilerState) (start: FileStart) (envBefore: DeclarationEnvironment) (depth: int) =
     if envBefore.Frames.Length <= depth then
         envBefore
     else
         use _ = new CompilationGlobalsScope(DiscardErrorsLogger, BuildPhase.TypeCheck)
-        let cenv, _, _ = DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File exits
+
+        let cenv, _, _ =
+            DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File exits
 
         let rec exit (env: DeclarationEnvironment) =
             match env.Frames with
             | frame :: outer when env.Frames.Length > depth ->
                 let outerEnv =
                     { frame.OuterEnv with
-                        eModuleOrNamespaceTypeAccumulator = ref frame.OuterEnv.eModuleOrNamespaceTypeAccumulator.Value }
+                        eModuleOrNamespaceTypeAccumulator = ref frame.OuterEnv.eModuleOrNamespaceTypeAccumulator.Value
+                    }
 
                 let envAfter =
                     match frame.Entity with
@@ -89,7 +98,15 @@ let exitModulesInto
                         let moduleContents = env.Env.eModuleOrNamespaceTypeAccumulator.Value
 
                         let _, envAfter, _ =
-                            ExitNestedModuleDeclarations cenv frame.ScopeRange outerEnv frame.Range entity moduleContents (List.rev frame.Checked) env.Env
+                            ExitNestedModuleDeclarations
+                                cenv
+                                frame.ScopeRange
+                                outerEnv
+                                frame.Range
+                                entity
+                                moduleContents
+                                (List.rev frame.Checked)
+                                env.Env
 
                         envAfter
                     | None -> outerEnv
@@ -117,7 +134,8 @@ let private framesOf (env: DeclarationEnvironment) = env.Frames |> List.choose _
 
 /// The bindings of inline values in a declaration's typed tree, in order.
 let rec private inlineBodies (contents: ModuleOrNamespaceContents) =
-    let ofBinding (TBind(v, body, _)) = if v.ShouldInline then [ v, body ] else []
+    let ofBinding (TBind(v, body, _)) =
+        if v.ShouldInline then [ v, body ] else []
 
     match contents with
     | TMDefs defs -> List.collect inlineBodies defs
@@ -246,7 +264,10 @@ let private openTypars (env: TcEnv) (contribution: ModuleOrNamespaceType) (check
     let found = ResizeArray<Typar>()
 
     let add (typars: Zset<Typar>) =
-        typars |> Zset.iter (fun tp -> if tp.Rigidity <> TyparRigidity.Rigid then found.Add tp)
+        typars
+        |> Zset.iter (fun tp ->
+            if tp.Rigidity <> TyparRigidity.Rigid then
+                found.Add tp)
 
     add (GeneralizationHelpers.ComputeUngeneralizableTypars env)
     add (freeInModuleTy contribution).FreeTypars
@@ -331,7 +352,8 @@ let private asOfDeclaration (start: FileStart) (definitions: Map<Stamp, Declarat
 
     try
         start.Augmented.Iter(fun tycon added ->
-            let later = HashSet<Stamp>(added |> Seq.map _.Stamp |> Seq.filter (definitions.ContainsKey >> not))
+            let later =
+                HashSet<Stamp>(added |> Seq.map _.Stamp |> Seq.filter (definitions.ContainsKey >> not))
 
             if later.Count > 0 then
                 let tcaug = tycon.TypeContents
@@ -355,13 +377,15 @@ let private asOfDeclaration (start: FileStart) (definitions: Map<Stamp, Declarat
 
 /// The types a type is made of, which its equality, comparison and other inferred properties come from.
 let private structureOf (tycon: Tycon) =
-    [ for field in tycon.AllFieldsArray -> field.FormalType
-      if tycon.IsUnionTycon then
-          for case in tycon.UnionCasesArray do
-              for field in case.RecdFieldsArray -> field.FormalType
-      yield! Option.toList tycon.TypeContents.tcaug_super
-      yield! tycon.ImmediateInterfaceTypesOfFSharpTycon
-      yield! Option.toList tycon.TypeAbbrev ]
+    [
+        for field in tycon.AllFieldsArray -> field.FormalType
+        if tycon.IsUnionTycon then
+            for case in tycon.UnionCasesArray do
+                for field in case.RecdFieldsArray -> field.FormalType
+        yield! Option.toList tycon.TypeContents.tcaug_super
+        yield! tycon.ImmediateInterfaceTypesOfFSharpTycon
+        yield! Option.toList tycon.TypeAbbrev
+    ]
 
 /// The declarations other than `self` that define what the declaration's checked contents, the types of what it
 /// publishes and what its sink resolved refer to, closed over the types each type of the project is made of.
@@ -396,7 +420,9 @@ let typedUsesOf
         Zset.iter addTycon ftyvs.FreeTycons
         Zset.iter addVal ftyvs.FreeTraitSolutions
 
-    let addTcref (tcref: TyconRef) = if tcref.IsLocalRef then addTycon tcref.Deref
+    let addTcref (tcref: TyconRef) =
+        if tcref.IsLocalRef then
+            addTycon tcref.Deref
 
     // A type's free entities leave out the units of measure in it, which entity references compare by object as they
     // do any other's
@@ -449,7 +475,9 @@ let typedUsesOf
         addTyvars (freeInType CollectAll ty)
         addUnits ty
 
-    let addVref (vref: ValRef) = if vref.IsLocalRef then addVal vref.Deref
+    let addVref (vref: ValRef) =
+        if vref.IsLocalRef then
+            addVal vref.Deref
 
     let addFreeVars (fvs: FreeVars) =
         Zset.iter addVal fvs.FreeLocals
@@ -490,7 +518,9 @@ let typedUsesOf
             addType einfo.ApparentEnclosingType
             Option.iter addVref einfo.ArbitraryValRef
         | Item.ILField finfo -> addType finfo.ApparentEnclosingType
-        | Item.ImplicitOp(_, sln) -> sln.Value |> Option.iter (fun sln -> addTyvars (accFreeInTraitSln CollectAll sln emptyFreeTyvars))
+        | Item.ImplicitOp(_, sln) ->
+            sln.Value
+            |> Option.iter (fun sln -> addTyvars (accFreeInTraitSln CollectAll sln emptyFreeTyvars))
         | _ -> ()
 
     for c in contents do
@@ -553,9 +583,17 @@ let private checkDeclarationLocked
     // the ambient token, and nothing else sets that one.
     use _ = FSharp.Compiler.Cancellable.UsingToken ct
     let sink = TcResultsSinkImpl(state.tcGlobals, ?sourceText = Some decl.Source)
-    let cenv, _, _ = DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
+
+    let cenv, _, _ =
+        DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File sink
+
     let referenced = ResizeArray<Val>()
-    cenv.recordValueReference <- fun v -> if v.IsModuleBinding then referenced.Add v
+
+    cenv.recordValueReference <-
+        fun v ->
+            if v.IsModuleBinding then
+                referenced.Add v
+
     let envBefore = exitModules state start envBefore decl.Depth
     let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
@@ -571,7 +609,11 @@ let private checkDeclarationLocked
             contentsBefore
 
     let accumulator = ref contentsAtStart
-    let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = accumulator }
+
+    let env =
+        { envBefore.Env with
+            eModuleOrNamespaceTypeAccumulator = accumulator
+        }
 
     // As checking the whole file: nothing in a scope or module whose setup failed is checked
     let checks =
@@ -588,7 +630,9 @@ let private checkDeclarationLocked
     let typeNames =
         match decl.Syntax with
         | SynModuleDecl.NestedModule _ when decl.Depth = 0 ->
-            let scratch, _, _ = DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+            let scratch, _, _ =
+                DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+
             TypeNamesOfDeclarations scratch start.Scope.Env decl.Siblings
         | _ -> envBefore.TypeNames
 
@@ -601,19 +645,22 @@ let private checkDeclarationLocked
                     None
 
             let frame =
-                { Entity = entered |> Option.map (fun (entity, _, _, _) -> entity)
-                  ScopeRange = decl.ScopeRange
-                  Range = decl.Syntax.Range
-                  OuterEnv = env
-                  OuterParent = envBefore.Parent
-                  OuterTypeNames = envBefore.TypeNames
-                  Checked = [] }
+                {
+                    Entity = entered |> Option.map (fun (entity, _, _, _) -> entity)
+                    ScopeRange = decl.ScopeRange
+                    Range = decl.Syntax.Range
+                    OuterEnv = env
+                    OuterParent = envBefore.Parent
+                    OuterTypeNames = envBefore.TypeNames
+                    Checked = []
+                }
 
             let envAfter =
                 match entered with
                 | Some(_, envForModule, parent, typeNames) ->
                     DeclarationEnvironment(envForModule, parent, typeNames, frame :: envBefore.Frames, envBefore.Definitions)
-                | None -> DeclarationEnvironment(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames, envBefore.Definitions)
+                | None ->
+                    DeclarationEnvironment(env, envBefore.Parent, envBefore.TypeNames, frame :: envBefore.Frames, envBefore.Definitions)
 
             // What the header decides about the module (its name, kind, attributes, access), without the contents
             // the module's declarations give it, which FinishFile replaces
@@ -622,7 +669,9 @@ let private checkDeclarationLocked
                 | Some entity ->
                     let header =
                         { entity with
-                            entity_modul_type = MaybeLazy.Strict(Construct.NewEmptyModuleOrNamespaceType entity.ModuleOrNamespaceType.ModuleOrNamespaceKind) }
+                            entity_modul_type =
+                                MaybeLazy.Strict(Construct.NewEmptyModuleOrNamespaceType entity.ModuleOrNamespaceType.ModuleOrNamespaceKind)
+                        }
 
                     Construct.NewModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind [ header ] []
                 | None -> Construct.NewEmptyModuleOrNamespaceType contentsBefore.ModuleOrNamespaceKind
@@ -642,19 +691,38 @@ let private checkDeclarationLocked
 
             let frames =
                 match envBefore.Frames with
-                | frame :: outer -> { frame with Checked = checkedDecl :: frame.Checked } :: outer
+                | frame :: outer ->
+                    { frame with
+                        Checked = checkedDecl :: frame.Checked
+                    }
+                    :: outer
                 | [] -> []
 
             let delta = contribution contentsAtStart accumulator.Value
-            checkedDecl, DeclarationEnvironment(envAfter, envBefore.Parent, envBefore.TypeNames, frames, envBefore.Definitions), envAtEnd, delta, InModules decl.Depth
+
+            checkedDecl,
+            DeclarationEnvironment(envAfter, envBefore.Parent, envBefore.TypeNames, frames, envBefore.Definitions),
+            envAtEnd,
+            delta,
+            InModules decl.Depth
 
     let leavesFreeTypars =
         anySolvable (GeneralizationHelpers.ComputeUngeneralizableTypars envAfter.Env)
 
-    let self = { File = start.Parse.FileName; Key = Some decl.Key }
-    let definitions = DeclarationProjectCheck.addDefinitions envBefore.Definitions self delta
+    let self =
+        {
+            File = start.Parse.FileName
+            Key = Some decl.Key
+        }
+
+    let definitions =
+        DeclarationProjectCheck.addDefinitions envBefore.Definitions self delta
+
     recordAugmentations start delta
-    let envAfter = DeclarationEnvironment(envAfter.Env, envAfter.Parent, envAfter.TypeNames, envAfter.Frames, definitions)
+
+    let envAfter =
+        DeclarationEnvironment(envAfter.Env, envAfter.Parent, envAfter.TypeNames, envAfter.Frames, definitions)
+
     let contents, _, _ = checkedDecl
 
     // By the declaration that defines each and the value's name, never the value: FinishFile finds the value in
@@ -671,11 +739,18 @@ let private checkDeclarationLocked
     let dependsOnLater = leavesFreeTypars || leavesOpenTypes delta checkedDecl
     // Before the fingerprint: collecting the unsolved variables normalizes the solutions of unit-of-measure
     // variables in place (FindUnsolved), as the finish's defaults then find them
-    let leavesUnsolved = leavesFreeTypars || leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl
+    let leavesUnsolved =
+        leavesFreeTypars
+        || leavesUnsolved state envAfter.Env.DisplayEnv delta checkedDecl
 
     let fingerprint, atCheck =
         let _, _, attribs = checkedDecl
-        let defaults = if leavesUnsolved && not dependsOnLater then Some(TMDefs contents, List.map snd attribs) else None
+
+        let defaults =
+            if leavesUnsolved && not dependsOnLater then
+                Some(TMDefs contents, List.map snd attribs)
+            else
+                None
 
         match defaults with
         | Some defaults when not decl.IsModuleHeader && checks ->
@@ -683,7 +758,14 @@ let private checkDeclarationLocked
             let seen = fingerprintOf delta checkedDecl slots
 
             let scratch () =
-                let scratch, _, _ = DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+                let scratch, _, _ =
+                    DeclarationProjectCheck.newCheckerState
+                        state
+                        start.TcState
+                        start.RootSigOpt
+                        start.File
+                        (TcResultsSinkImpl state.tcGlobals)
+
                 scratch
 
             let finished =
@@ -695,7 +777,8 @@ let private checkDeclarationLocked
                 finishedFingerprint (ValueSome seen) finished, ValueSome seen
         | _ -> fingerprintOf delta checkedDecl slots, ValueNone
 
-    let typedUses, heldDefinitions = typedUsesOf definitions self delta contents (Some sink)
+    let typedUses, heldDefinitions =
+        typedUsesOf definitions self delta contents (Some sink)
 
     DeclarationResult(
         start,
@@ -731,7 +814,9 @@ let checkDeclaration
     (ct: CancellationToken)
     : DeclarationResult =
     if decl.Depth > envBefore.Frames.Length then
-        invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+        invalidArg
+            (nameof envBefore)
+            "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
     // The undo and the check under the FileStart's lock, then the file's check lock, as FinishFile and the lazy
     // check results take them: nothing that applies a finish's changes again (building the results applies the
@@ -768,7 +853,9 @@ let printsNow (start: FileStart) (results: DeclarationResult[]) : string[] =
             let state = start.Context.State
             let _, logger = DeclarationProjectCheck.newLoggers state
             use _ = new CompilationGlobalsScope(logger, BuildPhase.TypeCheck)
-            results |> Array.map (fun result -> fingerprintOf result.Delta result.Checked result.SlotsAtCheck)))
+
+            results
+            |> Array.map (fun result -> fingerprintOf result.Delta result.Checked result.SlotsAtCheck)))
 
 let private shiftWith (s: DeclarationShift.Shifter) (result: DeclarationResult) (decl: ParsedDeclaration) : DeclarationResult voption =
     let start = result.Start
@@ -778,7 +865,10 @@ let private shiftWith (s: DeclarationShift.Shifter) (result: DeclarationResult) 
     let sink = s.Sink(state.tcGlobals, result.Sink)
     let contents, actions, attribs = result.Checked
     let contents = List.map s.Contents contents
-    let attribs = attribs |> List.map (fun (targets, attrib) -> targets, s.Attrib attrib)
+
+    let attribs =
+        attribs |> List.map (fun (targets, attrib) -> targets, s.Attrib attrib)
+
     let checkedDecl = contents, actions, attribs
     s.ModuleType result.Delta
 
@@ -792,7 +882,8 @@ let private shiftWith (s: DeclarationShift.Shifter) (result: DeclarationResult) 
             let frame =
                 { frame with
                     ScopeRange = s.Scope frame.ScopeRange
-                    Range = s.Own frame.Range }
+                    Range = s.Own frame.Range
+                }
 
             let frames =
                 match env.Frames with
@@ -803,7 +894,11 @@ let private shiftWith (s: DeclarationShift.Shifter) (result: DeclarationResult) 
         | InModules _ as nesting ->
             let frames =
                 match env.Frames with
-                | frame :: outer when not frame.Checked.IsEmpty -> { frame with Checked = checkedDecl :: frame.Checked.Tail } :: outer
+                | frame :: outer when not frame.Checked.IsEmpty ->
+                    { frame with
+                        Checked = checkedDecl :: frame.Checked.Tail
+                    }
+                    :: outer
                 | frames -> frames
 
             nesting, DeclarationEnvironment(env.Env, env.Parent, env.TypeNames, frames, env.Definitions)
@@ -849,7 +944,9 @@ let private shiftWith (s: DeclarationShift.Shifter) (result: DeclarationResult) 
 
 let private shiftLocked (result: DeclarationResult) (decl: ParsedDeclaration) (delta: int) : DeclarationResult voption =
     let old = result.Declaration
-    let s = DeclarationShift.Shifter(old.Range.FileIndex, old.Range, result.CapturedScope.End, delta, result.ShareKey)
+
+    let s =
+        DeclarationShift.Shifter(old.Range.FileIndex, old.Range, result.CapturedScope.End, delta, result.ShareKey)
 
     // A refused or failed shift restores what it moved in place, so `result` is left as it was
     try
@@ -892,7 +989,10 @@ let private shiftFrom (result: DeclarationResult) (decl: ParsedDeclaration) : De
         lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () -> shiftLocked result decl delta)
 
 let shift (result: DeclarationResult) (decl: ParsedDeclaration) : DeclarationResult voption =
-    if not (decl.IsUnchangedFrom result.Declaration) || decl.Key <> result.Declaration.Key then
+    if
+        not (decl.IsUnchangedFrom result.Declaration)
+        || decl.Key <> result.Declaration.Key
+    then
         ValueNone
     else
         let start = result.Start
@@ -905,7 +1005,10 @@ let shift (result: DeclarationResult) (decl: ParsedDeclaration) : DeclarationRes
 
             let latest = chain[chain.Count - 1]
 
-            if latest.Declaration.Range.Start = decl.Range.Start && not (obj.ReferenceEquals(latest, result)) then
+            if
+                latest.Declaration.Range.Start = decl.Range.Start
+                && not (obj.ReferenceEquals(latest, result))
+            then
                 ValueSome latest
             else
                 match shiftFrom latest decl with
@@ -925,30 +1028,40 @@ let extendEnvLocked (envBefore: DeclarationEnvironment) (result: DeclarationResu
     use _ = FSharp.Compiler.Cancellable.UsingToken CancellationToken.None
     let envBefore = exitModules state start envBefore decl.Depth
     // Its own checker state and sink: resolving an open or a module abbreviation again reports nothing
-    let cenv, _, _ = DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
+    let cenv, _, _ =
+        DeclarationProjectCheck.newCheckerState state start.TcState start.RootSigOpt start.File (TcResultsSinkImpl state.tcGlobals)
 
     let definitions =
         (DeclarationProjectCheck.addDefinitions envBefore.Definitions result.Ref result.Delta, result.HeldDefinitions)
-        ||> Array.fold (fun acc (stamp, declaration) -> if acc.ContainsKey stamp then acc else Map.add stamp declaration acc)
+        ||> Array.fold (fun acc (stamp, declaration) ->
+            if acc.ContainsKey stamp then
+                acc
+            else
+                Map.add stamp declaration acc)
 
     let contentsBefore = envBefore.Env.eModuleOrNamespaceTypeAccumulator.Value
 
     match result.Nesting with
     | ModuleHeader(_, frame) ->
         // As CheckDeclaration for a header: the module is published when it is left, not here
-        let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = ref contentsBefore }
+        let env =
+            { envBefore.Env with
+                eModuleOrNamespaceTypeAccumulator = ref contentsBefore
+            }
 
         let frame =
             { frame with
                 OuterEnv = env
                 OuterParent = envBefore.Parent
                 OuterTypeNames = envBefore.TypeNames
-                Checked = [] }
+                Checked = []
+            }
 
         match frame.Entity with
         | Some entity ->
             // As TcNestedModuleHeader and EnterNestedModuleDeclarations, with the module the header's check made
-            let envForModule, _ = MakeInnerEnv true env entity.Id entity.ModuleOrNamespaceType.ModuleOrNamespaceKind
+            let envForModule, _ =
+                MakeInnerEnv true env entity.Id entity.ModuleOrNamespaceType.ModuleOrNamespaceKind
 
             let moduleDecls =
                 match decl.Syntax with
@@ -967,7 +1080,10 @@ let extendEnvLocked (envBefore: DeclarationEnvironment) (result: DeclarationResu
 
         // Replayed against what the module or namespace held before it, as its check saw it (a recursive
         // fragment reads that), then given what it publishes
-        let env = { envBefore.Env with eModuleOrNamespaceTypeAccumulator = ref contentsBefore }
+        let env =
+            { envBefore.Env with
+                eModuleOrNamespaceTypeAccumulator = ref contentsBefore
+            }
 
         let env =
             if checks then
@@ -976,11 +1092,19 @@ let extendEnvLocked (envBefore: DeclarationEnvironment) (result: DeclarationResu
                 env
 
         let accumulator = ref (mergeDelta contentsBefore result.Delta result.DeltaCombines)
-        let env = { env with eModuleOrNamespaceTypeAccumulator = accumulator }
+
+        let env =
+            { env with
+                eModuleOrNamespaceTypeAccumulator = accumulator
+            }
 
         let frames =
             match envBefore.Frames with
-            | frame :: outer -> { frame with Checked = result.Checked :: frame.Checked } :: outer
+            | frame :: outer ->
+                { frame with
+                    Checked = result.Checked :: frame.Checked
+                }
+                :: outer
             | [] -> []
 
         DeclarationEnvironment(env, envBefore.Parent, envBefore.TypeNames, frames, definitions)
@@ -989,7 +1113,9 @@ let extendEnv (envBefore: DeclarationEnvironment) (result: DeclarationResult) : 
     let decl = result.Declaration
 
     if decl.Depth > envBefore.Frames.Length then
-        invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+        invalidArg
+            (nameof envBefore)
+            "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
     // As CheckDeclaration: nothing applies a finish's changes again while it reads the declaration's items
     lock result.Start.Sync (fun () ->
@@ -998,7 +1124,9 @@ let extendEnv (envBefore: DeclarationEnvironment) (result: DeclarationResult) : 
 
 let extendEnvAdHoc (envBefore: DeclarationEnvironment) (result: DeclarationResult) : DeclarationEnvironment =
     if result.Declaration.Depth > envBefore.Frames.Length then
-        invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+        invalidArg
+            (nameof envBefore)
+            "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
     lock result.Start.Sync (fun () -> keepingModuleTypes (framesOf envBefore) (fun () -> extendEnvLocked envBefore result))
 
@@ -1009,7 +1137,9 @@ let checkDeclarationAdHoc
     (ct: CancellationToken)
     : DeclarationResult =
     if decl.Depth > envBefore.Frames.Length then
-        invalidArg (nameof envBefore) "The environment is outside the declaration's module: it is not the environment after the declaration before it."
+        invalidArg
+            (nameof envBefore)
+            "The environment is outside the declaration's module: it is not the environment after the declaration before it."
 
     lock start.Sync (fun () ->
         lock (start.Context.Checks.FileLock start.Parse.FileName) (fun () ->

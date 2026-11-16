@@ -27,12 +27,16 @@ let sourceOf (parse: FSharpParseFileResults) =
     | _ -> None
 
 /// Each parse's copy of the project's diagnostic options, holding the #nowarn scopes that parse recorded.
-let private warnOptions = ConditionalWeakTable<FSharpParseFileResults, FSharpDiagnosticOptions>()
+let private warnOptions =
+    ConditionalWeakTable<FSharpParseFileResults, FSharpDiagnosticOptions>()
 
 let warnOptionsOf (parse: FSharpParseFileResults) =
     match warnOptions.TryGetValue parse with
     | true, options -> options
-    | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be checked: its #nowarn scopes are the ones it recorded."
+    | _ ->
+        invalidArg
+            (nameof parse)
+            "Only a parse made by DeclarationChecker.Parse can be checked: its #nowarn scopes are the ones it recorded."
 
 /// Whether diagnostics filtered and rendered with one parse's options are those another parse's give: the same
 /// warning options and #nowarn scopes.
@@ -55,7 +59,8 @@ let private currentLineDirectives (fileName: string) =
     LineDirectives.ofFile (FileIndex.fileIndexOfFile fileName)
 
 /// The #line directives of each parse, read right after it, under the file's parse lock.
-let private lineDirectives = ConditionalWeakTable<FSharpParseFileResults, (int * (int * int)) list>()
+let private lineDirectives =
+    ConditionalWeakTable<FSharpParseFileResults, (int * (int * int)) list>()
 
 let lineDirectivesOf (parse: FSharpParseFileResults) =
     match lineDirectives.TryGetValue parse with
@@ -91,6 +96,7 @@ let private textOfRange (source: ISourceText) (m: range) (docRanges: range list)
                 let e = if dr.EndLine = line1 then dr.EndColumn else Int32.MaxValue
                 let c0 = max first (min last s)
                 let c1 = max first (min last e)
+
                 if c0 < c1 then
                     spans.Add(c0, c1)
 
@@ -104,6 +110,7 @@ let private textOfRange (source: ISourceText) (m: range) (docRanges: range list)
             for (s, e) in spans do
                 if s > cur then
                     nonDocs.Add(cur, s)
+
                 cur <- max cur e
 
             if cur < last then
@@ -114,8 +121,19 @@ let private textOfRange (source: ISourceText) (m: range) (docRanges: range list)
     for line in m.StartLine - 1 .. lastLine do
         let line1 = line + 1
         let text = source.GetLineString line
-        let first = if line = m.StartLine - 1 then min m.StartColumn text.Length else 0
-        let last = if line = m.EndLine - 1 then min m.EndColumn text.Length else text.Length
+
+        let first =
+            if line = m.StartLine - 1 then
+                min m.StartColumn text.Length
+            else
+                0
+
+        let last =
+            if line = m.EndLine - 1 then
+                min m.EndColumn text.Length
+            else
+                text.Length
+
         let nonDocs, hasDoc = lineDocSpans line1 first last
 
         if not hasDoc then
@@ -143,6 +161,7 @@ let private docRangesOfDecl (decl: SynModuleDecl) : range list =
     let addDoc (doc: PreXmlDoc) =
         if not doc.IsEmpty then
             let m = doc.Range
+
             if not (Position.posEq m.Start m.End) then
                 docRanges.Add m
 
@@ -328,7 +347,9 @@ let private docRangesOfDecl (decl: SynModuleDecl) : range list =
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(xmlDoc = doc); decls = ds) ->
             addDoc doc
             ds |> List.iter walkDecl
-        | SynModuleDecl.Exception(exnDefn = SynExceptionDefn(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(xmlDoc = caseDoc); xmlDoc = reprDoc); members = ms)) ->
+        | SynModuleDecl.Exception(
+            exnDefn = SynExceptionDefn(
+                exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(xmlDoc = caseDoc); xmlDoc = reprDoc); members = ms)) ->
             addDoc reprDoc
             addDoc caseDoc
             ms |> List.iter walkMember
@@ -373,9 +394,18 @@ let private nameAndKind (decl: SynModuleDecl) =
     match decl with
     | SynModuleDecl.Let(isRecursive = isRec; bindings = binds) ->
         let names = binds |> List.collect (fun (SynBinding(headPat = pat)) -> patNames pat)
-        String.Join(",", names), (if isRec then DeclarationKind.RecGroup else DeclarationKind.Value)
+
+        String.Join(",", names),
+        (if isRec then
+             DeclarationKind.RecGroup
+         else
+             DeclarationKind.Value)
     | SynModuleDecl.Types([ typeDefn ], _) ->
-        typeDefnName typeDefn, (if isAugmentation typeDefn then DeclarationKind.Augmentation else DeclarationKind.Type)
+        typeDefnName typeDefn,
+        (if isAugmentation typeDefn then
+             DeclarationKind.Augmentation
+         else
+             DeclarationKind.Type)
     | SynModuleDecl.Types(typeDefns, _) ->
         (match typeDefns with
          | typeDefn :: _ -> typeDefnName typeDefn
@@ -384,7 +414,11 @@ let private nameAndKind (decl: SynModuleDecl) =
     | SynModuleDecl.Exception(SynExceptionDefn(SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _))), _, _, _), _) ->
         id.idText, DeclarationKind.Exception
     | SynModuleDecl.NestedModule(moduleInfo = info; isRecursive = isRec) ->
-        longIdentText info.LongIdent, (if isRec then DeclarationKind.RecGroup else DeclarationKind.Module)
+        longIdentText info.LongIdent,
+        (if isRec then
+             DeclarationKind.RecGroup
+         else
+             DeclarationKind.Module)
     | SynModuleDecl.Open(target, _) ->
         (match target with
          | SynOpenDeclTarget.ModuleOrNamespace(SynLongIdent(id = ids), _) -> longIdentText ids
@@ -401,7 +435,11 @@ let private nameAndKind (decl: SynModuleDecl) =
     | SynModuleDecl.Expr _ -> "", DeclarationKind.Do
     | SynModuleDecl.HashDirective(ParsedHashDirective(ident = ident), _) -> "#" + ident, DeclarationKind.Do
     | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(longId = ids; isRecursive = isRec)) ->
-        longIdentText ids, (if isRec then DeclarationKind.RecGroup else DeclarationKind.Module)
+        longIdentText ids,
+        (if isRec then
+             DeclarationKind.RecGroup
+         else
+             DeclarationKind.Module)
 
 /// Whether the declarations of the file are those of its only fragment; otherwise they are the fragments,
 /// and recursive ones are one declaration.
@@ -424,7 +462,8 @@ let private fragmentsHoldAugmentation (file: ParsedImplFileInput) =
             | _ -> false)
 
     file.Contents.Length > 1
-    && file.Contents |> List.exists (fun (SynModuleOrNamespace(decls = decls)) -> holds decls)
+    && file.Contents
+       |> List.exists (fun (SynModuleOrNamespace(decls = decls)) -> holds decls)
 
 /// The fully qualified names of the entities a file declares where another file can declare the same name (ruling
 /// R19), and the namespaces it puts them in: its top-level modules, and the modules, types, exceptions and module
@@ -441,7 +480,8 @@ let private declaredNames (input: ParsedInput) =
         for n in 1 .. path.Length do
             namespaces.Add(String.concat "." (List.truncate n path))
 
-    let add (path: string list) (name: string) = entities.Add(String.concat "." (path @ [ name ]))
+    let add (path: string list) (name: string) =
+        entities.Add(String.concat "." (path @ [ name ]))
 
     // A module may compile as XModule: next to a type X, or under [<CompilationRepresentation(ModuleSuffix)>]
     let addModule (path: string list) (name: string) =
@@ -473,7 +513,11 @@ let private declaredNames (input: ParsedInput) =
                         for SynTypeDefn(typeInfo = typeInfo) as typeDefn in typeDefns do
                             if not (isAugmentation typeDefn) then
                                 add path (lastName typeInfo.LongIdent)
-                    | SynModuleDecl.Exception(SynExceptionDefn(SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _))), _, _, _), _) ->
+                    | SynModuleDecl.Exception(SynExceptionDefn(SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _))),
+                                                               _,
+                                                               _,
+                                                               _),
+                                              _) ->
                         add path id.idText
                         add path (id.idText + "Exception")
                     | SynModuleDecl.ModuleAbbrev(ident = id) -> add path id.idText
@@ -489,7 +533,9 @@ let private declaredNames (input: ParsedInput) =
                             match repr with
                             | SynTypeDefnSigRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _) -> ()
                             | _ -> add path (lastName typeInfo.LongIdent)
-                    | SynModuleSigDecl.Exception(SynExceptionSig(exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _)))), _) ->
+                    | SynModuleSigDecl.Exception(SynExceptionSig(
+                                                     exnRepr = SynExceptionDefnRepr(caseName = SynUnionCase(ident = SynIdent(id, _)))),
+                                                 _) ->
                         add path id.idText
                         add path (id.idText + "Exception")
                     | SynModuleSigDecl.ModuleAbbrev(ident = id) -> add path id.idText
@@ -501,15 +547,17 @@ let private declaredNames (input: ParsedInput) =
 /// It also counts types whose type parameters fail that function's early measure check, so it can only hold more.
 let private typeNamesIn (decls: SynModuleDecl list) =
     set
-        [ for decl in decls do
-              match decl with
-              | SynModuleDecl.Types(typeDefns, _) ->
-                  for SynTypeDefn(typeInfo = typeInfo; typeRepr = repr) in typeDefns do
-                      match repr, List.tryLast typeInfo.LongIdent with
-                      | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _), _ -> ()
-                      | _, Some id -> yield id.idText
-                      | _, None -> ()
-              | _ -> () ]
+        [
+            for decl in decls do
+                match decl with
+                | SynModuleDecl.Types(typeDefns, _) ->
+                    for SynTypeDefn(typeInfo = typeInfo; typeRepr = repr) in typeDefns do
+                        match repr, List.tryLast typeInfo.LongIdent with
+                        | SynTypeDefnRepr.ObjectModel(kind = SynTypeDefnKind.Augmentation _), _ -> ()
+                        | _, Some id -> yield id.idText
+                        | _, None -> ()
+                | _ -> ()
+        ]
 
 /// Whether every later declaration depends on this one. For a module or fragment checked whole, that holds when
 /// anything in it would, except an open, whose scope ends with the module.
@@ -558,11 +606,17 @@ let private usesOf (entries: FileContentEntry list) =
     uses, members, fields, unresolvable
 
 let private sorted (names: seq<string>) =
-    names |> Seq.distinct |> Seq.toArray |> Array.sortWith (fun a b -> String.CompareOrdinal(a, b))
+    names
+    |> Seq.distinct
+    |> Seq.toArray
+    |> Array.sortWith (fun a b -> String.CompareOrdinal(a, b))
 
 let parse (ctx: ProjectContext) (fileName: string) (source: string) : FSharpParseFileResults =
     let state = ctx.State
-    let parsingOptions = FSharpParsingOptions.FromTcConfig(state.tcConfig, state.projectOptions.SourceFiles, false)
+
+    let parsingOptions =
+        FSharpParsingOptions.FromTcConfig(state.tcConfig, state.projectOptions.SourceFiles, false)
+
     let sourceText = SourceText.ofString source
 
     // Lexing records the file's #nowarn scopes in the project's diagnostic options, replacing the last parse's:
@@ -583,7 +637,13 @@ let parse (ctx: ProjectContext) (fileName: string) (source: string) : FSharpPars
             )
 
         let options = parsingOptions.DiagnosticOptions
-        let warnOptionsCopy = lock options (fun () -> { options with WarnScopeData = options.WarnScopeData })
+
+        let warnOptionsCopy =
+            lock options (fun () ->
+                { options with
+                    WarnScopeData = options.WarnScopeData
+                })
+
         let parse = FSharpParseFileResults(parseErrors, parseTree, anyErrors, [||])
         sources.Add(parse, sourceText)
         warnOptions.Add(parse, warnOptionsCopy)
@@ -619,7 +679,9 @@ let split (parse: FSharpParseFileResults) : ParsedDeclaration[] =
     | ParsedInput.ImplFile file ->
         let modulePath, endm, decls =
             if splitsFragment file then
-                let (SynModuleOrNamespace(longId = longId; decls = decls; range = m)) = List.exactlyOne file.Contents
+                let (SynModuleOrNamespace(longId = longId; decls = decls; range = m)) =
+                    List.exactlyOne file.Contents
+
                 longId |> List.map (fun id -> id.idText), m.EndRange, decls
             else
                 [], file.QualifiedName.Range, [ for fragment in file.Contents -> SynModuleDecl.NamespaceFragment fragment ]
@@ -627,19 +689,37 @@ let split (parse: FSharpParseFileResults) : ParsedDeclaration[] =
         let source =
             match sources.TryGetValue parse with
             | true, source -> source
-            | _ -> invalidArg (nameof parse) "Only a parse made by DeclarationChecker.Parse can be split: its declarations' text comes from the source it recorded."
+            | _ ->
+                invalidArg
+                    (nameof parse)
+                    "Only a parse made by DeclarationChecker.Parse can be split: its declarations' text comes from the source it recorded."
 
-        let seen = Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
+        let seen =
+            Dictionary<string list * string * DeclarationKind, int>(HashIdentity.Structural)
+
         let options = warnOptionsOf parse
         let checkXmlDocs = options.CheckXmlDocs
 
         let declaration modulePath within siblings depth (decl: SynModuleDecl) (range: range) scopem headerInputs isModuleHeader =
             let name, kind = nameAndKind decl
-            let ordinal = match seen.TryGetValue((modulePath, name, kind)) with | true, n -> n | _ -> 0
+
+            let ordinal =
+                match seen.TryGetValue((modulePath, name, kind)) with
+                | true, n -> n
+                | _ -> 0
+
             seen[(modulePath, name, kind)] <- ordinal + 1
             let docRanges = if checkXmlDocs then [] else docRangesOfDecl decl
             let text = textOfRange source range docRanges
-            let key = { ModulePath = modulePath; Name = name; Kind = kind; Ordinal = ordinal }
+
+            let key =
+                {
+                    ModulePath = modulePath
+                    Name = name
+                    Kind = kind
+                    Ordinal = ordinal
+                }
+
             ParsedDeclaration(key, decl, range, scopem, text, headerInputs, within, siblings, depth, isModuleHeader, source)
 
         let rec splitDecls modulePath within depth (endm: range) (decls: SynModuleDecl list) =
@@ -647,7 +727,12 @@ let split (parse: FSharpParseFileResults) : ParsedDeclaration[] =
 
             // Whether the module gets the Module suffix for a type of its name among the declarations around it
             let suffixInput (moduleInfo: SynComponentInfo) =
-                let ownName = moduleInfo.LongIdent |> List.tryLast |> Option.map _.idText |> Option.defaultValue ""
+                let ownName =
+                    moduleInfo.LongIdent
+                    |> List.tryLast
+                    |> Option.map _.idText
+                    |> Option.defaultValue ""
+
                 $"suffix=%b{typeNames.Contains ownName}"
 
             let makeDecl modulePath within depth decl range scopem headerInputs isModuleHeader =
@@ -690,7 +775,9 @@ let split (parse: FSharpParseFileResults) : ParsedDeclaration[] =
                     header :: splitDecls path (Some header.Key) (depth + 1) m.EndRange moduleDecls
                 // A module checked whole (module rec, or without a name) reads its suffix the same way
                 | SynModuleDecl.NestedModule(moduleInfo = moduleInfo) ->
-                    [ makeDecl modulePath within depth decl decl.Range scopem (suffixInput moduleInfo) false ]
+                    [
+                        makeDecl modulePath within depth decl decl.Range scopem (suffixInput moduleInfo) false
+                    ]
                 | _ -> [ makeDecl modulePath within depth decl decl.Range scopem "" false ])
             |> List.concat
 
@@ -703,7 +790,8 @@ let content (decl: ParsedDeclaration) : DeclarationContent =
         | SynModuleDecl.NestedModule(moduleInfo = SynComponentInfo(attributes = attributes) as moduleInfo) when decl.IsModuleHeader ->
             FileContentMapping.visitSynAttributes attributes, ([ for id in moduleInfo.LongIdent -> id.idText ], false)
         | SynModuleDecl.NamespaceFragment(SynModuleOrNamespace(attribs = attributes; decls = decls)) ->
-            FileContentMapping.visitSynAttributes attributes @ List.collect FileContentMapping.visitSynModuleDecl decls,
+            FileContentMapping.visitSynAttributes attributes
+            @ List.collect FileContentMapping.visitSynModuleDecl decls,
             TrieMapping.declarationNames decl.Syntax
         | syntax -> FileContentMapping.visitSynModuleDecl syntax, TrieMapping.declarationNames syntax
 
@@ -717,20 +805,18 @@ let content (decl: ParsedDeclaration) : DeclarationContent =
 
     let augments =
         match decl.Syntax with
-        | SynModuleDecl.Types(typeDefns, _) ->
-            typeDefns
-            |> List.filter isAugmentation
-            |> List.map typeDefnName
-            |> sorted
+        | SynModuleDecl.Types(typeDefns, _) -> typeDefns |> List.filter isAugmentation |> List.map typeDefnName |> sorted
         | _ -> [||]
 
-    { Defines = sorted defines
-      Uses = sorted uses
-      MemberUses = sorted members
-      FieldOrCaseUses = sorted fields
-      HasUnresolvable = unresolvable
-      AffectsAllLater = affectsAllLaterFlag || unreadableName
-      Augments = augments }
+    {
+        Defines = sorted defines
+        Uses = sorted uses
+        MemberUses = sorted members
+        FieldOrCaseUses = sorted fields
+        HasUnresolvable = unresolvable
+        AffectsAllLater = affectsAllLaterFlag || unreadableName
+        Augments = augments
+    }
 
 /// For each of the project's files, given in file order, the ascending indices of the earlier files checking it
 /// reads: the file dependency graph graph-mode checking builds, transitively closed. A file that depends on a
@@ -751,7 +837,10 @@ let fileDependencies (ctx: ProjectContext) (parses: FSharpParseFileResults[]) : 
 
     if
         parses.Length <> sourceFiles.Length
-        || Array.exists2 (fun (parse: FSharpParseFileResults) file -> not (String.Equals(parse.FileName, file, StringComparison.OrdinalIgnoreCase))) parses sourceFiles
+        || Array.exists2
+            (fun (parse: FSharpParseFileResults) file -> not (String.Equals(parse.FileName, file, StringComparison.OrdinalIgnoreCase)))
+            parses
+            sourceFiles
     then
         raise (ArgumentException("Expected one parse of each of the project's source files, in file order.", nameof parses))
 
@@ -765,7 +854,12 @@ let fileDependencies (ctx: ProjectContext) (parses: FSharpParseFileResults[]) : 
 
     let files =
         inputs
-        |> Array.mapi (fun idx input -> { Idx = idx; FileName = input.FileName; ParsedInput = input })
+        |> Array.mapi (fun idx input ->
+            {
+                Idx = idx
+                FileName = input.FileName
+                ParsedInput = input
+            })
 
     let filePairs = FilePairMap files
 
@@ -792,7 +886,9 @@ let fileDependencies (ctx: ProjectContext) (parses: FSharpParseFileResults[]) : 
             files
             |> Array.map (fun file ->
                 if unmatchedImplementations.Contains file.Idx then
-                    { file with FileName = file.FileName + "|unmatched" }
+                    { file with
+                        FileName = file.FileName + "|unmatched"
+                    }
                 else
                     file)
             |> FilePairMap
@@ -800,8 +896,11 @@ let fileDependencies (ctx: ProjectContext) (parses: FSharpParseFileResults[]) : 
     let graph, _ = DependencyResolution.mkGraph graphPairs files
 
     // By name, the files declaring an entity of that name, and those with a namespace of that name
-    let entityFiles = Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
-    let namespaceFiles = Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
+    let entityFiles =
+        Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
+
+    let namespaceFiles =
+        Dictionary<string, ResizeArray<int>>(StringComparer.OrdinalIgnoreCase)
 
     let filesOf (table: Dictionary<string, ResizeArray<int>>) name =
         match table.TryGetValue name with
@@ -849,16 +948,21 @@ let fileDependencies (ctx: ProjectContext) (parses: FSharpParseFileResults[]) : 
                     pending.Push transitive
 
                 // A pair whose names differ: the signature does not stand in for the implementation file
-                if filePairs.IsSignature dependency && not (matched.Contains parses[dependency].FileName) then
+                if
+                    filePairs.IsSignature dependency
+                    && not (matched.Contains parses[dependency].FileName)
+                then
                     pending.Push(filePairs.GetImplementationIndex dependency)
 
         closed[idx] <- dependencies |> Seq.sort |> Array.ofSeq
 
     ctx.Dependencies <-
         Some
-            { Parses = Array.copy parses
-              Dependencies = closed |> Array.map Array.copy
-              ModuleNamesBefore = moduleNamesBefore
-              MatchedSignatures = matched }
+            {
+                Parses = Array.copy parses
+                Dependencies = closed |> Array.map Array.copy
+                ModuleNamesBefore = moduleNamesBefore
+                MatchedSignatures = matched
+            }
 
     closed

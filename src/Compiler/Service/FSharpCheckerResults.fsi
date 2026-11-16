@@ -252,7 +252,7 @@ type public FSharpCodeCompletionOptions =
 
 [<Sealed>]
 type internal TypeCheckInfo =
-    internal new :
+    internal new:
         _sTcConfig: TcConfig *
         g: TcGlobals *
         ccuSigForFile: ModuleOrNamespaceType *
@@ -268,8 +268,9 @@ type internal TypeCheckInfo =
         sFallback: NameResolutionEnv *
         loadClosure: LoadClosure option *
         implFileOpt: CheckedImplFile option *
-        openDeclarations: OpenDeclaration[]
-            -> TypeCheckInfo
+        openDeclarations: OpenDeclaration[] ->
+            TypeCheckInfo
+
     member ScopeResolutions: TcResolutions
     member ScopeSymbolUses: TcSymbolUses
     member TcGlobals: TcGlobals
@@ -281,14 +282,14 @@ type internal TypeCheckInfo =
 /// A handle to the results of CheckFileInProject.
 [<Sealed>]
 type public FSharpCheckFileResults =
-    internal new :
+    internal new:
         fileName: string *
         errors: FSharpDiagnostic[] *
         scopeOptX: TypeCheckInfo option *
         dependencyFiles: string[] *
         builderX: IncrementalBuilder option *
-        keepAssemblyContents: bool
-            -> FSharpCheckFileResults
+        keepAssemblyContents: bool ->
+            FSharpCheckFileResults
 
     /// The errors returned by parsing a source file.
     member Diagnostics: FSharpDiagnostic[]
