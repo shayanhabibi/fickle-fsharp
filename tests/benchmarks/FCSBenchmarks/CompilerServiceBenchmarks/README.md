@@ -66,6 +66,17 @@ dotnet run -c Release --no-build -- --filter *DeclarationCheckerBenchmarks* --wa
 dotnet run -c Release --no-build -- declaration-memory
 ```
 
+## Symbol & IWSAM allocation benchmarks
+
+`SymbolAndIwsamBenchmarks.fs` measures repeated inspection of `FSharpMemberOrFunctionOrValue.CurriedParameterGroups`
+and `FSharpType` (`InspectSymbolsRepeatedly`), plus warm checking of interface-annotated bindings
+exercising `CheckIWSAM` (`WarmCheckFileWithInterfaces`).
+
+Run with `BUILDING_USING_DOTNET=true`:
+```powershell
+dotnet run -c Release -- --filter *SymbolAndIwsamBenchmarks* --warmupCount 3 --iterationCount 10
+```
+
 ## Sample results
 
 |                                 Method |        Job | UnrollFactor |           Mean |        Error |        StdDev |         Median |       Gen 0 |      Gen 1 |     Gen 2 |  Allocated |
