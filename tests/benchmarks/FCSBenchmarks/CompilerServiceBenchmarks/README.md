@@ -77,6 +77,17 @@ Run with `BUILDING_USING_DOTNET=true`:
 dotnet run -c Release -- --filter *SymbolAndIwsamBenchmarks* --warmupCount 3 --iterationCount 10
 ```
 
+## Comment-decoupled tooltip benchmarks (`GetToolTipParts`)
+
+`TooltipPartsBenchmarks.fs` compares re-parsing + `FSharpCheckFileResults.GetToolTip` over a 60-declaration
+module against `FSharpChecker.ParseFile` + `FSharpCheckFileResults.GetToolTipParts` + `FSharpDocSource.Compose`
+on `///` doc-comment edits without re-typechecking.
+
+Run with `BUILDING_USING_DOTNET=true`:
+```powershell
+dotnet run -c Release -- --filter *TooltipPartsBenchmarks* --warmupCount 3 --iterationCount 10
+```
+
 ## Sample results
 
 |                                 Method |        Job | UnrollFactor |           Mean |        Error |        StdDev |         Median |       Gen 0 |      Gen 1 |     Gen 2 |  Allocated |

@@ -18,6 +18,7 @@
     <Compile Include="NamespaceImportBenchmarks.fs" />
     <Compile Include="DeclarationCheckerBenchmarks.fs" />
     <Compile Include="SymbolAndIwsamBenchmarks.fs" />
+    <Compile Include="TooltipPartsBenchmarks.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
