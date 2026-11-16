@@ -33,6 +33,73 @@ compare `Narrow` retained across `main` and this branch (and Narrow-vs-Wide with
 To compare branches: build + run on `main`, note the numbers, `git checkout il-pre-namespace`, rebuild
 and re-run, diff. (The `BenchmarkComparison/` project automates historical before/after runs if preferred.)
 
+## Declaration-checker, tooltip-parts, and symbol-allocation benchmarks
+
+`DeclarationCheckerBenchmarks.fs` measures single-file incremental checking, comment-decoupled tooltips,
+symbol wrapper allocations, and per-file live heap retention for `DeclarationChecker` and `FSharpChecker`:
+
+* **`DeclarationCheckerBenchmarks`**: Uses a 60-declaration implementation module (`Bench.Declarations`)
+  with downstream callers (`compute31`..`compute35` calling `compute30`). Compares warm single-file
+  `FSharpChecker.ParseAndCheckFileInProject` (`BodyEdit_WholeFile_FSharpChecker`, baseline) against:
+  * `BodyEdit_WholeFile_DeclarationChecker` — whole-file `DeclarationChecker.CheckFile` without
+    materializing `TcResultsSink` (background signature checking).
+  * `BodyEdit_Incremental_Cutoff` — `Parse`, `Split`, single-declaration `CheckDeclaration` with
+    `SignatureFingerprint` cutoff (0 downstream declarations re-checked), and `FinishFile`.
+  * `BodyEdit_Incremental_WithCheckResults` — same incremental check plus forcing `fileRes.CheckResults`
+    to materialize full `FSharpCheckFileResults` from merged sinks.
+  * `LineShift_Incremental_DeclarationChecker` — shifting 59+ unchanged declarations across line
+    insertions/deletions via `DeclarationChecker.Shift` + `FinishFile` without re-typechecking.
+  * `CommentEdit_WholeFile_GetToolTip` vs `CommentEdit_NoRecheck_GetToolTipParts` — refreshing
+    `///` XML doc tooltips via `GetToolTipParts` + `FSharpDocSource.Compose` without re-checking.
+  These micro/service benchmarks isolate single-file operations after `ProjectContext` / `IncrementalBuilder`
+  warmup; end-to-end multi-project scheduling costs depend on the hosting language server.
+* **`SymbolAndIwsamBenchmarks`**: Measures repeated inspection of `FSharpMemberOrFunctionOrValue.CurriedParameterGroups`
+  and `FSharpType` (`InspectSymbolsRepeatedly`), plus warm checking of interface-annotated bindings
+  exercising `CheckIWSAM` (`WarmCheckFileWithInterfaces`).
+* **`declaration-memory` probe (`DeclarationMemoryProbe`)**: Deterministic `GC.GetTotalMemory(true)`
+  measurement comparing closed-file `FileSignature`, open-file `FileStart + DeclarationResult[]`, and
+  `FSharpCheckFileResults` on the 60-declaration module after `TcImports` warmup.
+
+Build and run with `BUILDING_USING_DOTNET=true`:
+```powershell
+$env:BUILDING_USING_DOTNET = "true"
+dotnet build-server shutdown
+dotnet build ..\..\..\..\src\FSharp.Build\FSharp.Build.fsproj -c Release --disable-build-servers
+dotnet build ..\..\..\..\src\Compiler\FSharp.Compiler.Service.fsproj -c Release --disable-build-servers
+dotnet build ..\..\..\FSharp.Test.Utilities\FSharp.Test.Utilities.fsproj -c Release --disable-build-servers
+dotnet build ..\..\FSharp.Benchmarks.Common\FSharp.Benchmarks.Common.fsproj -c Release --disable-build-servers
+dotnet build FSharp.Compiler.Benchmarks.fsproj -c Release --no-dependencies --disable-build-servers
+dotnet run -c Release --no-build -- --filter *DeclarationCheckerBenchmarks* *SymbolAndIwsamBenchmarks* --warmupCount 3 --iterationCount 10
+dotnet run -c Release --no-build -- declaration-memory
+```
+
+Sample `DeclarationCheckerBenchmarks` output (BenchmarkDotNet v0.13.10, Windows 11 10.0.26200.9974, AMD Ryzen 9 9900X 12-Core Processor, .NET SDK 11.0.100, `.NET 11.0.0`, `IterationCount=10`, `WarmupCount=3`):
+
+| Method                                   | Mean      | Error     | StdDev    | Ratio | RatioSD | Gen0     | Gen1    | Allocated | Alloc Ratio |
+|----------------------------------------- |----------:|----------:|----------:|------:|--------:|---------:|--------:|----------:|------------:|
+| BodyEdit_WholeFile_FSharpChecker         | 17.503 ms | 0.8358 ms | 0.5528 ms |  1.00 |    0.00 | 187.5000 | 62.5000 |  16.83 MB |        1.00 |
+| BodyEdit_WholeFile_DeclarationChecker    | 17.016 ms | 1.0292 ms | 0.6807 ms |  0.97 |    0.05 | 218.7500 | 62.5000 |  15.84 MB |        0.94 |
+| BodyEdit_Incremental_Cutoff              |  6.159 ms | 0.6797 ms | 0.4045 ms |  0.35 |    0.02 | 109.3750 | 15.6250 |   6.82 MB |        0.41 |
+| BodyEdit_Incremental_WithCheckResults    |  6.877 ms | 0.5476 ms | 0.3622 ms |  0.39 |    0.03 | 125.0000 | 15.6250 |    7.4 MB |        0.44 |
+| LineShift_Incremental_DeclarationChecker |  6.568 ms | 0.2983 ms | 0.1775 ms |  0.38 |    0.02 |  31.2500 |       - |   5.03 MB |        0.30 |
+| CommentEdit_WholeFile_GetToolTip         | 18.059 ms | 0.4790 ms | 0.3168 ms |  1.03 |    0.04 | 187.5000 | 93.7500 |  16.85 MB |        1.00 |
+| CommentEdit_NoRecheck_GetToolTipParts    |  2.141 ms | 0.1363 ms | 0.0902 ms |  0.12 |    0.01 |  15.6250 |       - |    1.2 MB |        0.07 |
+
+Sample `SymbolAndIwsamBenchmarks` output:
+
+| Method                      | Mean        | Error        | StdDev       | Gen0     | Gen1     | Allocated |
+|---------------------------- |------------:|-------------:|-------------:|---------:|---------:|----------:|
+| InspectSymbolsRepeatedly    |    321.2 μs |     10.03 μs |      6.63 μs |  11.2305 |        - |   1.03 MB |
+| WarmCheckFileWithInterfaces | 67,968.3 μs | 17,116.39 μs | 11,321.43 μs | 500.0000 | 250.0000 |  54.04 MB |
+
+Sample `declaration-memory` output:
+
+| State Retained                 |      Retained |     Allocated |
+| ------------------------------ | ------------: | ------------: |
+| ClosedFile_FileSignature       |     594.48 KB |   17543.45 KB |
+| OpenFile_IncrementalState      |    2899.26 KB |   36556.99 KB |
+| FSharpChecker_CheckFileResults |    2559.51 KB |   18654.02 KB |
+
 ## Sample results
 
 |                                 Method |        Job | UnrollFactor |           Mean |        Error |        StdDev |         Median |       Gen 0 |      Gen 1 |     Gen 2 |  Allocated |
